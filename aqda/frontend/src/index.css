@@ -1,0 +1,61 @@
+@import "tailwindcss";
+
+body {
+  margin: 0;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Tiptap editor styles */
+.tiptap {
+  outline: none;
+  min-height: 100%;
+  padding: 1rem;
+  font-size: 0.95rem;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+.tiptap p {
+  margin: 0 0 0.5em 0;
+}
+
+/* Code highlight marks — inline colored backgrounds for codings */
+mark[data-color] {
+  border-radius: 2px;
+  padding: 1px 0;
+  cursor: pointer;
+  transition: filter 0.15s;
+}
+mark[data-color]:hover {
+  filter: brightness(0.9);
+}
+
+/* AI search highlight — pulse then settle */
+.ai-search-highlight {
+  animation: ai-highlight-pulse 2s ease-in-out;
+  border-radius: 2px;
+  padding: 1px 0;
+}
+@keyframes ai-highlight-pulse {
+  0% { background-color: rgba(120, 120, 120, 0.4); }
+  30% { background-color: rgba(120, 120, 120, 0.15); }
+  60% { background-color: rgba(120, 120, 120, 0.35); }
+  100% { background-color: rgba(120, 120, 120, 0.2); }
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #d1d5db;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #9ca3af;
+}

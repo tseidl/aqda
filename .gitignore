@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+/dist/
+build/
+.venv/
+*.egg
+.ruff_cache/
+
+# Node / Frontend build
+node_modules/
+# aqda/frontend/dist/ is intentionally tracked — it ships as the pre-built frontend
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data
+*.db
+*.db-wal
+*.db-shm
+
+# Environment
+.env
+
+# Claude Code
+.claude/
+CLAUDE.md
