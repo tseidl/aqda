@@ -359,7 +359,9 @@ async def export_aqda(project_id: int):
     finally:
         os.unlink(tmp.name)
 
-    filename = f"{project['name'].replace(' ', '_')}.aqda"
+    from datetime import date
+    slug = project['name'].replace(' ', '_')
+    filename = f"{slug}_{date.today().isoformat()}.aqda"
     return StreamingResponse(
         io.BytesIO(data),
         media_type="application/octet-stream",

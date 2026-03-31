@@ -94,6 +94,11 @@ async def _parse_filename_variables(db, filename: str) -> dict[str, str]:
     )
     rows = await cursor.fetchall()
     settings = {r["key"]: r["value"] for r in rows}
+    return _parse_filename_variables_cached(settings, filename)
+
+
+def _parse_filename_variables_cached(settings: dict[str, str], filename: str) -> dict[str, str]:
+    """Parse meta-variables from a filename using pre-fetched settings."""
     pattern = settings.get("filename_pattern", "").strip()
     if not pattern:
         return {}
@@ -203,49 +208,109 @@ async def upload_documents_bulk(
     project_id: int = Form(...),
     files: list[UploadFile] = File(...),
 ):
-    results = []
-    for file in files:
-        content_bytes = await file.read()
-        if len(content_bytes) > MAX_UPLOAD_BYTES:
-            continue  # Skip oversized files in bulk upload
-        filename = file.filename or "untitled"
-        source_type = _detect_source_type(filename)
-        if source_type == "pdf":
-            text = await _extract_pdf_text(content_bytes)
-        elif source_type == "image":
-            ext = filename.rsplit('.', 1)[-1].lower()
-            mime = f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}"
-            text = f"data:{mime};base64,{base64.b64encode(content_bytes).decode('ascii')}"
-        elif source_type == "audio":
-            ext = '.' + filename.rsplit('.', 1)[-1].lower()
-            mime = AUDIO_MIME_MAP.get(ext, 'audio/mpeg')
-            text = f"data:{mime};base64,{base64.b64encode(content_bytes).decode('ascii')}"
-        else:
-            text = content_bytes.decode("utf-8", errors="replace")
-        if not text.strip():
-            continue
-        db = await get_db()
-        try:
+    db = await get_db()
+    try:
+        # Cache filename pattern settings once for the whole batch
+        cursor = await db.execute(
+            "SELECT key, value FROM setting WHERE key IN ('filename_pattern', 'filename_variables')"
+        )
+        rows = await cursor.fetchall()
+        pattern_settings = {r["key"]: r["value"] for r in rows}
+
+        results = []
+        doc_ids = []
+        for file in files:
+            content_bytes = await file.read()
+            if len(content_bytes) > MAX_UPLOAD_BYTES:
+                continue
+            filename = file.filename or "untitled"
+            source_type = _detect_source_type(filename)
+            if source_type == "pdf":
+                text = await _extract_pdf_text(content_bytes)
+            elif source_type == "image":
+                ext = filename.rsplit('.', 1)[-1].lower()
+                mime = f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}"
+                text = f"data:{mime};base64,{base64.b64encode(content_bytes).decode('ascii')}"
+            elif source_type == "audio":
+                ext = '.' + filename.rsplit('.', 1)[-1].lower()
+                mime = AUDIO_MIME_MAP.get(ext, 'audio/mpeg')
+                text = f"data:{mime};base64,{base64.b64encode(content_bytes).decode('ascii')}"
+            else:
+                text = content_bytes.decode("utf-8", errors="replace")
+            if not text.strip():
+                continue
             cursor = await db.execute(
                 "INSERT INTO document (project_id, name, content, source_type) VALUES (?, ?, ?, ?)",
                 (project_id, filename, text, source_type),
             )
-            await db.commit()
             doc_id = cursor.lastrowid
-            # Parse filename variables
-            file_vars = await _parse_filename_variables(db, filename)
+            doc_ids.append(doc_id)
+            # Parse filename variables using cached settings
+            file_vars = _parse_filename_variables_cached(pattern_settings, filename)
             if file_vars:
                 await _save_doc_variables(db, doc_id, file_vars)
-                await db.commit()
+        await db.commit()
+        # Fetch all inserted documents in one query
+        if doc_ids:
+            placeholders = ",".join("?" * len(doc_ids))
             cursor = await db.execute(
-                "SELECT id, project_id, name, source_type, created_at, modified_at "
-                "FROM document WHERE id=?",
-                (doc_id,),
+                f"SELECT id, project_id, name, source_type, created_at, modified_at "
+                f"FROM document WHERE id IN ({placeholders}) ORDER BY name",
+                doc_ids,
             )
-            results.append(dict(await cursor.fetchone()))
-        finally:
-            await db.close()
-    return results
+            results = [dict(r) for r in await cursor.fetchall()]
+        return results
+    finally:
+        await db.close()
+
+
+class BulkDeleteRequest(BaseModel):
+    ids: list[int]
+
+
+@router.post("/parse-variables")
+async def parse_variables_bulk(project_id: int):
+    """Re-parse filename variables for all documents in a project."""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT key, value FROM setting WHERE key IN ('filename_pattern', 'filename_variables')"
+        )
+        rows = await cursor.fetchall()
+        pattern_settings = {r["key"]: r["value"] for r in rows}
+        if not pattern_settings.get("filename_pattern", "").strip():
+            raise HTTPException(400, "No filename pattern configured in Settings")
+
+        cursor = await db.execute(
+            "SELECT id, name FROM document WHERE project_id=?", (project_id,)
+        )
+        docs = await cursor.fetchall()
+        updated = 0
+        for doc in docs:
+            file_vars = _parse_filename_variables_cached(pattern_settings, doc["name"])
+            if file_vars:
+                await _save_doc_variables(db, doc["id"], file_vars)
+                updated += 1
+        await db.commit()
+        return {"updated": updated, "total": len(docs)}
+    finally:
+        await db.close()
+
+
+@router.post("/bulk-delete", status_code=204)
+async def delete_documents_bulk(data: BulkDeleteRequest):
+    if not data.ids:
+        return
+    db = await get_db()
+    try:
+        placeholders = ",".join("?" * len(data.ids))
+        await db.execute(f"DELETE FROM document WHERE id IN ({placeholders})", data.ids)
+        await db.execute(
+            f"DELETE FROM document_variable WHERE document_id IN ({placeholders})", data.ids
+        )
+        await db.commit()
+    finally:
+        await db.close()
 
 
 @router.get("/{document_id}")

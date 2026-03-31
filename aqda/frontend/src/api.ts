@@ -157,16 +157,34 @@ export const documents = {
     if (!res.ok) throw new Error(await res.text());
     return res.json();
   },
-  uploadBulk: async (projectId: number, files: File[]): Promise<Document[]> => {
-    const form = new FormData();
-    form.append('project_id', String(projectId));
-    for (const f of files) form.append('files', f);
-    const res = await fetch(`${BASE}/documents/bulk`, { method: 'POST', body: form });
-    if (!res.ok) throw new Error(await res.text());
-    return res.json();
+  uploadBulk: async (
+    projectId: number,
+    files: File[],
+    onProgress?: (completed: number, total: number) => void,
+  ): Promise<Document[]> => {
+    const BATCH_SIZE = 20;
+    const results: Document[] = [];
+    for (let i = 0; i < files.length; i += BATCH_SIZE) {
+      const batch = files.slice(i, i + BATCH_SIZE);
+      const form = new FormData();
+      form.append('project_id', String(projectId));
+      for (const f of batch) form.append('files', f);
+      const res = await fetch(`${BASE}/documents/bulk`, { method: 'POST', body: form });
+      if (!res.ok) throw new Error(await res.text());
+      const docs: Document[] = await res.json();
+      results.push(...docs);
+      onProgress?.(Math.min(i + BATCH_SIZE, files.length), files.length);
+    }
+    return results;
   },
+  update: (id: number, data: { name?: string }) =>
+    request<Document>(`/documents/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   delete: (id: number) =>
     request<void>(`/documents/${id}`, { method: 'DELETE' }),
+  deleteBulk: (ids: number[]) =>
+    request<void>('/documents/bulk-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
+  parseVariables: (projectId: number) =>
+    request<{ updated: number; total: number }>(`/documents/parse-variables?project_id=${projectId}`, { method: 'POST' }),
   getVariables: (id: number) =>
     request<Record<string, string>>(`/documents/${id}/variables`),
   setVariables: (id: number, items: { key: string; value: string }[]) =>

@@ -56,6 +56,7 @@ You need one of each. They are configured in **Settings**.
 
 - **Python 3.10 or newer**
 - **pipx** (installs Python apps in isolated environments)
+- **Chrome, Firefox, or Brave** — Safari has known issues with large file imports and downloads
 - **Ollama** (optional, for AI features) — [ollama.com/download](https://ollama.com/download)
 
 ### Install
@@ -73,6 +74,7 @@ aqda
 ```
 
 This opens your browser at `http://127.0.0.1:8765`. To stop, press `Ctrl+C` in the terminal.
+
 
 <details>
 <summary><strong>Don't have Python or pipx?</strong></summary>

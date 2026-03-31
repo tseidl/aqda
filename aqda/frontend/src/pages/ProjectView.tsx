@@ -4,7 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowLeft, Upload, FileText, Tags, StickyNote, Search,
   Download, ChevronDown, Sparkles, Plus, Trash2, Settings,
-  Filter, LayoutList,
+  Filter, LayoutList, CheckSquare, Square,
 } from 'lucide-react';
 import { projects, documents, codes, codings, type Document as Doc } from '../api';
 import { CodeTree } from '../components/CodeTree';
@@ -33,6 +33,13 @@ export function ProjectView() {
   const [showDocVars, setShowDocVars] = useState(false);
   const [showDocControls, setShowDocControls] = useState(false);
   const [highlightRange, setHighlightRange] = useState<{ start: number; end: number } | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<{ completed: number; total: number } | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [selectedDocIds, setSelectedDocIds] = useState<Set<number>>(new Set());
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [renamingDocId, setRenamingDocId] = useState<number | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [docSearch, setDocSearch] = useState('');
 
   // Drag-to-resize sidebar
   const startResize = useCallback((e: React.MouseEvent) => {
@@ -69,6 +76,10 @@ export function ProjectView() {
   // Filtered + sorted documents
   const filteredDocs = useMemo(() => {
     let docs = [...docList];
+    if (docSearch.trim()) {
+      const q = docSearch.toLowerCase();
+      docs = docs.filter((d) => d.name.toLowerCase().includes(q));
+    }
     if (docFilter !== 'all') {
       docs = docs.filter((d) => d.source_type === (docFilter === 'text' ? 'text' : docFilter));
     }
@@ -79,7 +90,7 @@ export function ProjectView() {
       return 0;
     });
     return docs;
-  }, [docList, docFilter, docSort]);
+  }, [docList, docFilter, docSort, docSearch]);
 
   const { data: codeList = [] } = useQuery({
     queryKey: ['codes', projectId],
@@ -100,13 +111,24 @@ export function ProjectView() {
 
   // Mutations
   const uploadMut = useMutation({
-    mutationFn: (files: File[]) =>
-      files.length === 1
-        ? documents.upload(projectId, files[0]).then((d) => [d])
-        : documents.uploadBulk(projectId, files),
+    mutationFn: (files: File[]) => {
+      setUploadError(null);
+      if (files.length === 1) {
+        return documents.upload(projectId, files[0]).then((d) => [d]);
+      }
+      setUploadProgress({ completed: 0, total: files.length });
+      return documents.uploadBulk(projectId, files, (completed, total) => {
+        setUploadProgress({ completed, total });
+      });
+    },
     onSuccess: (docs) => {
+      setUploadProgress(null);
       queryClient.invalidateQueries({ queryKey: ['documents', projectId] });
       if (docs.length === 1) setSelectedDocId(docs[0].id);
+    },
+    onError: (err) => {
+      setUploadProgress(null);
+      setUploadError(err instanceof Error ? err.message : 'Upload failed');
     },
   });
 
@@ -115,6 +137,33 @@ export function ProjectView() {
     onSuccess: (_, deletedId) => {
       queryClient.invalidateQueries({ queryKey: ['documents', projectId] });
       if (selectedDocId === deletedId) setSelectedDocId(null);
+    },
+  });
+
+  const bulkDeleteMut = useMutation({
+    mutationFn: (ids: number[]) => documents.deleteBulk(ids),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['documents', projectId] });
+      if (selectedDocId && selectedDocIds.has(selectedDocId)) setSelectedDocId(null);
+      setSelectedDocIds(new Set());
+      setSelectionMode(false);
+    },
+  });
+
+  const renameDocMut = useMutation({
+    mutationFn: ({ id, name }: { id: number; name: string }) =>
+      documents.update(id, { name }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['documents', projectId] });
+      setRenamingDocId(null);
+    },
+  });
+
+  const parseVarsMut = useMutation({
+    mutationFn: () => documents.parseVariables(projectId),
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: ['documents', projectId] });
+      alert(`Parsed variables for ${result.updated} of ${result.total} documents.`);
     },
   });
 
@@ -189,9 +238,10 @@ export function ProjectView() {
           </Link>
           <button
             onClick={handleFileUpload}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-gray-100 hover:bg-gray-200 rounded-md text-gray-700"
+            disabled={uploadMut.isPending}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-gray-100 hover:bg-gray-200 rounded-md text-gray-700 disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            <Upload size={16} /> Import
+            <Upload size={16} /> {uploadMut.isPending ? 'Importing...' : 'Import'}
           </button>
           <div className="relative">
             <button
@@ -255,15 +305,48 @@ export function ProjectView() {
               {tabs.find((t) => t.key === activeTab)?.label}
             </span>
             {activeTab === 'documents' && (
-              <button
-                onClick={handleFileUpload}
-                className="p-1 text-gray-400 hover:text-indigo-600 rounded hover:bg-gray-100"
-                title="Add documents"
-              >
-                <Plus size={16} />
-              </button>
+              <div className="flex items-center gap-1">
+                {docList.length > 0 && !selectionMode && (
+                  <button
+                    onClick={() => setSelectionMode(true)}
+                    className="p-1 text-gray-400 hover:text-indigo-600 rounded hover:bg-gray-100"
+                    title="Select documents"
+                  >
+                    <CheckSquare size={16} />
+                  </button>
+                )}
+                <button
+                  onClick={handleFileUpload}
+                  className="p-1 text-gray-400 hover:text-indigo-600 rounded hover:bg-gray-100"
+                  title="Add documents"
+                >
+                  <Plus size={16} />
+                </button>
+              </div>
             )}
           </div>
+
+          {/* Upload progress */}
+          {uploadProgress && (
+            <div className="px-3 py-2 border-b border-gray-100 bg-indigo-50 shrink-0">
+              <div className="flex items-center justify-between text-xs text-indigo-700 mb-1">
+                <span>Importing documents...</span>
+                <span>{uploadProgress.completed} / {uploadProgress.total}</span>
+              </div>
+              <div className="w-full bg-indigo-100 rounded-full h-1.5">
+                <div
+                  className="bg-indigo-500 h-1.5 rounded-full transition-all"
+                  style={{ width: `${(uploadProgress.completed / uploadProgress.total) * 100}%` }}
+                />
+              </div>
+            </div>
+          )}
+          {uploadError && (
+            <div className="px-3 py-2 border-b border-gray-100 bg-red-50 text-xs text-red-700 flex items-center justify-between shrink-0">
+              <span>Import failed: {uploadError}</span>
+              <button onClick={() => setUploadError(null)} className="text-red-400 hover:text-red-600 ml-2">dismiss</button>
+            </div>
+          )}
 
           {/* Sidebar content */}
           <div className="flex-1 overflow-auto">
@@ -288,6 +371,18 @@ export function ProjectView() {
                     </button>
                   </div>
                 ) : (<>
+                  {/* Search */}
+                  <div className="relative mb-2">
+                    <Search size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400" />
+                    <input
+                      type="text"
+                      placeholder="Search documents..."
+                      value={docSearch}
+                      onChange={(e) => setDocSearch(e.target.value)}
+                      className="w-full text-xs pl-7 pr-2 py-1.5 rounded-md border border-gray-200 bg-gray-50 focus:bg-white focus:border-indigo-300 focus:outline-none"
+                    />
+                  </div>
+
                   {/* Filter/Sort/Display controls */}
                   <div className="flex items-center gap-1 px-1 mb-2">
                     <button
@@ -306,6 +401,42 @@ export function ProjectView() {
                     </button>
                     <span className="text-[10px] text-gray-400 ml-auto">{filteredDocs.length}/{docList.length}</span>
                   </div>
+
+                  {selectionMode && (
+                    <div className="flex items-center gap-2 px-2 pb-2 mb-1 border-b border-gray-100">
+                      <button
+                        onClick={() => {
+                          if (selectedDocIds.size === filteredDocs.length) {
+                            setSelectedDocIds(new Set());
+                          } else {
+                            setSelectedDocIds(new Set(filteredDocs.map((d: Doc) => d.id)));
+                          }
+                        }}
+                        className="text-[11px] text-indigo-600 hover:text-indigo-800"
+                      >
+                        {selectedDocIds.size === filteredDocs.length ? 'Deselect all' : 'Select all'}
+                      </button>
+                      {selectedDocIds.size > 0 && (
+                        <button
+                          onClick={() => {
+                            if (confirm(`Delete ${selectedDocIds.size} documents?`)) {
+                              bulkDeleteMut.mutate(Array.from(selectedDocIds));
+                            }
+                          }}
+                          disabled={bulkDeleteMut.isPending}
+                          className="text-[11px] text-red-600 hover:text-red-800 flex items-center gap-1"
+                        >
+                          <Trash2 size={11} /> Delete {selectedDocIds.size}
+                        </button>
+                      )}
+                      <button
+                        onClick={() => { setSelectionMode(false); setSelectedDocIds(new Set()); }}
+                        className="text-[11px] text-gray-500 hover:text-gray-700 ml-auto"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  )}
 
                   {showDocControls && (
                     <div className="px-1 pb-2 mb-2 border-b border-gray-100 space-y-1.5">
@@ -337,6 +468,13 @@ export function ProjectView() {
                           ))}
                         </div>
                       </div>
+                      <button
+                        onClick={() => parseVarsMut.mutate()}
+                        disabled={parseVarsMut.isPending}
+                        className="text-[10px] px-2 py-1 rounded bg-gray-50 text-gray-600 hover:bg-indigo-50 hover:text-indigo-700 w-full text-left"
+                      >
+                        {parseVarsMut.isPending ? 'Parsing...' : 'Parse variables from filenames'}
+                      </button>
                     </div>
                   )}
 
@@ -349,11 +487,61 @@ export function ProjectView() {
                             ? 'bg-indigo-50 text-indigo-700'
                             : 'text-gray-700 hover:bg-gray-50'
                         }`}
-                        onClick={() => setSelectedDocId(doc.id)}
+                        onClick={() => {
+                          if (selectionMode) {
+                            setSelectedDocIds((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(doc.id)) next.delete(doc.id);
+                              else next.add(doc.id);
+                              return next;
+                            });
+                          } else {
+                            setSelectedDocId(doc.id);
+                          }
+                        }}
                       >
                         <div className="flex items-center gap-2 px-3 py-2">
-                          <FileText size={16} className="shrink-0" />
-                          <span className="truncate flex-1">{doc.name}</span>
+                          {selectionMode ? (
+                            selectedDocIds.has(doc.id)
+                              ? <CheckSquare size={16} className="shrink-0 text-indigo-600" />
+                              : <Square size={16} className="shrink-0 text-gray-400" />
+                          ) : (
+                            <FileText size={16} className="shrink-0" />
+                          )}
+                          {renamingDocId === doc.id ? (
+                            <input
+                              autoFocus
+                              className="flex-1 text-sm bg-white border border-indigo-300 rounded px-1 py-0 outline-none min-w-0"
+                              value={renameValue}
+                              onChange={(e) => setRenameValue(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter' && renameValue.trim()) {
+                                  renameDocMut.mutate({ id: doc.id, name: renameValue.trim() });
+                                } else if (e.key === 'Escape') {
+                                  setRenamingDocId(null);
+                                }
+                              }}
+                              onBlur={() => {
+                                if (renameValue.trim() && renameValue.trim() !== doc.name) {
+                                  renameDocMut.mutate({ id: doc.id, name: renameValue.trim() });
+                                } else {
+                                  setRenamingDocId(null);
+                                }
+                              }}
+                              onClick={(e) => e.stopPropagation()}
+                            />
+                          ) : (
+                            <span
+                              className="truncate flex-1"
+                              onDoubleClick={(e) => {
+                                e.stopPropagation();
+                                setRenamingDocId(doc.id);
+                                setRenameValue(doc.name);
+                              }}
+                            >
+                              {doc.name}
+                            </span>
+                          )}
                           <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0 ${
                             doc.source_type === 'pdf'
                               ? 'bg-red-100 text-red-600'
@@ -420,9 +608,9 @@ export function ProjectView() {
             )}
           </div>
 
-          {/* Resize handle */}
+          {/* Resize handle — positioned to straddle the border, not overlap scrollbar */}
           <div
-            className="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-indigo-200 active:bg-indigo-300 z-10"
+            className="absolute top-0 -right-1 w-2 h-full cursor-col-resize hover:bg-indigo-200 active:bg-indigo-300 z-10"
             onMouseDown={startResize}
           />
         </div>

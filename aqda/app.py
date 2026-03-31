@@ -17,7 +17,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="AQDA", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="AQDA", version="0.1.1", lifespan=lifespan)
 
 # API routes
 app.include_router(projects.router, prefix="/api/projects", tags=["projects"])
