@@ -28,6 +28,18 @@ def _safe_xml_text(text: str) -> str:
     return xml_escape(text)
 
 
+def _xs_datetime(ts: str | None) -> str | None:
+    """Convert SQLite 'YYYY-MM-DD HH:MM:SS' to xs:dateTime 'YYYY-MM-DDTHH:MM:SSZ'."""
+    if not ts:
+        return None
+    return ts.replace(" ", "T") + "Z"
+
+
+def _attrs(**kwargs) -> dict[str, str]:
+    """Build an attribute dict that drops any None values (so optional xs:dateTime attrs are omitted, not emitted empty)."""
+    return {k: v for k, v in kwargs.items() if v is not None}
+
+
 async def _load_project_data(project_id: int):
     """Load all project data for export."""
     db = await get_db()
@@ -104,18 +116,14 @@ async def export_qdpx(project_id: int):
     guid_map = {}
     user_guid = _uuid()
 
-    # Build XML
-    root = Element("Project", {
-        "xmlns": "urn:QDA-XML:project:1.0",
-        "name": project["name"],
-        "origin": "AQDA",
-        "creatingUserGUID": user_guid,
-        "creationDateTime": project["created_at"] + "Z" if project["created_at"] else "",
-    })
-
-    if project.get("description"):
-        desc = SubElement(root, "Description")
-        desc.text = _safe_xml_text(project["description"])
+    # Build XML. ProjectType sequence per REFI-QDA XSD: Users, CodeBook, ..., Sources, Notes, ..., Description (last).
+    root = Element("Project", _attrs(
+        xmlns="urn:QDA-XML:project:1.0",
+        name=project["name"],
+        origin="AQDA",
+        creatingUserGUID=user_guid,
+        creationDateTime=_xs_datetime(project["created_at"]),
+    ))
 
     # Users
     users_el = SubElement(root, "Users")
@@ -127,7 +135,7 @@ async def export_qdpx(project_id: int):
     code_tree = _build_code_tree(codes)
     _add_codes_xml(codes_el, code_tree, guid_map)
 
-    # Sources (documents)
+    # Sources (documents). Files go to "Sources/{guid}.txt"; XML references them as "internal://{guid}.txt".
     sources_el = SubElement(root, "Sources")
     codings_by_doc = {}
     for cg in codings:
@@ -136,29 +144,29 @@ async def export_qdpx(project_id: int):
     for doc in documents:
         doc_guid = _uuid()
         guid_map[("doc", doc["id"])] = doc_guid
-        source_el = SubElement(sources_el, "TextSource", {
-            "guid": doc_guid,
-            "name": doc["name"],
-            "plainTextPath": f"sources/{doc['name']}.txt",
-            "creatingUser": user_guid,
-            "creationDateTime": doc["created_at"] + "Z" if doc["created_at"] else "",
-        })
+        source_el = SubElement(sources_el, "TextSource", _attrs(
+            guid=doc_guid,
+            name=doc["name"],
+            plainTextPath=f"internal://{doc_guid}.txt",
+            creatingUser=user_guid,
+            creationDateTime=_xs_datetime(doc["created_at"]),
+        ))
 
         # Add coded selections
         for cg in codings_by_doc.get(doc["id"], []):
             sel_guid = _uuid()
-            sel_el = SubElement(source_el, "PlainTextSelection", {
-                "guid": sel_guid,
-                "startPosition": str(cg["start_pos"]),
-                "endPosition": str(cg["end_pos"]),
-                "creatingUser": user_guid,
-                "creationDateTime": cg["created_at"] + "Z" if cg["created_at"] else "",
-            })
-            coding_el = SubElement(sel_el, "Coding", {
-                "guid": _uuid(),
-                "creatingUser": user_guid,
-                "creationDateTime": cg["created_at"] + "Z" if cg["created_at"] else "",
-            })
+            sel_el = SubElement(source_el, "PlainTextSelection", _attrs(
+                guid=sel_guid,
+                startPosition=str(cg["start_pos"]),
+                endPosition=str(cg["end_pos"]),
+                creatingUser=user_guid,
+                creationDateTime=_xs_datetime(cg["created_at"]),
+            ))
+            coding_el = SubElement(sel_el, "Coding", _attrs(
+                guid=_uuid(),
+                creatingUser=user_guid,
+                creationDateTime=_xs_datetime(cg["created_at"]),
+            ))
             code_guid = guid_map.get(("code", cg["code_id"]), _uuid())
             SubElement(coding_el, "CodeRef", {"targetGUID": code_guid})
 
@@ -167,14 +175,19 @@ async def export_qdpx(project_id: int):
         notes_el = SubElement(root, "Notes")
         for memo in memos:
             note_guid = _uuid()
-            note_el = SubElement(notes_el, "Note", {
-                "guid": note_guid,
-                "name": memo["title"] or "Memo",
-                "creatingUser": user_guid,
-                "creationDateTime": memo["created_at"] + "Z" if memo["created_at"] else "",
-            })
+            note_el = SubElement(notes_el, "Note", _attrs(
+                guid=note_guid,
+                name=memo["title"] or "Memo",
+                creatingUser=user_guid,
+                creationDateTime=_xs_datetime(memo["created_at"]),
+            ))
             content_el = SubElement(note_el, "PlainTextContent")
             content_el.text = _safe_xml_text(memo["content"])
+
+    # Description must come after Notes per the ProjectType sequence in the XSD.
+    if project.get("description"):
+        desc = SubElement(root, "Description")
+        desc.text = _safe_xml_text(project["description"])
 
     # Build ZIP
     xml_bytes = b'<?xml version="1.0" encoding="UTF-8"?>\n' + tostring(root, encoding="unicode").encode("utf-8")
@@ -183,7 +196,8 @@ async def export_qdpx(project_id: int):
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("project.qde", xml_bytes)
         for doc in documents:
-            zf.writestr(f"sources/{doc['name']}.txt", doc["content"])
+            doc_guid = guid_map[("doc", doc["id"])]
+            zf.writestr(f"Sources/{doc_guid}.txt", doc["content"])
 
     buf.seek(0)
     filename = f"{project['name'].replace(' ', '_')}.qdpx"
