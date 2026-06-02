@@ -13,6 +13,8 @@ class MemoCreate(BaseModel):
     document_id: int | None = None
     code_id: int | None = None
     coding_id: int | None = None
+    start_pos: int | None = None
+    end_pos: int | None = None
     title: str = ""
     content: str = ""
 
@@ -64,9 +66,10 @@ async def create_memo(data: MemoCreate):
     db = await get_db()
     try:
         cursor = await db.execute(
-            "INSERT INTO memo (project_id, document_id, code_id, coding_id, title, content) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (data.project_id, data.document_id, data.code_id, data.coding_id, data.title, data.content),
+            "INSERT INTO memo (project_id, document_id, code_id, coding_id, start_pos, end_pos, title, content) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (data.project_id, data.document_id, data.code_id, data.coding_id,
+             data.start_pos, data.end_pos, data.title, data.content),
         )
         await db.commit()
         memo_id = cursor.lastrowid

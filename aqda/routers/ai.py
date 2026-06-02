@@ -29,6 +29,19 @@ def _get_http_client() -> httpx.AsyncClient:
 # Track embedding progress for the UI
 _embedding_progress: dict = {"active": False, "current": 0, "total": 0, "doc_name": ""}
 
+# Source types whose text AQDA embeds for search. text/pdf embed `content`;
+# audio embeds its (non-empty) transcript, so offsets index into the transcript.
+_EMBEDDABLE_SOURCE_SQL = (
+    "source_type IN ('text', 'pdf') "
+    "OR (source_type='audio' AND transcript IS NOT NULL AND TRIM(transcript) <> '')"
+)
+
+
+def _embed_text_for(row) -> str:
+    """The text AQDA embeds for a document row: transcript for audio, else content."""
+    text = row["transcript"] if row["source_type"] == "audio" else row["content"]
+    return text or ""
+
 
 def _sync_db() -> sqlite3.Connection:
     """Synchronous SQLite connection for embedding operations (avoids aiosqlite memory leak)."""
@@ -139,6 +152,35 @@ def _chunk_id(doc_id: int, start: int, end: int, model: str) -> str:
     """Deterministic ID for a chunk embedding."""
     raw = f"{doc_id}:{start}:{end}:{model}"
     return hashlib.md5(raw.encode()).hexdigest()
+
+
+_SENTENCE_END = (".", "!", "?", "\n")
+
+
+def _snap_to_sentences(text: str, start: int, end: int) -> tuple[int, int]:
+    """Expand a [start, end) span outward to the nearest sentence boundaries.
+
+    Keeps suggested codings from beginning mid-sentence, so 'accepting' a
+    suggestion applies a clean, readable span.
+    """
+    n = len(text)
+    start = max(0, min(start, n))
+    end = max(start, min(end, n))
+    # Walk the start back to just after the previous sentence terminator.
+    s = start
+    while s > 0 and text[s - 1] not in _SENTENCE_END:
+        s -= 1
+    while s < end and text[s] in " \t\r\n":
+        s += 1
+    # Walk the end forward to finish the current sentence.
+    e = end
+    while e < n and text[e - 1] not in _SENTENCE_END:
+        e += 1
+    while e > s and text[e - 1] in " \t\r\n":
+        e -= 1
+    if e <= s:
+        return start, end
+    return s, e
 
 
 EMBED_BATCH_SIZE = 10  # embed this many chunks per Ollama call
@@ -265,8 +307,8 @@ async def embedding_status(project_id: int):
     conn = _sync_db()
     try:
         cursor = conn.execute(
-            "SELECT id, name FROM document "
-            "WHERE project_id=? AND source_type IN ('text', 'pdf')",
+            f"SELECT id, name FROM document "
+            f"WHERE project_id=? AND ({_EMBEDDABLE_SOURCE_SQL})",
             (project_id,),
         )
         docs = cursor.fetchall()
@@ -334,13 +376,16 @@ async def find_similar(req: SimilarSearchRequest):
             placeholders = ",".join("?" * len(req.document_ids))
             cursor = await db.execute(
                 f"SELECT id, name, source_type FROM document "
-                f"WHERE project_id=? AND id IN ({placeholders}) AND source_type='text'",
+                f"WHERE project_id=? AND id IN ({placeholders}) "
+                f"AND ({_EMBEDDABLE_SOURCE_SQL}) "
+                f"AND COALESCE(exclude_from_ai, 0)=0",
                 [req.project_id] + req.document_ids,
             )
         else:
             cursor = await db.execute(
-                "SELECT id, name, source_type FROM document "
-                "WHERE project_id=? AND source_type IN ('text', 'pdf')",
+                f"SELECT id, name, source_type FROM document "
+                f"WHERE project_id=? AND ({_EMBEDDABLE_SOURCE_SQL}) "
+                f"AND COALESCE(exclude_from_ai, 0)=0",
                 (req.project_id,),
             )
         docs = await cursor.fetchall()
@@ -361,10 +406,11 @@ async def find_similar(req: SimilarSearchRequest):
             conn = _sync_db()
             try:
                 cursor = conn.execute(
-                    "SELECT content FROM document WHERE id=?", (doc["id"],)
+                    "SELECT content, transcript, source_type FROM document WHERE id=?",
+                    (doc["id"],),
                 )
                 row = cursor.fetchone()
-                content = row["content"] if row else ""
+                content = _embed_text_for(row) if row else ""
             finally:
                 conn.close()
             await _ensure_doc_embedded(
@@ -382,9 +428,12 @@ async def find_similar(req: SimilarSearchRequest):
     except Exception as e:
         raise HTTPException(503, f"Ollama embedding failed: {e}")
 
+    # Scope the search to the resolved (non-excluded, still-existing) documents so
+    # cached chunks from reference/deleted docs never surface in results.
+    search_doc_ids = [doc["id"] for doc in docs]
     results = await _search_embeddings(
         query_embedding, req.project_id, embed_model,
-        top_k=req.top_k, document_ids=req.document_ids,
+        top_k=req.top_k, document_ids=search_doc_ids,
     )
 
     # Add document names
@@ -512,6 +561,28 @@ async def suggest_codings(req: AutoCodeRequest):
             filtered.append(result)
             if len(filtered) >= req.top_k:
                 break
+
+    # Snap suggestions to sentence boundaries so they don't start mid-sentence
+    # and 'accepting' one applies a clean span.
+    if filtered:
+        conn = _sync_db()
+        try:
+            contents: dict[int, str] = {}
+            for doc_id in {r["document_id"] for r in filtered}:
+                cur = conn.execute(
+                    "SELECT content, transcript, source_type FROM document WHERE id=?",
+                    (doc_id,),
+                )
+                row = cur.fetchone()
+                contents[doc_id] = _embed_text_for(row) if row else ""
+        finally:
+            conn.close()
+        for r in filtered:
+            content = contents.get(r["document_id"], "")
+            if content:
+                s, e = _snap_to_sentences(content, r["start_pos"], r["end_pos"])
+                r["start_pos"], r["end_pos"] = s, e
+                r["text"] = content[s:e]
 
     return filtered
 

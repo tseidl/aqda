@@ -14,10 +14,11 @@ AQDA gives you a modern coding interface with local AI assistance — without cl
 ### Core Qualitative Coding
 
 - **Text coding** — Select text, apply codes, build your codebook. Click on any coded passage to see applied codes or remove them.
-- **Hierarchical codes** — Organize codes in parent-child trees with colors and descriptions.
+- **Hierarchical codes** — Organize codes in parent-child trees with colors and descriptions. Drag and drop in the sidebar to re-parent or reorder.
 - **Image & audio support** — Import images (JPG, PNG, GIF, WebP) and audio files (MP3, WAV, M4A) with optional local transcription via Whisper.
-- **Memos** — Write analytical notes at the project, document, or code level.
-- **Document variables** — Add metadata (author, date, source) to documents. Auto-extract from filenames on import.
+- **Memos** — Write analytical notes at the project, document, or code level. Anchor a memo to a specific passage and jump back to it, and reference codes or other memos inline by typing `@` — click a reference to jump straight to it.
+- **Document variables & tags** — Add metadata (author, date, source) to documents, auto-extracted from filenames on import. Give a document a short tag (e.g. `INT`) shown next to it in the sidebar.
+- **Coder identity** — Set your name in Settings; each coding records who made it, so collaborators show up as distinct coders in REFI-QDA exports.
 - **Segments browser** — Browse all coded segments across documents. Click to jump to the passage in context, or delete directly from the list.
 - **Export** — REFI-QDA (.qdpx) for MAXQDA/ATLAS.ti/NVivo, codebook (.qdc), CSV, JSON.
 
@@ -28,12 +29,14 @@ AQDA uses [Ollama](https://ollama.com) to run AI models locally on your computer
 | Feature | What it does |
 |---------|-------------|
 | **Topic Search** | Find passages across your documents that match a topic or theme you describe |
-| **Code Suggest** | Given a code, find uncoded passages that might belong to it — based on its definition and existing coded examples |
+| **Code Suggest** | Given a code, find uncoded passages that might belong to it (from its definition and coded examples); review each and **Apply** or **Dismiss** it |
 | **Consistency Check** | Flag coded segments that seem like outliers within a code — like inter-rater reliability with yourself over time |
 | **Hierarchy Suggest** | After inductive coding, get suggestions for grouping your codes into parent categories |
 | **Code Definition Generator** | Applied a code many times but haven't written a definition yet? Generate one from the actual coded passages |
 
 When you click on an AI result, AQDA jumps to the passage in the document and highlights it, so you can immediately see the context and decide whether to code it.
+
+Topic Search and Code Suggest cover text, PDF, and transcribed audio. Mark any document as **Reference** from its header (e.g. pre-coded examples or training material) to keep it out of AI results.
 
 These tools are designed as a **methodological interlocutor** — they interrogate your coding rather than generate it. The researcher always has the final word.
 

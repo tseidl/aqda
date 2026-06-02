@@ -1,13 +1,17 @@
-import { useState, useMemo, useRef, useEffect } from 'react';
+import { useState, useMemo, useRef, useEffect, type DragEvent } from 'react';
 import { useMutation, useQueryClient, useQuery } from '@tanstack/react-query';
-import { ChevronRight, ChevronDown, Plus, Trash2, Pencil, Sparkles, Copy } from 'lucide-react';
-import { codes as codesApi, settings as settingsApi, ai, type Code } from '../api';
+import { ChevronRight, ChevronDown, Plus, Trash2, Pencil, Sparkles, Copy, GripVertical } from 'lucide-react';
+import { codes as codesApi, settings as settingsApi, ai, type Code, type Memo } from '../api';
+import { MentionTextarea, MentionView } from './MentionTextarea';
+import { buildMentionCandidates, type MentionCandidate } from './mentions';
 
 interface Props {
   projectId: number;
   codes: Code[];
+  memos: Memo[];
   selectedCodeId: number | null;
   onSelectCode: (id: number | null) => void;
+  onJumpToMention: (c: MentionCandidate) => void;
 }
 
 const COLOR_SCHEMES: Record<string, string[]> = {
@@ -35,6 +39,37 @@ function buildTree(codes: Code[]): Code[] {
   return roots;
 }
 
+type DropPos = 'before' | 'after' | 'inside';
+
+type DndCtx = {
+  draggingId: number | null;
+  dropTarget: { id: number; pos: DropPos } | null;
+  onDragStart: (id: number) => void;
+  onDragOver: (id: number, pos: DropPos) => void;
+  onDrop: (id: number, pos: DropPos) => void;
+  onDragEnd: () => void;
+};
+
+/** True if nodeId is ancestorId itself or sits within ancestorId's subtree. */
+function isInSubtree(codes: Code[], nodeId: number, ancestorId: number): boolean {
+  const byId = new Map(codes.map((c) => [c.id, c]));
+  let cur: number | null = nodeId;
+  while (cur != null) {
+    if (cur === ancestorId) return true;
+    cur = byId.get(cur)?.parent_id ?? null;
+  }
+  return false;
+}
+
+/** Read the drop position (before/inside/after) from the pointer's place in a row. */
+function dropPosFromEvent(e: DragEvent<HTMLElement>): DropPos {
+  const rect = e.currentTarget.getBoundingClientRect();
+  const y = e.clientY - rect.top;
+  if (y < rect.height * 0.3) return 'before';
+  if (y > rect.height * 0.7) return 'after';
+  return 'inside';
+}
+
 function CodeNode({
   code,
   depth,
@@ -42,6 +77,7 @@ function CodeNode({
   onSelectCode,
   projectId,
   colors,
+  dnd,
 }: {
   code: Code & { children?: Code[] };
   depth: number;
@@ -49,6 +85,7 @@ function CodeNode({
   onSelectCode: (id: number | null) => void;
   projectId: number;
   colors: string[];
+  dnd: DndCtx;
 }) {
   const [expanded, setExpanded] = useState(true);
   const [editing, setEditing] = useState(false);
@@ -71,16 +108,46 @@ function CodeNode({
 
   const hasChildren = (code.children?.length ?? 0) > 0;
   const isSelected = selectedCodeId === code.id;
+  const isDragging = dnd.draggingId === code.id;
+  const isDropTarget = dnd.dropTarget?.id === code.id;
+  const dropPos = isDropTarget ? dnd.dropTarget!.pos : null;
 
   return (
     <div>
       <div
+        draggable={!editing}
+        onDragStart={(e) => {
+          e.dataTransfer.effectAllowed = 'move';
+          dnd.onDragStart(code.id);
+        }}
+        onDragOver={(e) => {
+          if (dnd.draggingId == null || dnd.draggingId === code.id) return;
+          e.preventDefault();
+          dnd.onDragOver(code.id, dropPosFromEvent(e));
+        }}
+        onDrop={(e) => {
+          if (dnd.draggingId == null) return;
+          e.preventDefault();
+          e.stopPropagation();
+          dnd.onDrop(code.id, dropPosFromEvent(e));
+        }}
+        onDragEnd={dnd.onDragEnd}
         className={`flex items-center gap-1 px-2 py-1 cursor-pointer rounded-md mx-1 group ${
           isSelected ? 'bg-indigo-50' : 'hover:bg-gray-50'
+        } ${isDragging ? 'opacity-40' : ''} ${
+          isDropTarget && dropPos === 'inside' ? 'ring-2 ring-indigo-400 ring-inset' : ''
         }`}
-        style={{ paddingLeft: `${depth * 16 + 8}px` }}
+        style={{
+          paddingLeft: `${depth * 16 + 8}px`,
+          ...(isDropTarget && dropPos === 'before' ? { boxShadow: 'inset 0 2px 0 0 #6366f1' } : {}),
+          ...(isDropTarget && dropPos === 'after' ? { boxShadow: 'inset 0 -2px 0 0 #6366f1' } : {}),
+        }}
         onClick={() => onSelectCode(isSelected ? null : code.id)}
       >
+        <GripVertical
+          size={12}
+          className="shrink-0 text-gray-300 opacity-0 group-hover:opacity-100 cursor-grab"
+        />
         {hasChildren ? (
           <button
             onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }}
@@ -183,6 +250,7 @@ function CodeNode({
               onSelectCode={onSelectCode}
               projectId={projectId}
               colors={colors}
+              dnd={dnd}
             />
           ))}
         </div>
@@ -192,9 +260,13 @@ function CodeNode({
 }
 
 /** Inline editor for a code's description/definition. */
-function CodeDescriptionEditor({ code, projectId }: { code: Code; projectId: number }) {
+function CodeDescriptionEditor({ code, projectId, codes, memos, onJumpToMention }: {
+  code: Code; projectId: number; codes: Code[]; memos: Memo[];
+  onJumpToMention: (c: MentionCandidate) => void;
+}) {
   const queryClient = useQueryClient();
   const [desc, setDesc] = useState(code.description);
+  const [editing, setEditing] = useState(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const [summaryText, setSummaryText] = useState<string | null>(null);
   const [summaryLoading, setSummaryLoading] = useState(false);
@@ -254,13 +326,28 @@ function CodeDescriptionEditor({ code, projectId }: { code: Code; projectId: num
         <span className="text-xs text-gray-400 ml-auto">{code.coding_count ?? 0} segments</span>
       </div>
       <label className="block text-xs font-medium text-gray-500 mb-1">Definition / Description</label>
-      <textarea
-        value={desc}
-        onChange={(e) => handleChange(e.target.value)}
-        placeholder="Define this code: what does it mean, when should it be applied, what are inclusion/exclusion criteria..."
-        className="w-full px-2.5 py-2 text-sm border border-gray-200 rounded-md focus:outline-none focus:ring-1 focus:ring-indigo-500 resize-y bg-white min-h-[4.5rem]"
-        rows={5}
-      />
+      {editing ? (
+        <MentionTextarea
+          rows={5}
+          autoFocus
+          className="border border-gray-200 rounded-md bg-white focus-within:ring-1 focus-within:ring-indigo-500"
+          textClassName="px-2.5 py-2 text-sm"
+          value={desc}
+          onChange={handleChange}
+          candidates={buildMentionCandidates(codes, memos)}
+          placeholder="Define this code: what it means, when to apply it… (type @ to reference a code or memo)"
+          onBlur={() => setEditing(false)}
+        />
+      ) : (
+        <MentionView
+          value={desc}
+          candidates={buildMentionCandidates(codes, memos)}
+          onJump={onJumpToMention}
+          onEdit={() => setEditing(true)}
+          className="min-h-[4.5rem] max-h-40 overflow-auto border border-gray-200 rounded-md bg-white px-2.5 py-2 text-sm text-gray-800"
+          placeholder="Define this code: what it means, when to apply it… (type @ to reference a code or memo)"
+        />
+      )}
       <div className="flex items-center justify-between mt-1">
         <p className="text-xs text-gray-400">
           {updateMut.isPending ? 'Saving...' : 'Auto-saves as you type'}
@@ -296,11 +383,13 @@ function CodeDescriptionEditor({ code, projectId }: { code: Code; projectId: num
   );
 }
 
-export function CodeTree({ projectId, codes, selectedCodeId, onSelectCode }: Props) {
+export function CodeTree({ projectId, codes, memos, selectedCodeId, onSelectCode, onJumpToMention }: Props) {
   const [showNew, setShowNew] = useState(false);
   const [newName, setNewName] = useState('');
+  const [newDesc, setNewDesc] = useState('');
   const queryClient = useQueryClient();
   const tree = useMemo(() => buildTree(codes), [codes]);
+  const mentionCandidates = useMemo(() => buildMentionCandidates(codes, memos), [codes, memos]);
   const selectedCode = codes.find((c) => c.id === selectedCodeId);
 
   const { data: currentSettings } = useQuery({
@@ -311,18 +400,100 @@ export function CodeTree({ projectId, codes, selectedCodeId, onSelectCode }: Pro
   const colors = COLOR_SCHEMES[currentSettings?.color_scheme ?? 'Default'] ?? COLOR_SCHEMES.Default;
 
   const createMut = useMutation({
-    mutationFn: (data: { name: string; parent_id?: number }) =>
+    mutationFn: (data: { name: string; parent_id?: number; description?: string }) =>
       codesApi.create({ project_id: projectId, color: colors[codes.length % colors.length], ...data }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['codes', projectId] });
       setNewName('');
+      setNewDesc('');
       setShowNew(false);
     },
   });
 
+  const submitNewCode = () => {
+    if (!newName.trim()) return;
+    createMut.mutate({
+      name: newName.trim(),
+      parent_id: selectedCodeId ?? undefined,
+      description: newDesc.trim() || undefined,
+    });
+  };
+
+  // --- Drag-and-drop reorganization ---
+  const [draggingId, setDraggingId] = useState<number | null>(null);
+  const [dropTarget, setDropTarget] = useState<{ id: number; pos: DropPos } | null>(null);
+
+  const handleMove = async (draggedId: number, targetId: number | null, pos: DropPos) => {
+    const dragged = codes.find((c) => c.id === draggedId);
+    if (!dragged) return;
+    const target = targetId == null ? null : codes.find((c) => c.id === targetId);
+    // Can't drop a code into itself or its own subtree (server also rejects cycles).
+    if (targetId != null && (!target || isInSubtree(codes, targetId, draggedId))) return;
+
+    const newParent: number | null =
+      pos === 'inside' ? (target ? target.id : null) : target ? (target.parent_id ?? null) : null;
+
+    // Destination siblings in current display order, excluding the dragged code.
+    const siblings = codes
+      .filter((c) => (c.parent_id ?? null) === newParent && c.id !== draggedId)
+      .sort((a, b) => a.sort_order - b.sort_order || a.name.localeCompare(b.name));
+
+    let insertIdx = siblings.length;
+    if (pos !== 'inside' && target) {
+      const ti = siblings.findIndex((c) => c.id === target.id);
+      if (ti >= 0) insertIdx = pos === 'before' ? ti : ti + 1;
+    }
+    const ordered = [...siblings.slice(0, insertIdx), dragged, ...siblings.slice(insertIdx)];
+
+    // Persist only what changed: the dragged code's parent, plus any shifted sort_order.
+    const updates: Promise<unknown>[] = [];
+    ordered.forEach((c, idx) => {
+      const parentChanged = c.id === draggedId && (c.parent_id ?? null) !== newParent;
+      const orderChanged = c.sort_order !== idx;
+      if (parentChanged || orderChanged) {
+        const payload: Partial<Code> = { sort_order: idx };
+        if (c.id === draggedId) payload.parent_id = newParent;
+        updates.push(codesApi.update(c.id, payload));
+      }
+    });
+    if (updates.length) {
+      await Promise.all(updates);
+      queryClient.invalidateQueries({ queryKey: ['codes', projectId] });
+    }
+  };
+
+  const dnd: DndCtx = {
+    draggingId,
+    dropTarget,
+    onDragStart: (id) => setDraggingId(id),
+    onDragOver: (id, pos) => setDropTarget({ id, pos }),
+    onDrop: (id, pos) => {
+      if (draggingId != null) handleMove(draggingId, id, pos);
+      setDraggingId(null);
+      setDropTarget(null);
+    },
+    onDragEnd: () => {
+      setDraggingId(null);
+      setDropTarget(null);
+    },
+  };
+
   return (
     <div className="flex flex-col h-full">
-      <div className="flex-1 overflow-auto py-2">
+      <div
+        className="flex-1 overflow-auto py-2"
+        onDragOver={(e) => {
+          if (draggingId != null) e.preventDefault();
+        }}
+        onDrop={(e) => {
+          // Dropped on empty space (node drops stop propagation) -> move to top level.
+          if (draggingId == null) return;
+          e.preventDefault();
+          handleMove(draggingId, null, 'inside');
+          setDraggingId(null);
+          setDropTarget(null);
+        }}
+      >
         <div className="px-3 mb-2 flex items-center justify-between">
           <span className="text-xs font-medium text-gray-500 uppercase tracking-wide">Codes</span>
           <button
@@ -334,7 +505,7 @@ export function CodeTree({ projectId, codes, selectedCodeId, onSelectCode }: Pro
         </div>
 
         {showNew && (
-          <div className="mx-2 mb-2">
+          <div className="mx-2 mb-2 space-y-1.5">
             <input
               autoFocus
               placeholder="Code name"
@@ -342,20 +513,33 @@ export function CodeTree({ projectId, codes, selectedCodeId, onSelectCode }: Pro
               onChange={(e) => setNewName(e.target.value)}
               className="w-full px-2 py-1.5 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-1 focus:ring-indigo-500"
               onKeyDown={(e) => {
-                if (e.key === 'Enter' && newName.trim()) {
-                  createMut.mutate({
-                    name: newName.trim(),
-                    parent_id: selectedCodeId ?? undefined,
-                  });
-                }
-                if (e.key === 'Escape') { setShowNew(false); setNewName(''); }
+                if (e.key === 'Enter' && newName.trim()) submitNewCode();
+                if (e.key === 'Escape') { setShowNew(false); setNewName(''); setNewDesc(''); }
               }}
             />
-            <p className="text-xs text-gray-400 mt-1 px-1">
-              {selectedCodeId
-                ? `Will be created under "${codes.find((c) => c.id === selectedCodeId)?.name}"`
-                : 'Will be created at top level'}
-            </p>
+            <MentionTextarea
+              rows={2}
+              className="border border-gray-300 rounded-md focus-within:ring-1 focus-within:ring-indigo-500"
+              textClassName="px-2 py-1.5 text-sm"
+              value={newDesc}
+              onChange={setNewDesc}
+              candidates={mentionCandidates}
+              placeholder="Definition (optional) — type @ to reference a code or memo"
+            />
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs text-gray-400 px-1 truncate">
+                {selectedCodeId
+                  ? `Under “${codes.find((c) => c.id === selectedCodeId)?.name}”`
+                  : 'Top level'}
+              </p>
+              <button
+                onClick={submitNewCode}
+                disabled={!newName.trim()}
+                className="text-xs px-2 py-1 rounded bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+              >
+                Create
+              </button>
+            </div>
           </div>
         )}
 
@@ -373,6 +557,7 @@ export function CodeTree({ projectId, codes, selectedCodeId, onSelectCode }: Pro
               onSelectCode={onSelectCode}
               projectId={projectId}
               colors={colors}
+              dnd={dnd}
             />
           ))
         )}
@@ -384,6 +569,9 @@ export function CodeTree({ projectId, codes, selectedCodeId, onSelectCode }: Pro
           key={selectedCode.id}
           code={selectedCode}
           projectId={projectId}
+          codes={codes}
+          memos={memos}
+          onJumpToMention={onJumpToMention}
         />
       )}
     </div>

@@ -4,14 +4,15 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowLeft, Upload, FileText, Tags, StickyNote, Search,
   Download, ChevronDown, Sparkles, Plus, Trash2, Settings,
-  Filter, LayoutList, CheckSquare, Square,
+  Filter, LayoutList, CheckSquare, Square, Tag, BookMarked,
 } from 'lucide-react';
-import { projects, documents, codes, codings, type Document as Doc } from '../api';
+import { projects, documents, codes, codings, memos, type Document as Doc } from '../api';
 import { CodeTree } from '../components/CodeTree';
 import { DocumentViewer } from '../components/DocumentViewer';
 import { MemoPanel } from '../components/MemoPanel';
 import { SegmentsBrowser } from '../components/SegmentsBrowser';
 import { AiPanel } from '../components/AiPanel';
+import type { MentionCandidate } from '../components/mentions';
 
 type Tab = 'codes' | 'documents' | 'memos' | 'segments' | 'ai';
 
@@ -23,6 +24,7 @@ export function ProjectView() {
   const [activeTab, setActiveTab] = useState<Tab>('documents');
   const [selectedDocId, setSelectedDocId] = useState<number | null>(null);
   const [selectedCodeId, setSelectedCodeId] = useState<number | null>(null);
+  const [selectedMemoId, setSelectedMemoId] = useState<number | null>(null);
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(280);
   const isResizing = useRef(false);
@@ -39,6 +41,8 @@ export function ProjectView() {
   const [selectionMode, setSelectionMode] = useState(false);
   const [renamingDocId, setRenamingDocId] = useState<number | null>(null);
   const [renameValue, setRenameValue] = useState('');
+  const [taggingDocId, setTaggingDocId] = useState<number | null>(null);
+  const [tagValue, setTagValue] = useState('');
   const [docSearch, setDocSearch] = useState('');
 
   // Drag-to-resize sidebar
@@ -95,6 +99,12 @@ export function ProjectView() {
   const { data: codeList = [] } = useQuery({
     queryKey: ['codes', projectId],
     queryFn: () => codes.list(projectId),
+  });
+
+  // Shared with MemoPanel (same query key) — used for @-mention candidates.
+  const { data: memoList = [] } = useQuery({
+    queryKey: ['memos', projectId],
+    queryFn: () => memos.list({ project_id: projectId }),
   });
 
   const { data: selectedDoc } = useQuery({
@@ -159,6 +169,16 @@ export function ProjectView() {
     },
   });
 
+  const setDocLabelMut = useMutation({
+    mutationFn: ({ id, label }: { id: number; label: string }) =>
+      documents.update(id, { label }),
+    onSuccess: (_, vars) => {
+      queryClient.invalidateQueries({ queryKey: ['documents', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['document', vars.id] });
+      setTaggingDocId(null);
+    },
+  });
+
   const parseVarsMut = useMutation({
     mutationFn: () => documents.parseVariables(projectId),
     onSuccess: (result) => {
@@ -182,6 +202,30 @@ export function ProjectView() {
       queryClient.invalidateQueries({ queryKey: ['codes', projectId] });
     },
   });
+
+  const createMemoMut = useMutation({
+    mutationFn: memos.create,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos', projectId] }),
+  });
+
+  // Create a memo anchored to the current document + selected passage.
+  const handleAddMemo = useCallback(
+    (startPos: number, endPos: number, text: string, title?: string, content?: string) => {
+      if (!selectedDocId) return;
+      const trimmed = text.trim();
+      const snippet = trimmed.length > 50 ? trimmed.slice(0, 50) + '…' : trimmed;
+      const note = (content ?? '').trim();
+      createMemoMut.mutate({
+        project_id: projectId,
+        document_id: selectedDocId,
+        start_pos: startPos,
+        end_pos: endPos,
+        title: (title && title.trim()) || snippet || 'Memo',
+        content: note || `“${trimmed}”`,
+      });
+    },
+    [selectedDocId, projectId, createMemoMut]
+  );
 
   const handleFileUpload = useCallback(() => {
     const input = document.createElement('input');
@@ -209,6 +253,19 @@ export function ProjectView() {
     },
     [selectedDocId, createCodingMut]
   );
+
+  // Jump to a code or memo referenced via an @mention
+  const handleJumpToMention = useCallback((c: MentionCandidate) => {
+    const numId = Number(c.id.slice(1));
+    if (Number.isNaN(numId)) return;
+    if (c.kind === 'code') {
+      setSelectedCodeId(numId);
+      setActiveTab('codes');
+    } else {
+      setSelectedMemoId(numId);
+      setActiveTab('memos');
+    }
+  }, []);
 
   const tabs: { key: Tab; label: string; icon: React.ReactNode }[] = [
     { key: 'documents', label: 'Docs', icon: <FileText size={20} /> },
@@ -354,8 +411,10 @@ export function ProjectView() {
               <CodeTree
                 projectId={projectId}
                 codes={codeList}
+                memos={memoList}
                 selectedCodeId={selectedCodeId}
                 onSelectCode={setSelectedCodeId}
+                onJumpToMention={handleJumpToMention}
               />
             )}
             {activeTab === 'documents' && (
@@ -542,6 +601,45 @@ export function ProjectView() {
                               {doc.name}
                             </span>
                           )}
+                          {/* Reference (excluded from AI) indicator */}
+                          {doc.exclude_from_ai ? (
+                            <span title="Reference — excluded from AI suggestions" className="shrink-0 text-amber-500">
+                              <BookMarked size={12} />
+                            </span>
+                          ) : null}
+                          {/* User-set short tag */}
+                          {taggingDocId === doc.id ? (
+                            <input
+                              autoFocus
+                              value={tagValue}
+                              maxLength={6}
+                              placeholder="TAG"
+                              onClick={(e) => e.stopPropagation()}
+                              onChange={(e) => setTagValue(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') setDocLabelMut.mutate({ id: doc.id, label: tagValue.trim() });
+                                else if (e.key === 'Escape') setTaggingDocId(null);
+                              }}
+                              onBlur={() => setDocLabelMut.mutate({ id: doc.id, label: tagValue.trim() })}
+                              className="w-12 text-[10px] uppercase px-1 py-0.5 border border-indigo-300 rounded bg-white outline-none shrink-0"
+                            />
+                          ) : doc.label ? (
+                            <span
+                              onClick={(e) => { e.stopPropagation(); setTaggingDocId(doc.id); setTagValue(doc.label ?? ''); }}
+                              className="text-[10px] px-1.5 py-0.5 rounded font-semibold shrink-0 bg-indigo-100 text-indigo-700 uppercase cursor-pointer hover:bg-indigo-200"
+                              title="Edit tag"
+                            >
+                              {doc.label}
+                            </span>
+                          ) : (
+                            <button
+                              onClick={(e) => { e.stopPropagation(); setTaggingDocId(doc.id); setTagValue(''); }}
+                              className="hidden group-hover:flex items-center text-gray-300 hover:text-indigo-600 shrink-0"
+                              title="Add tag"
+                            >
+                              <Tag size={12} />
+                            </button>
+                          )}
                           <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0 ${
                             doc.source_type === 'pdf'
                               ? 'bg-red-100 text-red-600'
@@ -580,7 +678,21 @@ export function ProjectView() {
               </div>
             )}
             {activeTab === 'memos' && (
-              <MemoPanel projectId={projectId} />
+              <MemoPanel
+                projectId={projectId}
+                codes={codeList}
+                selectedMemoId={selectedMemoId}
+                onSelectMemo={setSelectedMemoId}
+                onJumpToMention={handleJumpToMention}
+                selectedDocId={selectedDocId}
+                selectedDocName={selectedDoc?.name}
+                onNavigate={(docId, startPos, endPos) => {
+                  setSelectedDocId(docId);
+                  if (startPos !== undefined && endPos !== undefined) {
+                    setHighlightRange({ start: startPos, end: endPos });
+                  }
+                }}
+              />
             )}
             {activeTab === 'segments' && (
               <SegmentsBrowser
@@ -622,10 +734,12 @@ export function ProjectView() {
               document={selectedDoc}
               codings={docCodings}
               codes={codeList}
+              memos={memoList}
               selectedCodeId={selectedCodeId}
               onApplyCode={handleApplyCode}
               onDeleteCoding={(id) => deleteCodingMut.mutate(id)}
               onSelectCode={(id) => { setSelectedCodeId(id); setActiveTab('codes'); }}
+              onAddMemo={handleAddMemo}
               highlightRange={highlightRange}
               onHighlightClear={() => setHighlightRange(null)}
             />

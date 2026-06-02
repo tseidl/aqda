@@ -15,6 +15,7 @@ router = APIRouter()
 ALLOWED_SETTINGS = {
     "ollama_url", "llm_model", "embedding_model", "chunk_size", "chunk_overlap",
     "filename_pattern", "filename_variables", "whisper_model", "color_scheme",
+    "coder_name", "think_mode",
 }
 
 
@@ -72,6 +73,9 @@ async def get_settings():
 
 @router.put("")
 async def update_settings(items: list[SettingUpdate]):
+    # Only accept known settings keys — ignores internal keys (e.g. schema_version)
+    # that the frontend round-trips, so they can't be clobbered.
+    items = [item for item in items if item.key in ALLOWED_SETTINGS]
     errors = {}
     for item in items:
         err = _validate_setting(item.key, item.value)

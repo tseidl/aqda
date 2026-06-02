@@ -55,10 +55,14 @@ async def list_codings(document_id: int | None = None, code_id: int | None = Non
 async def create_coding(data: CodingCreate):
     db = await get_db()
     try:
+        # Stamp the coding with the current coder identity (per-coding attribution).
+        cursor = await db.execute("SELECT value FROM setting WHERE key='coder_name'")
+        row = await cursor.fetchone()
+        coder = (row["value"] if row else "") or ""
         cursor = await db.execute(
-            "INSERT INTO coding (document_id, code_id, start_pos, end_pos, selected_text) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (data.document_id, data.code_id, data.start_pos, data.end_pos, data.selected_text),
+            "INSERT INTO coding (document_id, code_id, start_pos, end_pos, selected_text, coder) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (data.document_id, data.code_id, data.start_pos, data.end_pos, data.selected_text, coder),
         )
         await db.commit()
         coding_id = cursor.lastrowid

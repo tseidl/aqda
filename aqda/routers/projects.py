@@ -193,15 +193,25 @@ async def import_from_db(file: UploadFile = File(...)):
                 docs = await cursor.fetchall()
                 doc_map: dict[int, int] = {}  # old_id -> new_id
                 for doc in docs:
-                    # transcript column may not exist in older exports
+                    # transcript/label/exclude_from_ai may not exist in older exports
                     transcript = None
+                    label = ""
+                    exclude_from_ai = 0
                     try:
                         transcript = doc["transcript"]
                     except (IndexError, KeyError):
                         pass
+                    try:
+                        label = doc["label"] or ""
+                    except (IndexError, KeyError):
+                        pass
+                    try:
+                        exclude_from_ai = doc["exclude_from_ai"] or 0
+                    except (IndexError, KeyError):
+                        pass
                     c = await dst.execute(
-                        "INSERT INTO document (project_id, name, content, source_type, transcript, created_at, modified_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (new_project_id, doc["name"], doc["content"], doc["source_type"], transcript, doc["created_at"], doc["modified_at"]),
+                        "INSERT INTO document (project_id, name, content, source_type, transcript, label, exclude_from_ai, created_at, modified_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (new_project_id, doc["name"], doc["content"], doc["source_type"], transcript, label, exclude_from_ai, doc["created_at"], doc["modified_at"]),
                     )
                     doc_map[doc["id"]] = c.lastrowid
 
@@ -248,9 +258,14 @@ async def import_from_db(file: UploadFile = File(...)):
                         new_doc = doc_map.get(coding["document_id"])
                         new_code = code_map.get(coding["code_id"])
                         if new_doc and new_code:
+                            coder = ""
+                            try:
+                                coder = coding["coder"] or ""
+                            except (IndexError, KeyError):
+                                pass
                             await dst.execute(
-                                "INSERT INTO coding (document_id, code_id, start_pos, end_pos, selected_text, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                                (new_doc, new_code, coding["start_pos"], coding["end_pos"], coding["selected_text"], coding["created_at"]),
+                                "INSERT INTO coding (document_id, code_id, start_pos, end_pos, selected_text, coder, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                (new_doc, new_code, coding["start_pos"], coding["end_pos"], coding["selected_text"], coder, coding["created_at"]),
                             )
 
                 # Copy memos
@@ -260,10 +275,15 @@ async def import_from_db(file: UploadFile = File(...)):
                     )
                     memos = await cursor.fetchall()
                     for memo in memos:
+                        m_start = m_end = None
+                        try:
+                            m_start, m_end = memo["start_pos"], memo["end_pos"]
+                        except (IndexError, KeyError):
+                            pass
                         await dst.execute(
-                            "INSERT INTO memo (project_id, document_id, code_id, title, content, created_at, modified_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            "INSERT INTO memo (project_id, document_id, code_id, start_pos, end_pos, title, content, created_at, modified_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             (new_project_id, doc_map.get(memo["document_id"]), code_map.get(memo["code_id"]),
-                             memo["title"], memo["content"], memo["created_at"], memo["modified_at"]),
+                             m_start, m_end, memo["title"], memo["content"], memo["created_at"], memo["modified_at"]),
                         )
                 except Exception:
                     pass

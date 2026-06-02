@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS document (
     content TEXT NOT NULL,
     source_type TEXT DEFAULT 'text',
     transcript TEXT DEFAULT NULL,
+    label TEXT DEFAULT '',
+    exclude_from_ai INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now')),
     modified_at TEXT DEFAULT (datetime('now'))
 );
@@ -46,6 +48,7 @@ CREATE TABLE IF NOT EXISTS coding (
     start_pos INTEGER NOT NULL,
     end_pos INTEGER NOT NULL,
     selected_text TEXT NOT NULL,
+    coder TEXT DEFAULT '',
     created_at TEXT DEFAULT (datetime('now')),
     deleted_at TEXT DEFAULT NULL
 );
@@ -56,6 +59,8 @@ CREATE TABLE IF NOT EXISTS memo (
     document_id INTEGER REFERENCES document(id) ON DELETE CASCADE,
     code_id INTEGER REFERENCES code(id) ON DELETE SET NULL,
     coding_id INTEGER REFERENCES coding(id) ON DELETE SET NULL,
+    start_pos INTEGER DEFAULT NULL,
+    end_pos INTEGER DEFAULT NULL,
     title TEXT DEFAULT '',
     content TEXT DEFAULT '',
     created_at TEXT DEFAULT (datetime('now')),
@@ -85,7 +90,8 @@ INSERT OR IGNORE INTO setting (key, value) VALUES
     ('filename_pattern', ''),
     ('filename_variables', ''),
     ('whisper_model', 'base'),
-    ('schema_version', '5');
+    ('coder_name', ''),
+    ('schema_version', '7');
 
 CREATE TABLE IF NOT EXISTS embedding_cache (
     id TEXT PRIMARY KEY,
@@ -126,6 +132,16 @@ MIGRATIONS = {
     ],
     5: [
         "ALTER TABLE document ADD COLUMN transcript TEXT DEFAULT NULL",
+    ],
+    6: [
+        "ALTER TABLE document ADD COLUMN label TEXT DEFAULT ''",
+        "ALTER TABLE document ADD COLUMN exclude_from_ai INTEGER DEFAULT 0",
+        "ALTER TABLE memo ADD COLUMN start_pos INTEGER DEFAULT NULL",
+        "ALTER TABLE memo ADD COLUMN end_pos INTEGER DEFAULT NULL",
+        "INSERT OR IGNORE INTO setting (key, value) VALUES ('coder_name', '')",
+    ],
+    7: [
+        "ALTER TABLE coding ADD COLUMN coder TEXT DEFAULT ''",
     ],
 }
 

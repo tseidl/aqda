@@ -80,6 +80,18 @@ async def _load_project_data(project_id: int):
         await db.close()
 
 
+async def _get_coder_name() -> str:
+    """Configured coder identity for REFI-QDA <User>, falling back to a default."""
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT value FROM setting WHERE key='coder_name'")
+        row = await cursor.fetchone()
+        name = (row["value"] if row else "") or ""
+        return name.strip() or "AQDA User"
+    finally:
+        await db.close()
+
+
 # --- REFI-QDA Export ---
 
 def _build_code_tree(codes: list[dict], parent_id=None) -> list[dict]:
@@ -112,22 +124,35 @@ def _add_codes_xml(parent_el, codes_tree: list[dict], guid_map: dict):
 async def export_qdpx(project_id: int):
     """Export project as REFI-QDA .qdpx file."""
     project, documents, codes, codings, memos = await _load_project_data(project_id)
+    default_coder = await _get_coder_name()
 
     guid_map = {}
-    user_guid = _uuid()
+
+    # Per-coding attribution: one <User> per distinct coder name. Codings with no
+    # recorded coder fall back to the configured default.
+    coder_to_guid: dict[str, str] = {default_coder: _uuid()}
+    for cg in codings:
+        name = (cg["coder"] or "").strip() or default_coder
+        if name not in coder_to_guid:
+            coder_to_guid[name] = _uuid()
+    default_guid = coder_to_guid[default_coder]
+
+    def _coder_guid(cg) -> str:
+        return coder_to_guid.get((cg["coder"] or "").strip() or default_coder, default_guid)
 
     # Build XML. ProjectType sequence per REFI-QDA XSD: Users, CodeBook, ..., Sources, Notes, ..., Description (last).
     root = Element("Project", _attrs(
         xmlns="urn:QDA-XML:project:1.0",
         name=project["name"],
         origin="AQDA",
-        creatingUserGUID=user_guid,
+        creatingUserGUID=default_guid,
         creationDateTime=_xs_datetime(project["created_at"]),
     ))
 
-    # Users
+    # Users (sorted for stable output)
     users_el = SubElement(root, "Users")
-    SubElement(users_el, "User", {"guid": user_guid, "name": "AQDA User"})
+    for name in sorted(coder_to_guid):
+        SubElement(users_el, "User", {"guid": coder_to_guid[name], "name": name})
 
     # CodeBook
     codebook_el = SubElement(root, "CodeBook")
@@ -148,23 +173,24 @@ async def export_qdpx(project_id: int):
             guid=doc_guid,
             name=doc["name"],
             plainTextPath=f"internal://{doc_guid}.txt",
-            creatingUser=user_guid,
+            creatingUser=default_guid,
             creationDateTime=_xs_datetime(doc["created_at"]),
         ))
 
-        # Add coded selections
+        # Add coded selections, attributed to the coder who made each one
         for cg in codings_by_doc.get(doc["id"], []):
             sel_guid = _uuid()
+            coder_guid = _coder_guid(cg)
             sel_el = SubElement(source_el, "PlainTextSelection", _attrs(
                 guid=sel_guid,
                 startPosition=str(cg["start_pos"]),
                 endPosition=str(cg["end_pos"]),
-                creatingUser=user_guid,
+                creatingUser=coder_guid,
                 creationDateTime=_xs_datetime(cg["created_at"]),
             ))
             coding_el = SubElement(sel_el, "Coding", _attrs(
                 guid=_uuid(),
-                creatingUser=user_guid,
+                creatingUser=coder_guid,
                 creationDateTime=_xs_datetime(cg["created_at"]),
             ))
             code_guid = guid_map.get(("code", cg["code_id"]), _uuid())
@@ -178,7 +204,7 @@ async def export_qdpx(project_id: int):
             note_el = SubElement(notes_el, "Note", _attrs(
                 guid=note_guid,
                 name=memo["title"] or "Memo",
-                creatingUser=user_guid,
+                creatingUser=default_guid,
                 creationDateTime=_xs_datetime(memo["created_at"]),
             ))
             content_el = SubElement(note_el, "PlainTextContent")
@@ -197,7 +223,15 @@ async def export_qdpx(project_id: int):
         zf.writestr("project.qde", xml_bytes)
         for doc in documents:
             doc_guid = guid_map[("doc", doc["id"])]
-            zf.writestr(f"Sources/{doc_guid}.txt", doc["content"])
+            # Codings on audio index the transcript, and image "content" is a base64
+            # data URI — write the human-readable text so .txt offsets stay valid.
+            if doc["source_type"] == "audio":
+                source_text = doc.get("transcript") or ""
+            elif doc["source_type"] == "image":
+                source_text = ""
+            else:
+                source_text = doc["content"] or ""
+            zf.writestr(f"Sources/{doc_guid}.txt", source_text)
 
     buf.seek(0)
     filename = f"{project['name'].replace(' ', '_')}.qdpx"
@@ -323,8 +357,9 @@ async def export_aqda(project_id: int):
         for i, doc in enumerate(documents, 1):
             doc_map[doc["id"]] = i
             con.execute(
-                "INSERT INTO document (id, project_id, name, content, source_type, transcript, created_at, modified_at) VALUES (?, 1, ?, ?, ?, ?, ?, ?)",
-                (i, doc["name"], doc["content"], doc["source_type"], doc.get("transcript"), doc["created_at"], doc["modified_at"]),
+                "INSERT INTO document (id, project_id, name, content, source_type, transcript, label, exclude_from_ai, created_at, modified_at) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (i, doc["name"], doc["content"], doc["source_type"], doc.get("transcript"),
+                 doc.get("label", ""), doc.get("exclude_from_ai", 0), doc["created_at"], doc["modified_at"]),
             )
 
         # Document variables
@@ -352,15 +387,16 @@ async def export_aqda(project_id: int):
             new_code = code_map.get(cg["code_id"])
             if new_doc and new_code:
                 con.execute(
-                    "INSERT INTO coding (document_id, code_id, start_pos, end_pos, selected_text, created_at, deleted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (new_doc, new_code, cg["start_pos"], cg["end_pos"], cg["selected_text"], cg["created_at"], cg.get("deleted_at")),
+                    "INSERT INTO coding (document_id, code_id, start_pos, end_pos, selected_text, coder, created_at, deleted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (new_doc, new_code, cg["start_pos"], cg["end_pos"], cg["selected_text"], cg.get("coder", ""), cg["created_at"], cg.get("deleted_at")),
                 )
 
         # Memos
         for memo in memos:
             con.execute(
-                "INSERT INTO memo (project_id, document_id, code_id, title, content, created_at, modified_at) VALUES (1, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO memo (project_id, document_id, code_id, start_pos, end_pos, title, content, created_at, modified_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (doc_map.get(memo["document_id"]), code_map.get(memo["code_id"]),
+                 memo.get("start_pos"), memo.get("end_pos"),
                  memo["title"], memo["content"], memo["created_at"], memo["modified_at"]),
             )
 

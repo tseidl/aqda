@@ -1,11 +1,11 @@
 import { useState, useRef, useEffect } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Sparkles, Search, Wand2, X, Power, RefreshCw,
-  ShieldCheck, GitBranch, BookOpen, Settings2,
+  ShieldCheck, GitBranch, BookOpen, Settings2, Check,
 } from 'lucide-react';
 import {
-  ai, settings as settingsApi,
+  ai, settings as settingsApi, codings as codingsApi,
   type Code, type SimilarResult, type ConsistencyResult, type HierarchySuggestion,
 } from '../api';
 
@@ -63,6 +63,9 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
 
   const abortRef = useRef<AbortController | null>(null);
   const progressRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const queryClient = useQueryClient();
+  // Track which suggestion (by index) is being applied, to disable its buttons
+  const [applyingIdx, setApplyingIdx] = useState<number | null>(null);
 
   // Poll embedding progress while loading
   useEffect(() => {
@@ -136,6 +139,34 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
     setHierarchyResult(null);
     setDefinitionResult(null);
     setError(null);
+  };
+
+  // Accept a Code Suggest result: apply the selected code to its span, then
+  // remove it so the list cycles to the remaining suggestions.
+  const acceptSuggestion = async (index: number) => {
+    const r = similarResults[index];
+    if (!r || !selectedCodeId) return;
+    setApplyingIdx(index);
+    try {
+      await codingsApi.create({
+        document_id: r.document_id,
+        code_id: selectedCodeId,
+        start_pos: r.start_pos,
+        end_pos: r.end_pos,
+        selected_text: r.text,
+      });
+      queryClient.invalidateQueries({ queryKey: ['codings'] });
+      queryClient.invalidateQueries({ queryKey: ['codes', projectId] });
+      setSimilarResults((prev) => prev.filter((_, i) => i !== index));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to apply code');
+    } finally {
+      setApplyingIdx(null);
+    }
+  };
+
+  const rejectSuggestion = (index: number) => {
+    setSimilarResults((prev) => prev.filter((_, i) => i !== index));
   };
 
   const canRun = () => {
@@ -405,21 +436,49 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
         {/* Similar results (search, autocode, negative-cases) */}
         {similarResults.length > 0 && (
           <div className="space-y-1">
-            <p className="text-xs text-gray-500 px-1 sticky top-0 bg-white py-1">{similarResults.length} results</p>
+            <p className="text-xs text-gray-500 px-1 sticky top-0 bg-white py-1">
+              {similarResults.length} {mode === 'autocode' ? 'suggestion' : 'result'}{similarResults.length !== 1 ? 's' : ''}
+            </p>
             {similarResults.map((r, i) => (
-              <button
-                key={i}
-                onClick={() => onNavigate(r.document_id, r.start_pos, r.end_pos)}
-                className="w-full text-left p-2 rounded-md hover:bg-purple-50 border border-gray-100 transition-colors"
+              <div
+                key={`${r.document_id}-${r.start_pos}-${r.end_pos}`}
+                className="p-2 rounded-md border border-gray-100 hover:bg-purple-50/40 transition-colors"
               >
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-xs font-medium text-gray-600 truncate">{r.document_name}</span>
-                  <span className="text-xs text-purple-600 font-mono">{(r.similarity * 100).toFixed(0)}%</span>
-                </div>
-                <p className="text-xs text-gray-600 leading-relaxed">
-                  {r.text.length > 150 ? r.text.slice(0, 150) + '...' : r.text}
-                </p>
-              </button>
+                <button
+                  type="button"
+                  onClick={() => onNavigate(r.document_id, r.start_pos, r.end_pos)}
+                  className="w-full text-left"
+                  title="Go to this passage"
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-xs font-medium text-gray-600 truncate">{r.document_name}</span>
+                    <span className="text-xs text-purple-600 font-mono ml-2 shrink-0">{(r.similarity * 100).toFixed(0)}%</span>
+                  </div>
+                  <p className="text-xs text-gray-600 leading-relaxed">
+                    {r.text.length > 150 ? r.text.slice(0, 150) + '...' : r.text}
+                  </p>
+                </button>
+                {mode === 'autocode' && selectedCodeId && (
+                  <div className="flex gap-1 mt-1.5">
+                    <button
+                      type="button"
+                      onClick={() => acceptSuggestion(i)}
+                      disabled={applyingIdx !== null}
+                      className="flex-1 flex items-center justify-center gap-1 py-1 text-xs font-medium rounded bg-green-50 text-green-700 hover:bg-green-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <Check size={12} /> Apply
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => rejectSuggestion(i)}
+                      disabled={applyingIdx !== null}
+                      className="flex-1 flex items-center justify-center gap-1 py-1 text-xs font-medium rounded bg-gray-50 text-gray-500 hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <X size={12} /> Dismiss
+                    </button>
+                  </div>
+                )}
+              </div>
             ))}
           </div>
         )}

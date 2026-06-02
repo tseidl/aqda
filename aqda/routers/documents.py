@@ -26,6 +26,11 @@ router = APIRouter()
 
 class DocumentUpdate(BaseModel):
     name: str | None = None
+    label: str | None = None
+    exclude_from_ai: bool | None = None
+
+
+ALLOWED_DOCUMENT_FIELDS = {"name", "label", "exclude_from_ai"}
 
 
 class VariableUpdate(BaseModel):
@@ -62,7 +67,8 @@ async def list_documents(project_id: int):
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT id, project_id, name, source_type, created_at, modified_at, "
+            "SELECT id, project_id, name, source_type, label, exclude_from_ai, "
+            "created_at, modified_at, "
             "LENGTH(content) as content_length "
             "FROM document WHERE project_id=? ORDER BY name",
             (project_id,),
@@ -142,6 +148,37 @@ async def _save_doc_variables(db, document_id: int, variables: dict[str, str]):
             )
 
 
+def _decode_text_bytes(data: bytes) -> str:
+    """Decode uploaded text bytes robustly.
+
+    NVivo (Windows) often exports .txt as UTF-16 or UTF-8-with-BOM. Force-decoding
+    those as UTF-8 produced NUL-laden content that passed the non-empty check but
+    rendered as empty on export and broke embeddings. Sniff the BOM, fall back
+    UTF-8 -> UTF-16 -> latin-1, then strip any stray BOM / NUL characters.
+    """
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = data.decode("utf-16")
+    elif data[:3] == b"\xef\xbb\xbf":
+        text = data.decode("utf-8-sig")
+    elif b"\x00" in data:
+        # NUL bytes without a BOM -> almost certainly UTF-16. Decoding the wrong
+        # endianness does not raise (it silently yields garbage), so guess from
+        # which byte of each pair holds the (usually zero) high byte.
+        odd_nuls = data[1::2].count(0)
+        even_nuls = data[0::2].count(0)
+        guess = "utf-16-le" if odd_nuls >= even_nuls else "utf-16-be"
+        try:
+            text = data.decode(guess)
+        except UnicodeDecodeError:
+            text = data.decode("utf-8", errors="replace")
+    else:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = data.decode("latin-1")
+    return text.replace(chr(0xFEFF), "").replace("\x00", "")
+
+
 def _detect_source_type(filename: str) -> str:
     ext = '.' + filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
     if ext == '.pdf':
@@ -175,7 +212,7 @@ async def upload_document(
         mime = AUDIO_MIME_MAP.get(ext, 'audio/mpeg')
         text = f"data:{mime};base64,{base64.b64encode(content_bytes).decode('ascii')}"
     else:
-        text = content_bytes.decode("utf-8", errors="replace")
+        text = _decode_text_bytes(content_bytes)
 
     if not text.strip():
         raise HTTPException(400, "Document is empty or could not be read")
@@ -236,7 +273,7 @@ async def upload_documents_bulk(
                 mime = AUDIO_MIME_MAP.get(ext, 'audio/mpeg')
                 text = f"data:{mime};base64,{base64.b64encode(content_bytes).decode('ascii')}"
             else:
-                text = content_bytes.decode("utf-8", errors="replace")
+                text = _decode_text_bytes(content_bytes)
             if not text.strip():
                 continue
             cursor = await db.execute(
@@ -334,10 +371,22 @@ async def get_document(document_id: int):
 async def update_document(document_id: int, data: DocumentUpdate):
     db = await get_db()
     try:
-        if data.name:
+        # Only update fields the client actually sent (so label can be cleared to '')
+        fields = data.model_dump(exclude_unset=True)
+        updates = []
+        values = []
+        for field, val in fields.items():
+            if field not in ALLOWED_DOCUMENT_FIELDS:
+                continue
+            if field == "exclude_from_ai":
+                val = 1 if val else 0
+            updates.append(f"{field}=?")
+            values.append(val)
+        if updates:
+            updates.append("modified_at=datetime('now')")
+            values.append(document_id)
             await db.execute(
-                "UPDATE document SET name=?, modified_at=datetime('now') WHERE id=?",
-                (data.name, document_id),
+                f"UPDATE document SET {', '.join(updates)} WHERE id=?", values
             )
             await db.commit()
         cursor = await db.execute("SELECT * FROM document WHERE id=?", (document_id,))

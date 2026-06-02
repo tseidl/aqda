@@ -31,6 +31,8 @@ export interface Document {
   content?: string;
   source_type: string;
   transcript?: string | null;
+  label?: string;
+  exclude_from_ai?: number;
   created_at: string;
   modified_at: string;
   content_length?: number;
@@ -57,6 +59,7 @@ export interface Coding {
   start_pos: number;
   end_pos: number;
   selected_text: string;
+  coder?: string;
   created_at: string;
   code_name?: string;
   code_color?: string;
@@ -69,6 +72,8 @@ export interface Memo {
   document_id: number | null;
   code_id: number | null;
   coding_id: number | null;
+  start_pos?: number | null;
+  end_pos?: number | null;
   title: string;
   content: string;
   created_at: string;
@@ -177,7 +182,7 @@ export const documents = {
     }
     return results;
   },
-  update: (id: number, data: { name?: string }) =>
+  update: (id: number, data: { name?: string; label?: string; exclude_from_ai?: boolean }) =>
     request<Document>(`/documents/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   delete: (id: number) =>
     request<void>(`/documents/${id}`, { method: 'DELETE' }),

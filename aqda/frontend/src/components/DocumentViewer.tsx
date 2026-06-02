@@ -1,16 +1,20 @@
 import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { X, Tag, Sparkles, ChevronDown, ChevronRight, Plus, Trash2, Loader2, Minus as MinusIcon, Plus as PlusIcon } from 'lucide-react';
-import { ai, codes as codesApi, documents as docsApi, type Document, type Coding, type Code } from '../api';
+import { X, Tag, Sparkles, ChevronDown, ChevronRight, Plus, Trash2, Loader2, StickyNote, BookMarked, Minus as MinusIcon, Plus as PlusIcon } from 'lucide-react';
+import { ai, codes as codesApi, documents as docsApi, type Document, type Coding, type Code, type Memo } from '../api';
+import { MentionTextarea } from './MentionTextarea';
+import { buildMentionCandidates } from './mentions';
 
 interface Props {
   document: Document;
   codings: Coding[];
   codes: Code[];
+  memos: Memo[];
   selectedCodeId: number | null;
   onApplyCode: (codeId: number, startPos: number, endPos: number, text: string) => void;
   onDeleteCoding: (id: number) => void;
   onSelectCode: (id: number) => void;
+  onAddMemo?: (startPos: number, endPos: number, text: string, title?: string, content?: string) => void;
   highlightRange?: { start: number; end: number } | null;
   onHighlightClear?: () => void;
 }
@@ -22,7 +26,7 @@ interface TextSelection {
   rect: { top: number; bottom: number; left: number };
 }
 
-export function DocumentViewer({ document: doc, codings, codes, selectedCodeId, onApplyCode, onDeleteCoding, highlightRange, onHighlightClear }: Props) {
+export function DocumentViewer({ document: doc, codings, codes, memos, selectedCodeId, onApplyCode, onDeleteCoding, onAddMemo, highlightRange, onHighlightClear }: Props) {
   const contentRef = useRef<HTMLDivElement>(null);
   const queryClient = useQueryClient();
   const [selection, setSelection] = useState<TextSelection | null>(null);
@@ -32,6 +36,7 @@ export function DocumentViewer({ document: doc, codings, codes, selectedCodeId, 
   } | null>(null);
   const [showNewCodeInput, setShowNewCodeInput] = useState(false);
   const [newCodeName, setNewCodeName] = useState('');
+  const [newCodeDesc, setNewCodeDesc] = useState('');
   const [analysisText, setAnalysisText] = useState<string | null>(null);
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [showVariables, setShowVariables] = useState(false);
@@ -40,6 +45,9 @@ export function DocumentViewer({ document: doc, codings, codes, selectedCodeId, 
   const [showAddVar, setShowAddVar] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
   const [transcribeError, setTranscribeError] = useState<string | null>(null);
+  const [editingTag, setEditingTag] = useState(false);
+  const [tagValue, setTagValue] = useState('');
+  const [memoDraft, setMemoDraft] = useState<{ title: string; content: string } | null>(null);
   const highlightRef = useRef<HTMLElement | null>(null);
   const popupClickRef = useRef(false);
 
@@ -75,6 +83,23 @@ export function DocumentViewer({ document: doc, codings, codes, selectedCodeId, 
     },
   });
 
+  const setLabelMut = useMutation({
+    mutationFn: (label: string) => docsApi.update(doc.id, { label }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['document', doc.id] });
+      queryClient.invalidateQueries({ queryKey: ['documents', doc.project_id] });
+      setEditingTag(false);
+    },
+  });
+
+  const setExcludeMut = useMutation({
+    mutationFn: (exclude: boolean) => docsApi.update(doc.id, { exclude_from_ai: exclude }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['document', doc.id] });
+      queryClient.invalidateQueries({ queryKey: ['documents', doc.project_id] });
+    },
+  });
+
   const handleTranscribe = async () => {
     setTranscribing(true);
     setTranscribeError(null);
@@ -97,6 +122,8 @@ export function DocumentViewer({ document: doc, codings, codes, selectedCodeId, 
     for (const c of codes) m.set(c.id, c);
     return m;
   }, [codes]);
+
+  const mentionCandidates = useMemo(() => buildMentionCandidates(codes, memos), [codes, memos]);
 
   // For audio docs with transcript, coding operates on the transcript text
   const codeableText = (doc.source_type === 'audio' && doc.transcript) ? doc.transcript : (doc.content ?? '');
@@ -153,6 +180,7 @@ export function DocumentViewer({ document: doc, codings, codes, selectedCodeId, 
     // Text was selected — show apply-code popup
     if (!sel.isCollapsed) {
       setClickedCoding(null);
+      setMemoDraft(null);
       const range = sel.getRangeAt(0);
       const text = sel.toString().trim();
       if (!text) { setSelection(null); return; }
@@ -221,6 +249,7 @@ export function DocumentViewer({ document: doc, codings, codes, selectedCodeId, 
     setSelection(null);
     setShowNewCodeInput(false);
     setAnalysisText(null);
+    setMemoDraft(null);
   }, [codings]);
 
   // Apply code to selection
@@ -248,6 +277,30 @@ export function DocumentViewer({ document: doc, codings, codes, selectedCodeId, 
     }
   }, [selection]);
 
+  // Save the memo drafted in the selection popup
+  const saveMemo = useCallback(() => {
+    if (!selection || !onAddMemo) return;
+    onAddMemo(selection.start, selection.end, selection.text, memoDraft?.title ?? '', memoDraft?.content ?? '');
+    setMemoDraft(null);
+    setSelection(null);
+    window.getSelection()?.removeAllRanges();
+  }, [selection, onAddMemo, memoDraft]);
+
+  // Create a new code (with optional definition) and apply it to the selection
+  const createNewCode = useCallback(async () => {
+    if (!newCodeName.trim()) return;
+    const newCode = await codesApi.create({
+      project_id: doc.project_id,
+      name: newCodeName.trim(),
+      description: newCodeDesc.trim() || undefined,
+    });
+    queryClient.invalidateQueries({ queryKey: ['codes', doc.project_id] });
+    applyCode(newCode.id);
+    setNewCodeName('');
+    setNewCodeDesc('');
+    setShowNewCodeInput(false);
+  }, [newCodeName, newCodeDesc, doc.project_id, applyCode, queryClient]);
+
   return (
     <div className="h-full flex flex-col">
       {/* Document header */}
@@ -255,6 +308,38 @@ export function DocumentViewer({ document: doc, codings, codes, selectedCodeId, 
         <div className="px-4 py-2 flex items-center justify-between">
           <div className="flex items-center gap-2 min-w-0">
             <h2 className="text-sm font-medium text-gray-700 truncate">{doc.name}</h2>
+            {/* User-set short tag */}
+            {editingTag ? (
+              <input
+                autoFocus
+                value={tagValue}
+                maxLength={6}
+                placeholder="TAG"
+                onChange={(e) => setTagValue(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') setLabelMut.mutate(tagValue.trim());
+                  else if (e.key === 'Escape') setEditingTag(false);
+                }}
+                onBlur={() => setLabelMut.mutate(tagValue.trim())}
+                className="w-16 text-[10px] uppercase px-1 py-0.5 border border-indigo-300 rounded bg-white outline-none shrink-0"
+              />
+            ) : doc.label ? (
+              <button
+                onClick={() => { setTagValue(doc.label ?? ''); setEditingTag(true); }}
+                className="text-[10px] px-1.5 py-0.5 rounded font-semibold shrink-0 bg-indigo-100 text-indigo-700 uppercase hover:bg-indigo-200"
+                title="Edit tag"
+              >
+                {doc.label}
+              </button>
+            ) : (
+              <button
+                onClick={() => { setTagValue(''); setEditingTag(true); }}
+                className="text-[10px] px-1.5 py-0.5 rounded text-gray-400 hover:text-indigo-600 hover:bg-gray-100 flex items-center gap-0.5 shrink-0"
+                title="Add a short tag"
+              >
+                <Tag size={11} /> tag
+              </button>
+            )}
             <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0 ${
               doc.source_type === 'pdf' ? 'bg-red-100 text-red-600'
               : doc.source_type === 'image' ? 'bg-green-100 text-green-600'
@@ -265,6 +350,16 @@ export function DocumentViewer({ document: doc, codings, codes, selectedCodeId, 
             </span>
           </div>
           <div className="flex items-center gap-3">
+            <button
+              onClick={() => setExcludeMut.mutate(!doc.exclude_from_ai)}
+              className={`text-xs flex items-center gap-1 ${
+                doc.exclude_from_ai ? 'text-amber-600 font-medium' : 'text-gray-400 hover:text-gray-600'
+              }`}
+              title="Reference material is excluded from AI search and code suggestions — useful for pre-coded examples / training documents."
+            >
+              <BookMarked size={13} />
+              {doc.exclude_from_ai ? 'Reference (no AI)' : 'Mark as reference'}
+            </button>
             {Object.keys(variables).length > 0 && !showVariables && (
               <span className="text-xs text-gray-400">
                 {Object.keys(variables).length} variable{Object.keys(variables).length !== 1 ? 's' : ''}
@@ -524,6 +619,37 @@ export function DocumentViewer({ document: doc, codings, codes, selectedCodeId, 
             }}
             onMouseDown={(e) => { e.preventDefault(); popupClickRef.current = true; }}
           >
+            {memoDraft ? (
+              <div onMouseDown={(e) => { e.stopPropagation(); popupClickRef.current = true; }}>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs text-gray-500 flex items-center gap-1"><StickyNote size={12} /> New memo</span>
+                  <button onClick={() => setMemoDraft(null)} className="text-gray-400 hover:text-gray-600"><X size={14} /></button>
+                </div>
+                <p className="text-[11px] text-gray-400 italic mb-2 max-h-12 overflow-hidden">
+                  “{selection.text.length > 90 ? selection.text.slice(0, 90) + '…' : selection.text}”
+                </p>
+                <input
+                  autoFocus
+                  placeholder="Title (optional)"
+                  value={memoDraft.title}
+                  onChange={(e) => setMemoDraft((d) => (d ? { ...d, title: e.target.value } : d))}
+                  className="w-full px-2 py-1 border border-gray-200 rounded text-sm mb-1.5 focus:outline-none focus:ring-1 focus:ring-amber-400"
+                />
+                <MentionTextarea
+                  rows={3}
+                  className="border border-gray-200 rounded mb-2 focus-within:ring-1 focus-within:ring-amber-400"
+                  textClassName="px-2 py-1 text-sm"
+                  value={memoDraft.content}
+                  onChange={(v) => setMemoDraft((d) => (d ? { ...d, content: v } : d))}
+                  candidates={mentionCandidates}
+                  placeholder="Write your note… (type @ to reference a code or memo)"
+                />
+                <div className="flex gap-1">
+                  <button onClick={saveMemo} className="flex-1 py-1 text-sm font-medium rounded bg-amber-500 text-white hover:bg-amber-600">Save memo</button>
+                  <button onClick={() => setMemoDraft(null)} className="px-2 py-1 text-sm rounded bg-gray-100 text-gray-500 hover:bg-gray-200">Cancel</button>
+                </div>
+              </div>
+            ) : (<>
             {/* Existing codings on this selection — with delete */}
             {overlapping.length > 0 && (
               <div className="mb-2 pb-2 border-b border-gray-100">
@@ -532,6 +658,7 @@ export function DocumentViewer({ document: doc, codings, codes, selectedCodeId, 
                   <div key={c.id} className="flex items-center gap-2 px-2 py-1 rounded hover:bg-red-50 group">
                     <span className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ backgroundColor: c.code_color }} />
                     <span className="text-sm text-gray-700 truncate flex-1">{c.code_name}</span>
+                    {c.coder && <span className="text-[10px] text-gray-400 shrink-0" title="Coder">{c.coder}</span>}
                     <button
                       onClick={() => { onDeleteCoding(c.id); setSelection(null); }}
                       className="text-gray-300 group-hover:text-red-500 p-0.5"
@@ -589,29 +716,36 @@ export function DocumentViewer({ document: doc, codings, codes, selectedCodeId, 
 
             {/* New code inline */}
             {showNewCodeInput ? (
-              <div className="mt-2 pt-2 border-t border-gray-100">
+              <div className="mt-2 pt-2 border-t border-gray-100 space-y-1.5">
                 <input
                   autoFocus
                   placeholder="New code name"
                   value={newCodeName}
                   onChange={(e) => setNewCodeName(e.target.value)}
+                  onMouseDown={(e) => { e.stopPropagation(); popupClickRef.current = true; }}
                   className="w-full px-2 py-1 border border-gray-200 rounded text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                  onKeyDown={async (e) => {
-                    if (e.key === 'Enter' && newCodeName.trim()) {
-                      const newCode = await codesApi.create({
-                        project_id: doc.project_id,
-                        name: newCodeName.trim(),
-                      });
-                      applyCode(newCode.id);
-                      setNewCodeName('');
-                      setShowNewCodeInput(false);
-                    }
-                    if (e.key === 'Escape') {
-                      setShowNewCodeInput(false);
-                      setNewCodeName('');
-                    }
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && newCodeName.trim()) createNewCode();
+                    if (e.key === 'Escape') { setShowNewCodeInput(false); setNewCodeName(''); setNewCodeDesc(''); }
                   }}
                 />
+                <MentionTextarea
+                  rows={2}
+                  className="border border-gray-200 rounded focus-within:ring-1 focus-within:ring-indigo-500"
+                  textClassName="px-2 py-1 text-sm"
+                  value={newCodeDesc}
+                  onChange={setNewCodeDesc}
+                  candidates={mentionCandidates}
+                  placeholder="Definition (optional) — what does this code mean, when to apply it…"
+                  onTextareaMouseDown={(e) => { e.stopPropagation(); popupClickRef.current = true; }}
+                />
+                <button
+                  onClick={createNewCode}
+                  disabled={!newCodeName.trim()}
+                  className="w-full py-1 text-sm font-medium rounded bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Create &amp; apply
+                </button>
               </div>
             ) : (
               <button
@@ -632,11 +766,23 @@ export function DocumentViewer({ document: doc, codings, codes, selectedCodeId, 
               {analysisLoading ? 'Analyzing...' : 'AI Analyze'}
             </button>
 
+            {/* Add a memo anchored to this passage */}
+            {onAddMemo && (
+              <button
+                onClick={() => setMemoDraft({ title: '', content: '' })}
+                className="w-full text-left px-2 py-1.5 mt-1 rounded text-sm text-amber-600 hover:bg-amber-50 flex items-center gap-1.5"
+              >
+                <StickyNote size={13} />
+                Add memo
+              </button>
+            )}
+
             {analysisText && (
-              <div className="mt-2 p-2 bg-purple-50 rounded text-xs text-purple-900 max-h-32 overflow-auto">
+              <div className="mt-2 p-2.5 bg-purple-50 rounded text-sm text-purple-900 leading-relaxed whitespace-pre-wrap max-h-72 overflow-auto">
                 {analysisText}
               </div>
             )}
+            </>)}
           </div>
           );
         })()}
@@ -661,6 +807,7 @@ export function DocumentViewer({ document: doc, codings, codes, selectedCodeId, 
               <div key={c.id} className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-red-50 group">
                 <span className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ backgroundColor: c.code_color }} />
                 <span className="text-sm text-gray-700 truncate flex-1">{c.code_name}</span>
+                {c.coder && <span className="text-[10px] text-gray-400 shrink-0" title="Coder">{c.coder}</span>}
                 <button
                   onClick={() => { onDeleteCoding(c.id); setClickedCoding(null); }}
                   className="text-gray-300 group-hover:text-red-500 p-0.5"

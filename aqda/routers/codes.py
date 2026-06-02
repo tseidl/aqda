@@ -84,7 +84,9 @@ async def create_code(data: CodeCreate):
 async def update_code(code_id: int, data: CodeUpdate):
     db = await get_db()
     try:
-        fields = data.model_dump(exclude_none=True)
+        # exclude_unset (not exclude_none) so an explicit parent_id=null — moving a
+        # code back to the top level — is applied rather than silently dropped.
+        fields = data.model_dump(exclude_unset=True)
 
         # Prevent circular hierarchy
         if "parent_id" in fields:

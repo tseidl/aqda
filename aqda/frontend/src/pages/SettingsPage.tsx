@@ -79,6 +79,24 @@ export function SettingsPage() {
       </header>
 
       <main className="max-w-3xl mx-auto px-6 py-8 space-y-8">
+        {/* Coder Identity */}
+        <section>
+          <h2 className="text-lg font-medium text-gray-800 mb-4">Coder Identity</h2>
+          <div className="bg-white rounded-lg border border-gray-200 p-4">
+            <label className="block text-sm font-medium text-gray-700 mb-1">Coder name</label>
+            <input
+              value={form.coder_name ?? ''}
+              onChange={(e) => update('coder_name', e.target.value)}
+              className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              placeholder="e.g., Cate B."
+            />
+            <p className="text-xs text-gray-400 mt-1">
+              Recorded as the coder in REFI-QDA (.qdpx) exports, so tools like NVivo and MAXQDA
+              attribute the coding to you. Leave blank to use “AQDA User”.
+            </p>
+          </div>
+        </section>
+
         {/* Data Storage */}
         <section>
           <h2 className="text-lg font-medium text-gray-800 mb-4">Data Storage</h2>
