@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { X, Tag, Sparkles, ChevronDown, ChevronRight, Plus, Trash2, Loader2, StickyNote, BookMarked, Minus as MinusIcon, Plus as PlusIcon } from 'lucide-react';
+import { X, Tag, Sparkles, ChevronDown, ChevronRight, ChevronUp, Plus, Trash2, Loader2, StickyNote, BookMarked, Search, Minus as MinusIcon, Plus as PlusIcon } from 'lucide-react';
 import { ai, codes as codesApi, documents as docsApi, type Document, type Coding, type Code, type Memo } from '../api';
 import { MentionTextarea } from './MentionTextarea';
 import { buildMentionCandidates } from './mentions';
@@ -50,6 +50,11 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
   const [memoDraft, setMemoDraft] = useState<{ title: string; content: string } | null>(null);
   const highlightRef = useRef<HTMLElement | null>(null);
   const popupClickRef = useRef(false);
+  // In-document find (Cmd/Ctrl+F)
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState('');
+  const [findIdx, setFindIdx] = useState(0);
+  const findInputRef = useRef<HTMLInputElement>(null);
 
   // Scroll to highlighted range and auto-clear after 4s
   useEffect(() => {
@@ -128,10 +133,87 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
   // For audio docs with transcript, coding operates on the transcript text
   const codeableText = (doc.source_type === 'audio' && doc.transcript) ? doc.transcript : (doc.content ?? '');
 
+  // Find/highlighting only make sense over real text (not image/base64 or untranscribed audio).
+  const hasSearchableText =
+    doc.source_type === 'text' || doc.source_type === 'pdf' ||
+    (doc.source_type === 'audio' && !!doc.transcript);
+
+  // In-document find: positions of every case-insensitive match of the query.
+  const findMatches = useMemo(() => {
+    if (!findOpen || !findQuery) return [] as number[];
+    const hay = codeableText.toLowerCase();
+    const needle = findQuery.toLowerCase();
+    const out: number[] = [];
+    let idx = hay.indexOf(needle);
+    while (idx !== -1 && out.length < 5000) {
+      out.push(idx);
+      idx = hay.indexOf(needle, idx + Math.max(1, needle.length));
+    }
+    return out;
+  }, [findOpen, findQuery, codeableText]);
+
+  const safeFindIdx = findMatches.length ? Math.min(findIdx, findMatches.length - 1) : 0;
+
+  // The highlight actually shown: the active find match takes precedence over the
+  // parent-driven highlight (memo/AI navigation) while find is open.
+  const activeHighlight = useMemo(() => {
+    if (findOpen && findMatches.length > 0) {
+      const s = findMatches[safeFindIdx];
+      return { start: s, end: s + findQuery.length };
+    }
+    return highlightRange ?? null;
+  }, [findOpen, findMatches, safeFindIdx, findQuery.length, highlightRange]);
+
+  const gotoNextMatch = useCallback(() => {
+    if (findMatches.length) setFindIdx((i) => (i + 1) % findMatches.length);
+  }, [findMatches.length]);
+  const gotoPrevMatch = useCallback(() => {
+    if (findMatches.length) setFindIdx((i) => (i - 1 + findMatches.length) % findMatches.length);
+  }, [findMatches.length]);
+
+  // Cmd/Ctrl+F opens the in-document find bar; Escape closes it.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'f') {
+        if (!hasSearchableText) return;  // let the browser's own find handle image/audio docs
+        // Don't steal the shortcut while the user is typing in a field (memo, code
+        // name, doc search) — only hijack it for the document body.
+        const el = window.document.activeElement as HTMLElement | null;
+        if (el && el !== findInputRef.current &&
+            (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) {
+          return;
+        }
+        e.preventDefault();
+        setFindOpen(true);
+        requestAnimationFrame(() => { findInputRef.current?.focus(); findInputRef.current?.select(); });
+      } else if (e.key === 'Escape' && findOpen) {
+        setFindOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [findOpen, hasSearchableText]);
+
+  // Reset find state when switching documents.
+  useEffect(() => {
+    setFindOpen(false);
+    setFindQuery('');
+    setFindIdx(0);
+  }, [doc.id]);
+
+  // Scroll the active find match into view as the user steps through matches.
+  useEffect(() => {
+    if (!findOpen || findMatches.length === 0) return;
+    const raf = requestAnimationFrame(() => {
+      highlightRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [findOpen, safeFindIdx, findMatches]);
+
   // Build rendered content with highlight spans
   const renderedContent = useMemo(() => {
     const text = codeableText;
-    if (codings.length === 0 && !highlightRange) return [{ text, codings: [] as Coding[], highlighted: false }];
+    if (codings.length === 0 && !activeHighlight) return [{ text, codings: [] as Coding[], highlighted: false }];
 
     type Event = { pos: number; type: 'start' | 'end'; coding?: Coding; highlight?: boolean };
     const events: Event[] = [];
@@ -139,9 +221,9 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
       events.push({ pos: c.start_pos, type: 'start', coding: c });
       events.push({ pos: c.end_pos, type: 'end', coding: c });
     }
-    if (highlightRange) {
-      events.push({ pos: highlightRange.start, type: 'start', highlight: true });
-      events.push({ pos: highlightRange.end, type: 'end', highlight: true });
+    if (activeHighlight) {
+      events.push({ pos: activeHighlight.start, type: 'start', highlight: true });
+      events.push({ pos: activeHighlight.end, type: 'end', highlight: true });
     }
     events.sort((a, b) => a.pos - b.pos || (a.type === 'end' ? -1 : 1));
 
@@ -167,7 +249,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     }
 
     return segments;
-  }, [codeableText, codings, highlightRange]);
+  }, [codeableText, codings, activeHighlight]);
 
   // Handle text selection or click on coded passage
   const handleMouseUp = useCallback(() => {
@@ -389,9 +471,16 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
                 <PlusIcon size={12} />
               </button>
             </div>
-            <span className="text-xs text-gray-400">
-              {(doc.content?.length ?? 0).toLocaleString()} chars
-            </span>
+            {/* Char count: for audio show the transcript length; for images the
+                "content" is a base64 data URI, so the count is meaningless — hide it. */}
+            {doc.source_type !== 'image' && (
+              <span className="text-xs text-gray-400">
+                {(doc.source_type === 'audio'
+                  ? (doc.transcript?.length ?? 0)
+                  : (doc.content?.length ?? 0)
+                ).toLocaleString()} chars
+              </span>
+            )}
           </div>
         </div>
 
@@ -472,6 +561,51 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
 
       {/* Document content */}
       <div className="flex-1 overflow-auto relative" ref={contentRef} onMouseUp={handleMouseUp}>
+        {/* In-document find bar (Cmd/Ctrl+F) */}
+        {findOpen && hasSearchableText && (
+          <div className="sticky top-0 z-40 flex justify-end pointer-events-none">
+            <div className="pointer-events-auto m-2 flex items-center gap-1 bg-white border border-gray-200 rounded-lg shadow-md pl-2 pr-1 py-1">
+              <Search size={13} className="text-gray-400 shrink-0" />
+              <input
+                ref={findInputRef}
+                value={findQuery}
+                onChange={(e) => { setFindQuery(e.target.value); setFindIdx(0); }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') { e.preventDefault(); if (e.shiftKey) gotoPrevMatch(); else gotoNextMatch(); }
+                  else if (e.key === 'Escape') { e.preventDefault(); setFindOpen(false); }
+                }}
+                placeholder="Find in document"
+                className="text-sm px-1 py-0.5 w-44 outline-none bg-transparent"
+              />
+              <span className="text-[11px] text-gray-400 tabular-nums w-12 text-center shrink-0">
+                {findQuery ? `${findMatches.length ? safeFindIdx + 1 : 0}/${findMatches.length}` : ''}
+              </span>
+              <button
+                onClick={gotoPrevMatch}
+                disabled={findMatches.length === 0}
+                className="p-1 text-gray-400 hover:text-gray-600 disabled:opacity-30 rounded hover:bg-gray-100"
+                title="Previous match (Shift+Enter)"
+              >
+                <ChevronUp size={14} />
+              </button>
+              <button
+                onClick={gotoNextMatch}
+                disabled={findMatches.length === 0}
+                className="p-1 text-gray-400 hover:text-gray-600 disabled:opacity-30 rounded hover:bg-gray-100"
+                title="Next match (Enter)"
+              >
+                <ChevronDown size={14} />
+              </button>
+              <button
+                onClick={() => setFindOpen(false)}
+                className="p-1 text-gray-400 hover:text-gray-600 rounded hover:bg-gray-100"
+                title="Close (Esc)"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          </div>
+        )}
         {doc.source_type === 'image' ? (
           <div className="p-6 flex items-center justify-center">
             <img

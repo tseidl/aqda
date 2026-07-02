@@ -144,7 +144,10 @@ def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[dic
         # Last chunk reached — no overlap needed
         if end >= len(text):
             break
-        start = end - overlap
+        # Always advance. When overlap is large relative to a short (sentence-snapped)
+        # chunk, `end - overlap` can land at or before `start`; force forward progress
+        # so the loop can never spin forever.
+        start = max(end - overlap, start + 1)
     return chunks
 
 
@@ -708,16 +711,17 @@ async def consistency_check(req: ConsistencyCheckRequest):
             if len(segments) < 2:
                 continue
 
-            # Embed each segment
+            # Embed segments in batches (one Ollama call per batch, not per segment)
             embeddings = []
             valid_segments = []
-            for seg in segments:
+            for batch_start in range(0, len(segments), EMBED_BATCH_SIZE):
+                batch = segments[batch_start:batch_start + EMBED_BATCH_SIZE]
                 try:
-                    emb = await _ollama_embed(
-                        seg["selected_text"], embed_model, ollama_url
+                    batch_embs = await _ollama_embed(
+                        [s["selected_text"] for s in batch], embed_model, ollama_url
                     )
-                    embeddings.append(emb)
-                    valid_segments.append(seg)
+                    embeddings.extend(batch_embs)
+                    valid_segments.extend(batch)
                 except httpx.ConnectError:
                     raise HTTPException(
                         503, "Cannot connect to Ollama. Make sure it is running."

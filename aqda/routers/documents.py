@@ -1,5 +1,6 @@
 """Document management routes."""
 
+import asyncio
 import base64
 import re
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
@@ -256,25 +257,34 @@ async def upload_documents_bulk(
 
         results = []
         doc_ids = []
+        skipped = []
         for file in files:
             content_bytes = await file.read()
-            if len(content_bytes) > MAX_UPLOAD_BYTES:
-                continue
             filename = file.filename or "untitled"
+            if len(content_bytes) > MAX_UPLOAD_BYTES:
+                skipped.append({"name": filename, "reason": f"exceeds {MAX_UPLOAD_BYTES // (1024*1024)} MB limit"})
+                continue
             source_type = _detect_source_type(filename)
-            if source_type == "pdf":
-                text = await _extract_pdf_text(content_bytes)
-            elif source_type == "image":
-                ext = filename.rsplit('.', 1)[-1].lower()
-                mime = f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}"
-                text = f"data:{mime};base64,{base64.b64encode(content_bytes).decode('ascii')}"
-            elif source_type == "audio":
-                ext = '.' + filename.rsplit('.', 1)[-1].lower()
-                mime = AUDIO_MIME_MAP.get(ext, 'audio/mpeg')
-                text = f"data:{mime};base64,{base64.b64encode(content_bytes).decode('ascii')}"
-            else:
-                text = _decode_text_bytes(content_bytes)
+            # Isolate per-file extraction failures (e.g. a corrupt PDF) so one bad
+            # file is skipped instead of aborting the whole batch before commit.
+            try:
+                if source_type == "pdf":
+                    text = await _extract_pdf_text(content_bytes)
+                elif source_type == "image":
+                    ext = filename.rsplit('.', 1)[-1].lower()
+                    mime = f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}"
+                    text = f"data:{mime};base64,{base64.b64encode(content_bytes).decode('ascii')}"
+                elif source_type == "audio":
+                    ext = '.' + filename.rsplit('.', 1)[-1].lower()
+                    mime = AUDIO_MIME_MAP.get(ext, 'audio/mpeg')
+                    text = f"data:{mime};base64,{base64.b64encode(content_bytes).decode('ascii')}"
+                else:
+                    text = _decode_text_bytes(content_bytes)
+            except Exception:
+                skipped.append({"name": filename, "reason": "could not be read"})
+                continue
             if not text.strip():
+                skipped.append({"name": filename, "reason": "empty or unreadable"})
                 continue
             cursor = await db.execute(
                 "INSERT INTO document (project_id, name, content, source_type) VALUES (?, ?, ?, ?)",
@@ -296,7 +306,7 @@ async def upload_documents_bulk(
                 doc_ids,
             )
             results = [dict(r) for r in await cursor.fetchall()]
-        return results
+        return {"documents": results, "skipped": skipped}
     finally:
         await db.close()
 
@@ -454,8 +464,8 @@ async def delete_variable(document_id: int, key: str):
         await db.close()
 
 
-async def _extract_pdf_text(content_bytes: bytes) -> str:
-    """Extract text from PDF bytes using pdfplumber."""
+def _extract_pdf_text_sync(content_bytes: bytes) -> str:
+    """Extract text from PDF bytes using pdfplumber (CPU-bound, sync)."""
     import io
     import pdfplumber
 
@@ -466,6 +476,11 @@ async def _extract_pdf_text(content_bytes: bytes) -> str:
             if text:
                 pages.append(text)
     return "\n\n".join(pages)
+
+
+async def _extract_pdf_text(content_bytes: bytes) -> str:
+    """Extract PDF text off the event loop so uploads don't block other requests."""
+    return await asyncio.to_thread(_extract_pdf_text_sync, content_bytes)
 
 
 @router.post("/{document_id}/transcribe")
@@ -520,10 +535,14 @@ async def transcribe_audio(document_id: int):
             setting_row = await cursor.fetchone()
             model_name = setting_row["value"] if setting_row else "base"
 
-            # Transcribe
-            model = WhisperModel(model_name, device="cpu", compute_type="int8")
-            segments, _info = model.transcribe(tmp_path)
-            transcript = " ".join(seg.text.strip() for seg in segments)
+            # Transcribe off the event loop — model load + decoding are CPU-bound
+            # and can run for minutes; blocking here would freeze the whole app.
+            def _run_whisper() -> str:
+                model = WhisperModel(model_name, device="cpu", compute_type="int8")
+                segments, _info = model.transcribe(tmp_path)
+                return " ".join(seg.text.strip() for seg in segments)
+
+            transcript = await asyncio.to_thread(_run_whisper)
 
             if not transcript.strip():
                 raise HTTPException(400, "Transcription produced no text")

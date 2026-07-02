@@ -37,6 +37,7 @@ export function ProjectView() {
   const [highlightRange, setHighlightRange] = useState<{ start: number; end: number } | null>(null);
   const [uploadProgress, setUploadProgress] = useState<{ completed: number; total: number } | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadNotice, setUploadNotice] = useState<string | null>(null);
   const [selectedDocIds, setSelectedDocIds] = useState<Set<number>>(new Set());
   const [selectionMode, setSelectionMode] = useState(false);
   const [renamingDocId, setRenamingDocId] = useState<number | null>(null);
@@ -121,20 +122,29 @@ export function ProjectView() {
 
   // Mutations
   const uploadMut = useMutation({
-    mutationFn: (files: File[]) => {
+    mutationFn: async (files: File[]) => {
       setUploadError(null);
+      setUploadNotice(null);
       if (files.length === 1) {
-        return documents.upload(projectId, files[0]).then((d) => [d]);
+        const d = await documents.upload(projectId, files[0]);
+        return { documents: [d], skipped: [] };
       }
       setUploadProgress({ completed: 0, total: files.length });
       return documents.uploadBulk(projectId, files, (completed, total) => {
         setUploadProgress({ completed, total });
       });
     },
-    onSuccess: (docs) => {
+    onSuccess: (res) => {
       setUploadProgress(null);
       queryClient.invalidateQueries({ queryKey: ['documents', projectId] });
-      if (docs.length === 1) setSelectedDocId(docs[0].id);
+      if (res.documents.length === 1 && res.skipped.length === 0) setSelectedDocId(res.documents[0].id);
+      if (res.skipped.length > 0) {
+        const names = res.skipped.slice(0, 3).map((s) => s.name).join(', ');
+        setUploadNotice(
+          `Skipped ${res.skipped.length} file${res.skipped.length !== 1 ? 's' : ''}` +
+          `${names ? ` (${names}${res.skipped.length > 3 ? ', …' : ''})` : ''} — empty, unreadable, or too large.`
+        );
+      }
     },
     onError: (err) => {
       setUploadProgress(null);
@@ -402,6 +412,12 @@ export function ProjectView() {
             <div className="px-3 py-2 border-b border-gray-100 bg-red-50 text-xs text-red-700 flex items-center justify-between shrink-0">
               <span>Import failed: {uploadError}</span>
               <button onClick={() => setUploadError(null)} className="text-red-400 hover:text-red-600 ml-2">dismiss</button>
+            </div>
+          )}
+          {uploadNotice && (
+            <div className="px-3 py-2 border-b border-gray-100 bg-amber-50 text-xs text-amber-700 flex items-center justify-between shrink-0">
+              <span>{uploadNotice}</span>
+              <button onClick={() => setUploadNotice(null)} className="text-amber-400 hover:text-amber-600 ml-2">dismiss</button>
             </div>
           )}
 

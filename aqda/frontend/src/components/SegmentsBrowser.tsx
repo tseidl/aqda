@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Trash2 } from 'lucide-react';
 import { codings as codingsApi, type Code, type Coding } from '../api';
@@ -20,6 +20,7 @@ export function SegmentsBrowser({ projectId, codes, onNavigate }: Props) {
     },
   });
   const [filterCodeId, setFilterCodeId] = useState<number | null>(null);
+  const [filterCoder, setFilterCoder] = useState<string>('');
 
   const { data: allCodings = [] } = useQuery({
     queryKey: ['codings', 'project', projectId, filterCodeId],
@@ -30,6 +31,22 @@ export function SegmentsBrowser({ projectId, codes, onNavigate }: Props) {
           : { project_id: projectId }
       ),
   });
+
+  // Distinct coder names present in the (code-filtered) codings, for the coder dropdown.
+  const coders = useMemo(
+    () => Array.from(new Set(allCodings.map((c: Coding) => c.coder).filter(Boolean) as string[])).sort(),
+    [allCodings]
+  );
+
+  // Ignore a stale coder selection that no longer appears under the current code
+  // filter, so switching codes never leaves the list silently empty.
+  const effectiveCoder = filterCoder && coders.includes(filterCoder) ? filterCoder : '';
+
+  // Coder filtering is done client-side over the already-loaded codings.
+  const shownCodings = useMemo(
+    () => (effectiveCoder ? allCodings.filter((c: Coding) => c.coder === effectiveCoder) : allCodings),
+    [allCodings, effectiveCoder]
+  );
 
   return (
     <div className="p-2">
@@ -53,13 +70,27 @@ export function SegmentsBrowser({ projectId, codes, onNavigate }: Props) {
         ))}
       </select>
 
-      {allCodings.length === 0 ? (
+      {/* Filter by coder — shown only when codings carry coder attribution */}
+      {coders.length > 0 && (
+        <select
+          value={effectiveCoder}
+          onChange={(e) => setFilterCoder(e.target.value)}
+          className="w-full px-2 py-1.5 text-sm border border-gray-200 rounded-md mb-2 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+        >
+          <option value="">All coders</option>
+          {coders.map((name) => (
+            <option key={name} value={name}>{name}</option>
+          ))}
+        </select>
+      )}
+
+      {shownCodings.length === 0 ? (
         <p className="text-sm text-gray-400 text-center py-8">
-          {filterCodeId ? 'No segments with this code' : 'No coded segments yet'}
+          {filterCodeId || effectiveCoder ? 'No matching segments' : 'No coded segments yet'}
         </p>
       ) : (
         <div className="space-y-1">
-          {allCodings.map((coding: Coding) => (
+          {shownCodings.map((coding: Coding) => (
             <div
               key={coding.id}
               className="p-2 rounded-md hover:bg-gray-50 border border-gray-100 group"
@@ -75,6 +106,9 @@ export function SegmentsBrowser({ projectId, codes, onNavigate }: Props) {
                 <span className="text-xs text-gray-400 truncate shrink-0 max-w-[40%]">
                   {coding.document_name}
                 </span>
+                {coding.coder && (
+                  <span className="text-[10px] text-gray-400 shrink-0" title="Coder">{coding.coder}</span>
+                )}
                 <button
                   onClick={(e) => { e.stopPropagation(); deleteCodingMut.mutate(coding.id); }}
                   className="p-0.5 text-gray-300 hover:text-red-500 shrink-0"
@@ -96,7 +130,7 @@ export function SegmentsBrowser({ projectId, codes, onNavigate }: Props) {
             </div>
           ))}
           <p className="text-xs text-gray-400 text-center py-1">
-            {allCodings.length} segment{allCodings.length !== 1 ? 's' : ''}
+            {shownCodings.length} segment{shownCodings.length !== 1 ? 's' : ''}
           </p>
         </div>
       )}

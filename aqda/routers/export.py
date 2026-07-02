@@ -40,8 +40,13 @@ def _attrs(**kwargs) -> dict[str, str]:
     return {k: v for k, v in kwargs.items() if v is not None}
 
 
-async def _load_project_data(project_id: int):
-    """Load all project data for export."""
+async def _load_project_data(project_id: int, include_deleted: bool = False):
+    """Load all project data for export.
+
+    By default, soft-deleted (trashed) codes and codings are excluded so they
+    never leak into interchange formats (REFI-QDA, codebook, CSV, JSON). The
+    standalone .aqda backup passes include_deleted=True to preserve full state.
+    """
     db = await get_db()
     try:
         cursor = await db.execute("SELECT * FROM project WHERE id=?", (project_id,))
@@ -54,17 +59,20 @@ async def _load_project_data(project_id: int):
         )
         documents = await cursor.fetchall()
 
+        code_filter = "" if include_deleted else "AND deleted_at IS NULL"
         cursor = await db.execute(
-            "SELECT * FROM code WHERE project_id=? ORDER BY parent_id NULLS FIRST, sort_order",
+            f"SELECT * FROM code WHERE project_id=? {code_filter} "
+            "ORDER BY parent_id NULLS FIRST, sort_order",
             (project_id,),
         )
         codes = await cursor.fetchall()
 
+        coding_filter = "" if include_deleted else "AND cg.deleted_at IS NULL AND c.deleted_at IS NULL"
         cursor = await db.execute(
             "SELECT cg.*, c.name as code_name FROM coding cg "
             "JOIN code c ON c.id=cg.code_id "
             "JOIN document d ON d.id=cg.document_id "
-            "WHERE d.project_id=? ORDER BY cg.document_id, cg.start_pos",
+            f"WHERE d.project_id=? {coding_filter} ORDER BY cg.document_id, cg.start_pos",
             (project_id,),
         )
         codings = await cursor.fetchall()
@@ -273,12 +281,13 @@ async def export_csv(project_id: int):
 
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["document", "code", "start_pos", "end_pos", "text", "created_at"])
+    writer.writerow(["document", "code", "coder", "start_pos", "end_pos", "text", "created_at"])
     for cg in codings:
         doc_name = next((d["name"] for d in documents if d["id"] == cg["document_id"]), "")
         writer.writerow([
             doc_name,
             cg["code_name"],
+            cg["coder"] or "",
             cg["start_pos"],
             cg["end_pos"],
             cg["selected_text"],
@@ -322,7 +331,8 @@ async def export_json(project_id: int):
 @router.get("/{project_id}/aqda")
 async def export_aqda(project_id: int):
     """Export a single project as a standalone .aqda (SQLite) file for sharing."""
-    project, documents, codes, codings, memos = await _load_project_data(project_id)
+    # Full backup: keep trashed codes/codings so the file round-trips exactly.
+    project, documents, codes, codings, memos = await _load_project_data(project_id, include_deleted=True)
 
     # Also load document variables
     db = await get_db()

@@ -86,6 +86,16 @@ export interface Settings {
   [key: string]: string;
 }
 
+export interface SkippedUpload {
+  name: string;
+  reason: string;
+}
+
+export interface BulkUploadResult {
+  documents: Document[];
+  skipped: SkippedUpload[];
+}
+
 export interface SimilarResult {
   document_id: number;
   document_name: string;
@@ -166,9 +176,10 @@ export const documents = {
     projectId: number,
     files: File[],
     onProgress?: (completed: number, total: number) => void,
-  ): Promise<Document[]> => {
+  ): Promise<BulkUploadResult> => {
     const BATCH_SIZE = 20;
-    const results: Document[] = [];
+    const documents: Document[] = [];
+    const skipped: SkippedUpload[] = [];
     for (let i = 0; i < files.length; i += BATCH_SIZE) {
       const batch = files.slice(i, i + BATCH_SIZE);
       const form = new FormData();
@@ -176,11 +187,12 @@ export const documents = {
       for (const f of batch) form.append('files', f);
       const res = await fetch(`${BASE}/documents/bulk`, { method: 'POST', body: form });
       if (!res.ok) throw new Error(await res.text());
-      const docs: Document[] = await res.json();
-      results.push(...docs);
+      const data: BulkUploadResult = await res.json();
+      documents.push(...data.documents);
+      skipped.push(...data.skipped);
       onProgress?.(Math.min(i + BATCH_SIZE, files.length), files.length);
     }
-    return results;
+    return { documents, skipped };
   },
   update: (id: number, data: { name?: string; label?: string; exclude_from_ai?: boolean }) =>
     request<Document>(`/documents/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),

@@ -17,7 +17,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="AQDA", version="0.1.1", lifespan=lifespan)
+app = FastAPI(title="AQDA", version="0.2.0", lifespan=lifespan)
 
 # API routes
 app.include_router(projects.router, prefix="/api/projects", tags=["projects"])
@@ -34,11 +34,15 @@ FRONTEND_DIR = Path(__file__).parent / "frontend" / "dist"
 
 if FRONTEND_DIR.exists():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIR / "assets"), name="static")
+    _FRONTEND_ROOT = FRONTEND_DIR.resolve()
+    _INDEX = _FRONTEND_ROOT / "index.html"
 
     @app.get("/{path:path}")
     async def serve_spa(path: str):
-        # Serve index.html for all non-API, non-asset routes (SPA routing)
-        file_path = FRONTEND_DIR / path
-        if file_path.exists() and file_path.is_file():
-            return FileResponse(file_path)
-        return FileResponse(FRONTEND_DIR / "index.html")
+        # Serve index.html for all non-API, non-asset routes (SPA routing).
+        # Resolve the target and confine it to the frontend dir so crafted
+        # paths like "../../db.py" can't escape and serve arbitrary files.
+        target = (_FRONTEND_ROOT / path).resolve()
+        if target.is_relative_to(_FRONTEND_ROOT) and target.is_file():
+            return FileResponse(target)
+        return FileResponse(_INDEX)

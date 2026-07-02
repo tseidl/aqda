@@ -82,9 +82,13 @@ async def create_coding(data: CodingCreate):
 
 @router.delete("/{coding_id}", status_code=204)
 async def delete_coding(coding_id: int):
+    # Soft-delete for consistency with code deletion and to keep it recoverable.
+    # List queries filter `deleted_at IS NULL`, so it disappears from the UI.
     db = await get_db()
     try:
-        await db.execute("DELETE FROM coding WHERE id=?", (coding_id,))
+        await db.execute(
+            "UPDATE coding SET deleted_at=datetime('now') WHERE id=?", (coding_id,)
+        )
         await db.commit()
     finally:
         await db.close()

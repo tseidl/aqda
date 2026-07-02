@@ -177,8 +177,12 @@ async def _run_migrations(db: aiosqlite.Connection):
         for sql in MIGRATIONS[target]:
             try:
                 await db.execute(sql)
-            except Exception:
-                pass  # Column may already exist from fresh schema
+            except Exception as e:
+                # An ALTER that re-adds an existing column is expected (the fresh
+                # schema already has it); anything else is a real failure we must
+                # not hide, or we'd silently bump the version on a broken DB.
+                if "duplicate column name" not in str(e).lower():
+                    raise
         await db.execute(
             "INSERT OR REPLACE INTO setting (key, value) VALUES ('schema_version', ?)",
             (str(target),),
