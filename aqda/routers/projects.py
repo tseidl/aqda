@@ -172,17 +172,31 @@ async def import_from_db(file: UploadFile = File(...)):
         dst = await get_db()
 
         try:
-            # Get all projects from source
-            cursor = await src.execute("SELECT * FROM project")
-            projects = await cursor.fetchall()
+            # Get all projects from source, skipping trashed ones. Older
+            # databases have no project.deleted_at column — fall back.
+            try:
+                try:
+                    cursor = await src.execute("SELECT * FROM project WHERE deleted_at IS NULL")
+                except aiosqlite.OperationalError as e:
+                    if "no such column" not in str(e).lower():
+                        raise
+                    cursor = await src.execute("SELECT * FROM project")
+                projects = await cursor.fetchall()
+            except aiosqlite.DatabaseError:
+                raise HTTPException(
+                    400,
+                    "Not an AQDA project file. Expected an .aqda file "
+                    "(from Export → Share Project) or an AQDA database.",
+                )
 
             for proj in projects:
-                # Create project in destination
+                # Create project in destination. modified_at is left to its
+                # default (now) so the import sorts to the top of the list.
                 stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 imported_name = f"{proj['name']} (imported {stamp})"
                 c = await dst.execute(
-                    "INSERT INTO project (name, description, created_at, modified_at) VALUES (?, ?, ?, ?)",
-                    (imported_name, proj["description"], proj["created_at"], proj["modified_at"]),
+                    "INSERT INTO project (name, description, created_at) VALUES (?, ?, ?)",
+                    (imported_name, proj["description"], proj["created_at"]),
                 )
                 new_project_id = c.lastrowid
 
@@ -230,20 +244,31 @@ async def import_from_db(file: UploadFile = File(...)):
                     except Exception:
                         pass  # Source DB may not have this table
 
-                # Copy codes, remap IDs (handle hierarchy)
+                # Copy codes, remap IDs. Insert first, then set parents in a
+                # second pass — source ID order says nothing about hierarchy
+                # (re-parented codes can have parents with higher IDs).
                 cursor = await src.execute(
-                    "SELECT * FROM code WHERE project_id=? ORDER BY parent_id NULLS FIRST",
-                    (proj["id"],),
+                    "SELECT * FROM code WHERE project_id=?", (proj["id"],)
                 )
                 src_codes = await cursor.fetchall()
                 code_map: dict[int, int] = {}
                 for code in src_codes:
-                    new_parent = code_map.get(code["parent_id"]) if code["parent_id"] else None
+                    deleted = None
+                    try:
+                        deleted = code["deleted_at"]
+                    except (IndexError, KeyError):
+                        pass
                     c = await dst.execute(
-                        "INSERT INTO code (project_id, parent_id, name, description, color, sort_order, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (new_project_id, new_parent, code["name"], code["description"], code["color"], code["sort_order"], code["created_at"]),
+                        "INSERT INTO code (project_id, parent_id, name, description, color, sort_order, created_at, deleted_at) VALUES (?, NULL, ?, ?, ?, ?, ?, ?)",
+                        (new_project_id, code["name"], code["description"], code["color"], code["sort_order"], code["created_at"], deleted),
                     )
                     code_map[code["id"]] = c.lastrowid
+                for code in src_codes:
+                    if code["parent_id"] and code["parent_id"] in code_map:
+                        await dst.execute(
+                            "UPDATE code SET parent_id=? WHERE id=?",
+                            (code_map[code["parent_id"]], code_map[code["id"]]),
+                        )
 
                 # Copy codings
                 cursor = await src.execute(
@@ -263,9 +288,14 @@ async def import_from_db(file: UploadFile = File(...)):
                                 coder = coding["coder"] or ""
                             except (IndexError, KeyError):
                                 pass
+                            deleted = None
+                            try:
+                                deleted = coding["deleted_at"]
+                            except (IndexError, KeyError):
+                                pass
                             await dst.execute(
-                                "INSERT INTO coding (document_id, code_id, start_pos, end_pos, selected_text, coder, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                (new_doc, new_code, coding["start_pos"], coding["end_pos"], coding["selected_text"], coder, coding["created_at"]),
+                                "INSERT INTO coding (document_id, code_id, start_pos, end_pos, selected_text, coder, created_at, deleted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                (new_doc, new_code, coding["start_pos"], coding["end_pos"], coding["selected_text"], coder, coding["created_at"], deleted),
                             )
 
                 # Copy memos

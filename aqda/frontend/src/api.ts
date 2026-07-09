@@ -156,7 +156,16 @@ export const projects = {
     const form = new FormData();
     form.append('file', file);
     const res = await fetch(`${BASE}/projects/import-db`, { method: 'POST', body: form });
-    if (!res.ok) throw new Error(await res.text());
+    if (!res.ok) {
+      const text = await res.text();
+      let message = text;
+      try {
+        message = JSON.parse(text).detail ?? text;
+      } catch {
+        // not JSON, keep raw text
+      }
+      throw new Error(message);
+    }
     return res.json();
   },
 };

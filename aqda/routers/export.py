@@ -381,10 +381,13 @@ async def export_aqda(project_id: int):
                     (new_doc_id, dv["key"], dv["value"]),
                 )
 
-        # Codes — remap IDs, respecting hierarchy order
+        # Codes — remap IDs; build the full map first so parent references
+        # resolve regardless of insertion order (re-parented codes can have
+        # parents with higher IDs)
         code_map: dict[int, int] = {}
         for i, code in enumerate(codes, 1):
             code_map[code["id"]] = i
+        for i, code in enumerate(codes, 1):
             new_parent = code_map.get(code["parent_id"]) if code["parent_id"] else None
             con.execute(
                 "INSERT INTO code (id, project_id, parent_id, name, description, color, sort_order, created_at, deleted_at) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)",

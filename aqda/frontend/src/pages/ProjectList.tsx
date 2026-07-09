@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, Link } from 'react-router-dom';
-import { Plus, FolderOpen, Trash2, Settings, FileText, Tags, Upload, RotateCcw, ChevronDown } from 'lucide-react';
+import { Plus, FolderOpen, Trash2, Settings, FileText, Tags, Upload, RotateCcw, ChevronDown, X } from 'lucide-react';
 import { projects, type Project } from '../api';
 
 export function ProjectList() {
@@ -11,6 +11,7 @@ export function ProjectList() {
   const [newName, setNewName] = useState('');
   const [newDesc, setNewDesc] = useState('');
   const [showTrash, setShowTrash] = useState(false);
+  const [importMsg, setImportMsg] = useState<{ ok: boolean; text: string } | null>(null);
 
   const { data: projectList = [], isLoading } = useQuery({
     queryKey: ['projects'],
@@ -56,7 +57,16 @@ export function ProjectList() {
     mutationFn: projects.importDb,
     onSuccess: (result) => {
       queryClient.invalidateQueries({ queryKey: ['projects'] });
-      if (result.count === 1) navigate(`/project/${result.imported[0].id}`);
+      if (result.count === 0) {
+        setImportMsg({ ok: false, text: 'No projects found in that file.' });
+      } else if (result.count === 1) {
+        setImportMsg({ ok: true, text: `Imported "${result.imported[0].name}".` });
+      } else {
+        setImportMsg({ ok: true, text: `Imported ${result.count} projects.` });
+      }
+    },
+    onError: (err: Error) => {
+      setImportMsg({ ok: false, text: `Import failed: ${err.message}` });
     },
   });
 
@@ -65,7 +75,10 @@ export function ProjectList() {
     input.type = 'file';
     input.accept = '.db,.sqlite,.sqlite3,.aqda';
     input.onchange = () => {
-      if (input.files?.length) importMut.mutate(input.files[0]);
+      if (input.files?.length) {
+        setImportMsg(null);
+        importMut.mutate(input.files[0]);
+      }
     };
     input.click();
   };
@@ -92,9 +105,9 @@ export function ProjectList() {
               onClick={handleImportDb}
               disabled={importMut.isPending}
               className="flex items-center gap-2 px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 text-sm font-medium"
-              title="Import projects from another AQDA database file"
+              title="Import a project from an .aqda file (Export → Share Project) or another AQDA database"
             >
-              <Upload size={16} /> {importMut.isPending ? 'Importing...' : 'Import DB'}
+              <Upload size={16} /> {importMut.isPending ? 'Importing...' : 'Import Project'}
             </button>
             <button
               onClick={() => setShowNew(true)}
@@ -104,6 +117,25 @@ export function ProjectList() {
             </button>
           </div>
         </div>
+
+        {importMsg && (
+          <div
+            className={`flex items-start justify-between gap-3 rounded-lg border px-4 py-3 mb-4 text-sm ${
+              importMsg.ok
+                ? 'bg-green-50 border-green-200 text-green-800'
+                : 'bg-red-50 border-red-200 text-red-700'
+            }`}
+          >
+            <span>{importMsg.text}</span>
+            <button
+              onClick={() => setImportMsg(null)}
+              className="opacity-60 hover:opacity-100"
+              title="Dismiss"
+            >
+              <X size={14} />
+            </button>
+          </div>
+        )}
 
         {showNew && (
           <div className="bg-white rounded-lg border border-gray-200 p-4 mb-4">

@@ -177,7 +177,7 @@ AQDA supports sharing individual projects via `.aqda` files — small, self-cont
 
 1. In your project, click **Export → Share Project (.aqda)** — downloads a file like `My_Project.aqda`
 2. Send the file to your collaborator (email, Google Drive, USB stick — whatever works)
-3. They open AQDA, click **Import DB** on the project list, and select the `.aqda` file
+3. They open AQDA, click **Import Project** on the project list, and select the `.aqda` file
 4. The project appears in their AQDA with all data intact
 5. When they're done, they export and send it back
 
