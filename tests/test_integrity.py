@@ -190,8 +190,13 @@ async def test_export_fidelity_and_api_404(tmp_path, use_data_dir):
     assert "exclude source content" in exported_json["format"]
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://127.0.0.1:8765"
+    ) as client:
         response = await client.get("/api/definitely-not-a-route")
+        dns_rebinding = await client.get(
+            "/api/projects", headers={"Host": "attacker.example"}
+        )
         cross_site = await client.post(
             "/api/shared/sync", headers={"Origin": "https://attacker.example"}
         )
@@ -201,6 +206,10 @@ async def test_export_fidelity_and_api_404(tmp_path, use_data_dir):
         )
     assert response.status_code == 404
     assert response.json()["detail"].startswith("API route not found")
+    assert dns_rebinding.status_code == 400
+    assert dns_rebinding.json()["detail"] == (
+        "AQDA only accepts requests addressed to localhost"
+    )
     assert cross_site.status_code == 403
     assert cross_site.json()["detail"] == "Cross-site requests to AQDA are not allowed"
     assert local_site.status_code == 404

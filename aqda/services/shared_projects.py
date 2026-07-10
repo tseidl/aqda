@@ -440,6 +440,15 @@ async def share_project(project_id: int, root_path: str | None = None) -> dict:
                 "This is a reference copy of concurrent work and cannot be shared separately.",
             )
         folder = Path(project["shared_folder"]) if project["shared_folder"] else None
+        if folder is not None and root_path:
+            requested_root = Path(root_path).expanduser().resolve()
+            current_root = folder.expanduser().resolve().parent
+            if requested_root != current_root:
+                raise HTTPException(
+                    409,
+                    f'This project is already collaborating from "{current_root}". '
+                    "Stop sharing it before choosing another location.",
+                )
         if folder is None:
             roots = await get_shared_roots()
             if root_path:
@@ -895,6 +904,17 @@ async def open_shared_project(
 
         snapshot_data = await asyncio.to_thread(primary.path.read_bytes)
         result = await import_package_bytes(snapshot_data, mode="auto")
+        trashed_conflict = next(
+            (item for item in result["conflicts"] if item.get("trashed")),
+            None,
+        )
+        if trashed_conflict:
+            result = await import_package_bytes(
+                snapshot_data,
+                mode="replace",
+                target_lineage_id=primary.lineage_id,
+            )
+
         local_newer = next(
             (
                 item
@@ -903,28 +923,26 @@ async def open_shared_project(
             ),
             None,
         )
+        local_divergent = next(
+            (item for item in result["conflicts"] if not item.get("trashed")),
+            None,
+        )
+        local_relation = (
+            "newer" if local_newer else "divergent" if local_divergent else None
+        )
+        local_choice_project = local_newer or local_divergent
         backup_path = result.get("backup_path")
-        if local_newer and local_newer_choice is None:
+        if local_relation and local_newer_choice is None:
             return {
-                "project_id": local_newer["id"],
-                "name": local_newer["name"],
+                "project_id": local_choice_project["id"],
+                "name": local_choice_project["name"],
                 "needs_local_newer_choice": True,
+                "local_relation": local_relation,
                 "shared_name": primary.name,
                 "folder": str(folder),
                 "conflicts": [],
             }
-        if local_newer and local_newer_choice == "use_shared":
-            result = await import_package_bytes(
-                snapshot_data,
-                mode="replace",
-                target_lineage_id=primary.lineage_id,
-            )
-            backup_path = result.get("backup_path")
-        trashed_conflict = next(
-            (item for item in result["conflicts"] if item.get("trashed")),
-            None,
-        )
-        if trashed_conflict:
+        if local_relation and local_newer_choice == "use_shared":
             result = await import_package_bytes(
                 snapshot_data,
                 mode="replace",
@@ -1305,4 +1323,21 @@ def write_project_metadata(folder: Path, name: str, lineage_id: str) -> None:
     """Optional human-readable marker; snapshots remain the source of truth."""
     metadata = {"format": "aqda-shared-project", "name": name, "lineage_id": lineage_id}
     path = folder / "project.json"
-    path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=folder,
+            prefix=".project.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temp_path = Path(stream.name)
+            stream.write(json.dumps(metadata, indent=2) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)

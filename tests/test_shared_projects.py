@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 from pathlib import Path
 
@@ -119,6 +120,7 @@ async def test_existing_local_changes_require_choice_before_connecting(
 
     needs_choice = await open_shared_project(str(folder))
     assert needs_choice["needs_local_newer_choice"] is True
+    assert needs_choice["local_relation"] == "newer"
     assert (await project_row(bob_id))["description"] == "Minor local test coding"
     assert (await project_row(bob_id))["shared_folder"] is None
 
@@ -129,6 +131,58 @@ async def test_existing_local_changes_require_choice_before_connecting(
     assert (await project_row(bob_id))["shared_folder"] == str(folder)
     assert await project_count() == 1
     assert len(list((folder / "snapshots").glob("*.aqda"))) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("choice", ["use_shared", "use_local"])
+async def test_divergent_local_copy_requires_choice_before_connecting(
+    tmp_path, use_data_dir, choice
+):
+    shared_root = tmp_path / "Drive" / "divergent-study"
+
+    use_data_dir(tmp_path / "alice-divergent-open")
+    await db_module.init_db()
+    await set_shared_root(str(shared_root))
+    alice = await projects.create_project(projects.ProjectCreate(name="Divergent study"))
+    folder = Path((await share_project(alice["id"]))["folder"])
+    baseline = next((folder / "snapshots").glob("*.aqda")).read_bytes()
+    await projects.update_project(
+        alice["id"], projects.ProjectUpdate(description="Alice changed the shared copy")
+    )
+    await sync_project(alice["id"])
+
+    use_data_dir(tmp_path / "bob-divergent-open")
+    await db_module.init_db()
+    imported = await projects.import_package_bytes(baseline)
+    bob_id = imported["imported"][0]["id"]
+    await projects.update_project(
+        bob_id, projects.ProjectUpdate(description="Bob independently changed his copy")
+    )
+    await set_shared_root(str(shared_root))
+
+    writer_count = len(list((folder / "snapshots").glob("*.aqda")))
+    needs_choice = await open_shared_project(str(folder))
+    assert needs_choice["needs_local_newer_choice"] is True
+    assert needs_choice["local_relation"] == "divergent"
+    assert (await project_row(bob_id))["description"] == "Bob independently changed his copy"
+    assert (await project_row(bob_id))["shared_folder"] is None
+    assert len(list((folder / "snapshots").glob("*.aqda"))) == writer_count
+
+    connected = await open_shared_project(str(folder), choice)
+    assert (await project_row(bob_id))["shared_folder"] == str(folder)
+    if choice == "use_shared":
+        assert connected["backup_path"]
+        assert (await project_row(bob_id))["description"] == "Alice changed the shared copy"
+        assert await project_count() == 1
+    else:
+        assert connected["conflicts"]
+        assert (await project_row(bob_id))["description"] == (
+            "Bob independently changed his copy"
+        )
+        assert await project_count() == 2
+        mirror = next(row for row in await project_rows() if row["id"] != bob_id)
+        assert mirror["description"] == "Alice changed the shared copy"
+        assert mirror["shared_folder"] is None
 
 
 @pytest.mark.asyncio
@@ -152,6 +206,14 @@ async def test_projects_choose_between_multiple_collaboration_locations(
     methods_shared = await share_project(methods["id"], str(university_team))
     assert Path(policy_shared["folder"]).parent == drive_team
     assert Path(methods_shared["folder"]).parent == university_team
+    with pytest.raises(HTTPException, match="already collaborating"):
+        await share_project(policy["id"], str(university_team))
+
+    metadata = json.loads(
+        (Path(policy_shared["folder"]) / "project.json").read_text(encoding="utf-8")
+    )
+    assert metadata["name"] == "Policy study"
+    assert not list(Path(policy_shared["folder"]).glob(".project.*.tmp"))
 
     status = await shared_router.shared_status()
     roots = {item["path"]: item for item in status["roots"]}

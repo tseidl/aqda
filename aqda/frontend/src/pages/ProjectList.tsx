@@ -20,6 +20,7 @@ export function ProjectList() {
   const [pendingLocalConnection, setPendingLocalConnection] = useState<{
     folder: string;
     name: string;
+    relation: 'newer' | 'divergent';
   } | null>(null);
 
   const { data: projectList = [], isLoading } = useQuery({
@@ -47,12 +48,14 @@ export function ProjectList() {
     }: {
       folder: string;
       choice?: 'use_shared' | 'use_local';
+      relation?: 'newer' | 'divergent';
     }) => shared.openProject(folder, choice),
     onSuccess: (result, variables) => {
       if (result.needs_local_newer_choice) {
         setPendingLocalConnection({
           folder: result.folder ?? variables.folder,
           name: result.shared_name ?? result.name,
+          relation: result.local_relation ?? 'newer',
         });
         return;
       }
@@ -62,7 +65,11 @@ export function ProjectList() {
       if (variables.choice === 'use_shared') {
         alert('Connected to the shared version. AQDA created a full safety backup of your previous local data.');
       } else if (variables.choice === 'use_local') {
-        alert('Connected and published the changes from this computer.');
+        alert(
+          variables.relation === 'divergent'
+            ? 'Connected both versions. AQDA kept the shared branch as a single collaborator reference so you can compare and resolve them.'
+            : 'Connected and published the changes from this computer.'
+        );
       }
       navigate(`/project/${result.project_id}`);
     },
@@ -301,9 +308,15 @@ export function ProjectList() {
             <div className="flex items-start gap-3">
               <AlertTriangle size={18} className="mt-0.5 shrink-0 text-amber-700" />
               <div className="flex-1">
-                <p className="font-medium">This computer has additional local changes to “{pendingLocalConnection.name}”</p>
+                <p className="font-medium">
+                  {pendingLocalConnection.relation === 'divergent'
+                    ? `This computer and the shared folder contain different changes to “${pendingLocalConnection.name}”`
+                    : `This computer has additional local changes to “${pendingLocalConnection.name}”`}
+                </p>
                 <p className="text-xs text-amber-800 mt-1">
-                  Choose which version should become the shared project. AQDA will not combine or discard them silently.
+                  {pendingLocalConnection.relation === 'divergent'
+                    ? 'Use the shared version and archive your local data, or connect both versions for comparison. AQDA will not publish or discard either version until you choose.'
+                    : 'Choose which version should become the shared project. AQDA will not combine or discard them silently.'}
                 </p>
                 <div className="flex flex-wrap gap-2 mt-3">
                   <button
@@ -312,6 +325,7 @@ export function ProjectList() {
                         openSharedMut.mutate({
                           folder: pendingLocalConnection.folder,
                           choice: 'use_shared',
+                          relation: pendingLocalConnection.relation,
                         });
                       }
                     }}
@@ -322,17 +336,23 @@ export function ProjectList() {
                   </button>
                   <button
                     onClick={() => {
-                      if (confirm('Publish the changes currently saved on this computer to the collaboration folder?')) {
+                      const message = pendingLocalConnection.relation === 'divergent'
+                        ? 'Connect both versions? AQDA will publish this computer’s branch and keep the shared branch as a single collaborator reference that you must resolve manually.'
+                        : 'Publish the changes currently saved on this computer to the collaboration folder?';
+                      if (confirm(message)) {
                         openSharedMut.mutate({
                           folder: pendingLocalConnection.folder,
                           choice: 'use_local',
+                          relation: pendingLocalConnection.relation,
                         });
                       }
                     }}
                     disabled={openSharedMut.isPending}
                     className="px-3 py-1.5 rounded-md bg-white border border-amber-300 text-amber-900 text-xs font-medium hover:bg-amber-100 disabled:opacity-50"
                   >
-                    Publish my local changes
+                    {pendingLocalConnection.relation === 'divergent'
+                      ? 'Keep both versions'
+                      : 'Publish my local changes'}
                   </button>
                   <button
                     onClick={() => setPendingLocalConnection(null)}

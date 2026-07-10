@@ -81,6 +81,7 @@ export interface OpenSharedProjectResult {
   project_id: number;
   name: string;
   needs_local_newer_choice?: boolean;
+  local_relation?: 'newer' | 'divergent';
   shared_name?: string;
   folder?: string;
   backup_path?: string | null;

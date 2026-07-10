@@ -27,20 +27,49 @@ app = FastAPI(title="AQDA", version="0.3.0", lifespan=lifespan)
 _LOCAL_BROWSER_ORIGINS = {
     "http://127.0.0.1:8765",
     "http://localhost:8765",
+    "http://[::1]:8765",
     # The Vite development server proxies /api requests to the same local app.
     "http://127.0.0.1:5173",
     "http://localhost:5173",
+    "http://[::1]:5173",
 }
+_LOCAL_BROWSER_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _hostname_from_host_header(value: str) -> str:
+    """Return a normalized hostname while rejecting malformed port syntax."""
+    host = value.strip().lower()
+    if host.startswith("["):
+        closing = host.find("]")
+        suffix = host[closing + 1:] if closing >= 0 else ""
+        if closing < 0 or (
+            suffix and not (suffix.startswith(":") and suffix[1:].isdigit())
+        ):
+            return ""
+        return host[1:closing]
+    if host.count(":") == 1:
+        hostname, port = host.rsplit(":", 1)
+        if not port.isdigit():
+            return ""
+        return hostname
+    return host if ":" not in host else ""
 
 
 @app.middleware("http")
-async def require_local_origin_for_changes(request, call_next):
-    """Reject browser-driven cross-site writes to the localhost API.
+async def require_local_http_context(request, call_next):
+    """Reject DNS-rebinding reads and browser-driven cross-site writes.
 
-    Origin-less requests remain available to the command line and native folder
-    picker. Browsers attach an Origin to cross-site POST/PUT/PATCH/DELETE requests,
-    which prevents an arbitrary website from closing AQDA or changing its data.
+    Every request must retain a localhost Host header. Origin-less local requests
+    remain available to the command line and native folder picker. Browsers attach
+    an Origin to cross-site POST/PUT/PATCH/DELETE requests, which prevents an
+    arbitrary website from closing AQDA or changing its data.
     """
+    hostname = _hostname_from_host_header(request.headers.get("host", ""))
+    if hostname not in _LOCAL_BROWSER_HOSTS:
+        return JSONResponse(
+            {"detail": "AQDA only accepts requests addressed to localhost"},
+            status_code=400,
+        )
     if request.method not in {"GET", "HEAD", "OPTIONS"}:
         origin = request.headers.get("origin")
         if origin and origin not in _LOCAL_BROWSER_ORIGINS:

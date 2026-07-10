@@ -48,6 +48,12 @@
   stable managed folder while publishing the new display name in subsequent snapshots.
 - Collaboration Settings remembers multiple locations, and the **Collaborate** button offers
   a clear per-project choice between saved team folders or a new shared folder.
+- Connecting an existing project now asks before acting for both newer and genuinely divergent
+  local work. Users can adopt the shared version after a verified backup or explicitly keep
+  both branches for comparison; AQDA never silently publishes the divergent branch.
+- Localhost Host validation also protects read requests from DNS rebinding, contradictory
+  attempts to move an already linked project return an error, and shared `project.json`
+  metadata is replaced atomically.
 
 ## 0.2.0
 

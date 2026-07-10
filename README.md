@@ -70,6 +70,12 @@ Open a terminal and run:
 pipx install git+https://github.com/tseidl/aqda.git
 ```
 
+Already installed? Refresh AQDA to the current version with:
+
+```bash
+pipx reinstall aqda
+```
+
 Then start AQDA:
 
 ```bash
