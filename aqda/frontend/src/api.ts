@@ -34,6 +34,7 @@ export interface Project {
 }
 
 export interface SharedDiscoveredProject {
+  root: string;
   folder: string;
   name: string;
   lineage_id: string;
@@ -41,13 +42,25 @@ export interface SharedDiscoveredProject {
   updated_at: string;
   updated_by: string;
   head_count: number;
+  local_project_id?: number | null;
   linked_project_id?: number | null;
+}
+
+export interface SharedRoot {
+  path: string;
+  name: string;
+  available: boolean;
+  project_count: number;
+  standalone_aqda_count: number;
+  linked_project_count: number;
 }
 
 export interface SharedStatus {
   root: string;
+  roots: SharedRoot[];
   linked: Project[];
   discovered: SharedDiscoveredProject[];
+  standalone_aqda_count: number;
   backup_folder: string;
   backup_count: number;
   latest_backup?: string | null;
@@ -62,6 +75,15 @@ export interface ConflictResolutionResult {
   archived_project_name?: string | null;
   backup_path?: string | null;
   message: string;
+}
+
+export interface OpenSharedProjectResult {
+  project_id: number;
+  name: string;
+  needs_local_newer_choice?: boolean;
+  shared_name?: string;
+  folder?: string;
+  backup_path?: string | null;
 }
 
 export interface ProjectImportConflict {
@@ -250,16 +272,27 @@ export const shared = {
     request<{ path: string; discovered: SharedDiscoveredProject[] }>('/shared/folder', {
       method: 'PUT', body: JSON.stringify({ path }),
     }),
-  shareProject: (projectId: number) =>
+  removeFolder: (path: string) =>
+    request<void>('/shared/folder', {
+      method: 'DELETE', body: JSON.stringify({ path }),
+    }),
+  shareProject: (projectId: number, root?: string) =>
     request<{ project_id: number; folder: string; published: boolean }>(
-      `/shared/projects/${projectId}/share`, { method: 'POST' }
+      `/shared/projects/${projectId}/share`, {
+        method: 'POST', body: JSON.stringify({ root }),
+      }
     ),
   syncProject: (projectId: number) =>
     request(`/shared/projects/${projectId}/sync`, { method: 'POST' }),
   syncAll: () => request('/shared/sync', { method: 'POST' }),
-  openProject: (folder: string) =>
-    request<{ project_id: number; name: string }>('/shared/open', {
-      method: 'POST', body: JSON.stringify({ folder }),
+  openProject: (
+    folder: string,
+    localNewerChoice?: 'use_shared' | 'use_local',
+  ) => request<OpenSharedProjectResult>('/shared/open', {
+      method: 'POST', body: JSON.stringify({
+        folder,
+        local_newer_choice: localNewerChoice,
+      }),
     }),
   unlinkProject: (projectId: number) =>
     request<void>(`/shared/projects/${projectId}/link`, { method: 'DELETE' }),

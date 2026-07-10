@@ -150,9 +150,58 @@ async def get_shared_root() -> Path | None:
             await db.execute("SELECT value FROM setting WHERE key='shared_folder'")
         ).fetchone()
         value = (row["value"] if row else "").strip()
-        return Path(value).expanduser().resolve() if value else None
+        if value:
+            return Path(value).expanduser().resolve()
     finally:
         await db.close()
+    roots = await get_shared_roots()
+    return roots[0] if roots else None
+
+
+async def get_shared_roots() -> list[Path]:
+    """Return every saved collaboration location plus roots used by linked projects."""
+    db = await get_db()
+    try:
+        rows = await (
+            await db.execute(
+                "SELECT key, value FROM setting "
+                "WHERE key IN ('shared_folder', 'shared_folders')"
+            )
+        ).fetchall()
+        settings = {row["key"]: row["value"] for row in rows}
+        project_rows = await (
+            await db.execute(
+                "SELECT shared_folder FROM project WHERE shared_folder IS NOT NULL "
+                "AND deleted_at IS NULL"
+            )
+        ).fetchall()
+    finally:
+        await db.close()
+
+    values: list[str] = []
+    try:
+        saved = json.loads(settings.get("shared_folders", "[]"))
+        if isinstance(saved, list):
+            values.extend(str(item) for item in saved if isinstance(item, str))
+    except (TypeError, ValueError):
+        pass
+    legacy = settings.get("shared_folder", "").strip()
+    if legacy:
+        values.append(legacy)
+    for row in project_rows:
+        values.append(str(Path(row["shared_folder"]).expanduser().resolve().parent))
+
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for value in values:
+        if not value.strip():
+            continue
+        root = Path(value).expanduser().resolve()
+        key = str(root)
+        if key not in seen:
+            seen.add(key)
+            roots.append(root)
+    return roots
 
 
 async def set_shared_root(path: str) -> Path:
@@ -167,16 +216,68 @@ async def set_shared_root(path: str) -> Path:
     except OSError as exc:
         raise HTTPException(400, f"AQDA cannot write to that folder: {exc}") from exc
 
+    existing = await get_shared_roots()
+    saved = [str(root), *(str(item) for item in existing if item != root)]
     db = await get_db()
     try:
         await db.execute(
             "INSERT OR REPLACE INTO setting (key, value) VALUES ('shared_folder', ?)",
             (str(root),),
         )
+        await db.execute(
+            "INSERT OR REPLACE INTO setting (key, value) VALUES ('shared_folders', ?)",
+            (json.dumps(saved),),
+        )
         await db.commit()
     finally:
         await db.close()
     return root
+
+
+async def remove_shared_root(path: str) -> None:
+    target = Path(path).expanduser().resolve()
+    db = await get_db()
+    try:
+        linked = await (
+            await db.execute(
+                "SELECT id, name, shared_folder FROM project "
+                "WHERE shared_folder IS NOT NULL AND deleted_at IS NULL"
+            )
+        ).fetchall()
+        in_use = [
+            row
+            for row in linked
+            if Path(row["shared_folder"]).expanduser().resolve().parent == target
+        ]
+        if in_use:
+            names = ", ".join(row["name"] for row in in_use[:3])
+            raise HTTPException(
+                409,
+                f"Stop sharing linked projects from this location first: {names}",
+            )
+    finally:
+        await db.close()
+
+    remaining = [root for root in await get_shared_roots() if root != target]
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT OR REPLACE INTO setting (key, value) VALUES ('shared_folders', ?)",
+            (json.dumps([str(root) for root in remaining]),),
+        )
+        current = await (
+            await db.execute("SELECT value FROM setting WHERE key='shared_folder'")
+        ).fetchone()
+        if current and Path(current["value"]).expanduser().resolve() == target:
+            replacement = str(remaining[0]) if remaining else ""
+            await db.execute(
+                "INSERT OR REPLACE INTO setting (key, value) "
+                "VALUES ('shared_folder', ?)",
+                (replacement,),
+            )
+        await db.commit()
+    finally:
+        await db.close()
 
 
 def _folder_component(name: str) -> str:
@@ -193,6 +294,16 @@ def _new_project_folder(root: Path, name: str) -> Path:
         counter += 1
     (candidate / "snapshots").mkdir(parents=True)
     return candidate
+
+
+def _project_folder_for_share(root: Path, project) -> Path:
+    previous = project["shared_previous_folder"]
+    if previous:
+        candidate = Path(previous).expanduser().resolve()
+        if candidate.is_relative_to(root) and candidate.name.endswith(".aqda-project"):
+            (candidate / "snapshots").mkdir(parents=True, exist_ok=True)
+            return candidate
+    return _new_project_folder(root, project["name"])
 
 
 async def _project_row(project_id: int):
@@ -276,6 +387,12 @@ async def _publish_project(project_id: int, force: bool = False) -> dict:
 
     data, exported_project, snapshot_id = await build_aqda_snapshot(project_id)
     folder = Path(project["shared_folder"])
+    await asyncio.to_thread(
+        write_project_metadata,
+        folder,
+        exported_project["name"],
+        exported_project["lineage_id"],
+    )
     writer_id = await _device_id()
     await asyncio.to_thread(
         _write_snapshot,
@@ -301,11 +418,8 @@ async def _publish_project(project_id: int, force: bool = False) -> dict:
     }
 
 
-async def share_project(project_id: int) -> dict:
+async def share_project(project_id: int, root_path: str | None = None) -> dict:
     async with _sync_lock:
-        root = await get_shared_root()
-        if root is None:
-            raise HTTPException(400, "Choose a collaboration folder in Settings first")
         project = await _project_row(project_id)
         if not project:
             raise HTTPException(404, "Project not found")
@@ -327,14 +441,31 @@ async def share_project(project_id: int) -> dict:
             )
         folder = Path(project["shared_folder"]) if project["shared_folder"] else None
         if folder is None:
-            folder = await asyncio.to_thread(_new_project_folder, root, project["name"])
+            roots = await get_shared_roots()
+            if root_path:
+                requested = Path(root_path).expanduser().resolve()
+                root = requested if requested in roots else await set_shared_root(root_path)
+            elif len(roots) == 1:
+                root = roots[0]
+            elif not roots:
+                raise HTTPException(400, "Add a collaboration location first")
+            else:
+                raise HTTPException(400, "Choose which collaboration location to use")
+            folder = await asyncio.to_thread(_project_folder_for_share, root, project)
             await _update_sync_state(
                 project_id,
                 shared_folder=str(folder),
+                shared_previous_folder=str(folder),
                 shared_last_published_revision=None,
                 shared_last_snapshot_id=None,
                 shared_sync_error=None,
             )
+        await asyncio.to_thread(
+            write_project_metadata,
+            folder,
+            project["name"],
+            project["lineage_id"],
+        )
         result = await _publish_project(project_id, force=True)
         result["project_id"] = project_id
         return result
@@ -668,58 +799,138 @@ async def sync_all_shared_projects(
 
 
 async def discover_shared_projects() -> list[dict]:
-    root = await get_shared_root()
-    if root is None or not root.is_dir():
+    roots = [root for root in await get_shared_roots() if root.is_dir()]
+    if not roots:
         return []
     db = await get_db()
     try:
-        linked_rows = await (
-            await db.execute("SELECT id, lineage_id, shared_folder FROM project")
+        local_rows = await (
+            await db.execute(
+                "SELECT id, lineage_id, shared_folder FROM project "
+                "WHERE deleted_at IS NULL"
+            )
         ).fetchall()
-        linked_by_lineage = {row["lineage_id"]: row["id"] for row in linked_rows}
+        local_by_lineage = {row["lineage_id"]: row for row in local_rows}
     finally:
         await db.close()
 
     discovered = []
-    for folder in sorted(root.glob("*.aqda-project")):
-        infos = await _snapshot_infos(folder)
-        for lineage_id in sorted({item.lineage_id for item in infos}):
-            heads = _head_infos(infos, lineage_id)
-            if not heads:
+    seen_folders: set[str] = set()
+    for root in roots:
+        for folder in sorted(root.glob("*.aqda-project")):
+            folder_key = str(folder.resolve())
+            if folder_key in seen_folders:
                 continue
-            latest = heads[0]
-            discovered.append({
-                "folder": str(folder),
-                "name": latest.name,
-                "lineage_id": lineage_id,
-                "revision": latest.revision,
-                "updated_at": latest.created_at,
-                "updated_by": latest.created_by,
-                "head_count": len(heads),
-                "linked_project_id": linked_by_lineage.get(lineage_id),
-            })
+            seen_folders.add(folder_key)
+            infos = await _snapshot_infos(folder)
+            for lineage_id in sorted({item.lineage_id for item in infos}):
+                heads = _head_infos(infos, lineage_id)
+                if not heads:
+                    continue
+                latest = heads[0]
+                local = local_by_lineage.get(lineage_id)
+                local_shared_folder = (
+                    Path(local["shared_folder"]).expanduser().resolve()
+                    if local and local["shared_folder"]
+                    else None
+                )
+                discovered.append({
+                    "root": str(root),
+                    "folder": str(folder),
+                    "name": latest.name,
+                    "lineage_id": lineage_id,
+                    "revision": latest.revision,
+                    "updated_at": latest.created_at,
+                    "updated_by": latest.created_by,
+                    "head_count": len(heads),
+                    "local_project_id": local["id"] if local else None,
+                    "linked_project_id": (
+                        local["id"] if local_shared_folder == folder.resolve() else None
+                    ),
+                })
     return discovered
 
 
-async def open_shared_project(folder_path: str) -> dict:
+async def open_shared_project(
+    folder_path: str,
+    local_newer_choice: str | None = None,
+) -> dict:
     async with _sync_lock:
-        root = await get_shared_root()
-        if root is None:
-            raise HTTPException(400, "Choose a collaboration folder in Settings first")
+        if local_newer_choice not in {None, "use_shared", "use_local"}:
+            raise HTTPException(400, "Choose 'use_shared' or 'use_local'")
+        roots = await get_shared_roots()
+        if not roots:
+            raise HTTPException(400, "Add a collaboration location in Settings first")
         folder = Path(folder_path).expanduser().resolve()
-        if not folder.is_relative_to(root) or not folder.is_dir():
-            raise HTTPException(400, "That project is not inside the configured collaboration folder")
+        if not any(folder.is_relative_to(root) for root in roots) or not folder.is_dir():
+            raise HTTPException(400, "That project is not inside a saved collaboration location")
         infos = await _snapshot_infos(folder)
         heads = _head_infos(infos)
         if not heads:
             raise HTTPException(400, "No valid AQDA snapshots were found in that project")
         primary = heads[0]
 
+        db = await get_db()
+        try:
+            already_local = await (
+                await db.execute(
+                    "SELECT id, name, shared_folder FROM project "
+                    "WHERE lineage_id=? AND deleted_at IS NULL LIMIT 1",
+                    (primary.lineage_id,),
+                )
+            ).fetchone()
+        finally:
+            await db.close()
+        if already_local and already_local["shared_folder"]:
+            current_folder = Path(already_local["shared_folder"]).expanduser().resolve()
+            if current_folder != folder:
+                raise HTTPException(
+                    409,
+                    f'“{already_local["name"]}” is already collaborating from '
+                    f'"{current_folder.parent}". Stop sharing it there before connecting '
+                    "the copy in this location.",
+                )
+
         from aqda.routers.projects import import_package_bytes
 
-        result = await import_package_bytes(
-            await asyncio.to_thread(primary.path.read_bytes), mode="auto"
+        snapshot_data = await asyncio.to_thread(primary.path.read_bytes)
+        result = await import_package_bytes(snapshot_data, mode="auto")
+        local_newer = next(
+            (
+                item
+                for item in result["unchanged"]
+                if item.get("reason") == "local_newer"
+            ),
+            None,
         )
+        backup_path = result.get("backup_path")
+        if local_newer and local_newer_choice is None:
+            return {
+                "project_id": local_newer["id"],
+                "name": local_newer["name"],
+                "needs_local_newer_choice": True,
+                "shared_name": primary.name,
+                "folder": str(folder),
+                "conflicts": [],
+            }
+        if local_newer and local_newer_choice == "use_shared":
+            result = await import_package_bytes(
+                snapshot_data,
+                mode="replace",
+                target_lineage_id=primary.lineage_id,
+            )
+            backup_path = result.get("backup_path")
+        trashed_conflict = next(
+            (item for item in result["conflicts"] if item.get("trashed")),
+            None,
+        )
+        if trashed_conflict:
+            result = await import_package_bytes(
+                snapshot_data,
+                mode="replace",
+                target_lineage_id=primary.lineage_id,
+            )
+            backup_path = result.get("backup_path")
         if result["conflicts"]:
             local_id = result["conflicts"][0]["id"]
             await _update_sync_state(
@@ -729,6 +940,7 @@ async def open_shared_project(folder_path: str) -> dict:
                 shared_last_snapshot_id=None,
                 shared_last_sync_at=None,
             )
+            await _publish_project(local_id, force=True)
             copied = await _create_conflict_copy(local_id, primary)
             if not copied:
                 raise HTTPException(409, "Concurrent versions were detected")
@@ -753,7 +965,14 @@ async def open_shared_project(folder_path: str) -> dict:
             shared_last_sync_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             shared_sync_error=None,
         )
-        return {"project_id": project_id, "name": primary.name, "conflicts": result["conflicts"]}
+        await _publish_project(project_id, force=True)
+        return {
+            "project_id": project_id,
+            "name": primary.name,
+            "conflicts": result["conflicts"],
+            "needs_local_newer_choice": False,
+            "backup_path": backup_path,
+        }
 
 
 def get_sync_health() -> dict[str, str | None]:
@@ -797,7 +1016,7 @@ async def unlink_shared_project(project_id: int) -> None:
                 )
             ).fetchall()
             await db.execute(
-                "UPDATE project SET shared_folder=NULL, "
+                "UPDATE project SET shared_previous_folder=shared_folder, shared_folder=NULL, "
                 "shared_last_published_revision=NULL, shared_last_snapshot_id=NULL, "
                 "shared_last_sync_at=NULL, shared_sync_error=NULL WHERE id=?",
                 (project_id,),

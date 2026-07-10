@@ -4,7 +4,8 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowLeft, Upload, FileText, Tags, StickyNote, Search,
   Download, ChevronDown, Sparkles, Plus, Trash2, Settings,
-  Filter, LayoutList, CheckSquare, Square, Tag, BookMarked, Cloud, AlertTriangle,
+  Filter, LayoutList, CheckSquare, Square, Tag, BookMarked, Cloud, AlertTriangle, Pencil,
+  FolderOpen, X,
 } from 'lucide-react';
 import { projects, documents, codes, codings, memos, shared, type Document as Doc } from '../api';
 import { CodeTree } from '../components/CodeTree';
@@ -28,7 +29,11 @@ export function ProjectView() {
   const [selectedCodeId, setSelectedCodeId] = useState<number | null>(null);
   const [selectedMemoId, setSelectedMemoId] = useState<number | null>(null);
   const [showExportMenu, setShowExportMenu] = useState(false);
+  const [renamingProject, setRenamingProject] = useState(false);
+  const [projectNameDraft, setProjectNameDraft] = useState('');
   const [collaborationNotice, setCollaborationNotice] = useState<string | null>(null);
+  const [showCollaborationPicker, setShowCollaborationPicker] = useState(false);
+  const [collaborationPickerError, setCollaborationPickerError] = useState<string | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(280);
   const isResizing = useRef(false);
   const lastProjectRevision = useRef<number | undefined>(undefined);
@@ -92,11 +97,39 @@ export function ProjectView() {
     lastProjectRevision.current = project.revision;
   }, [project?.revision, projectId, queryClient]);
 
+  const { data: sharedStatus, isLoading: sharedStatusLoading } = useQuery({
+    queryKey: ['shared-status'],
+    queryFn: shared.status,
+    enabled: showCollaborationPicker,
+  });
+
   const shareMut = useMutation({
-    mutationFn: () => shared.shareProject(projectId),
+    mutationFn: (root: string) => shared.shareProject(projectId, root),
     onSuccess: () => {
+      setShowCollaborationPicker(false);
+      setCollaborationPickerError(null);
       queryClient.invalidateQueries({ queryKey: ['project', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['shared-status'] });
       alert('Collaboration is on. AQDA will save complete snapshots automatically.');
+    },
+    onError: (error: Error) => setCollaborationPickerError(error.message),
+  });
+
+  const chooseCollaborationFolderMut = useMutation({
+    mutationFn: shared.chooseFolder,
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: ['shared-status'] });
+      shareMut.mutate(result.path);
+    },
+    onError: (error: Error) => setCollaborationPickerError(error.message),
+  });
+
+  const renameProjectMut = useMutation({
+    mutationFn: (name: string) => projects.update(projectId, { name }),
+    onSuccess: () => {
+      setRenamingProject(false);
+      queryClient.invalidateQueries({ queryKey: ['project', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['projects'] });
     },
     onError: (error: Error) => alert(error.message),
   });
@@ -377,7 +410,58 @@ export function ProjectView() {
           <Link to="/" className="p-1.5 text-gray-500 hover:text-gray-700 rounded hover:bg-gray-100">
             <ArrowLeft size={18} />
           </Link>
-          <h1 className="font-semibold text-gray-900">{project?.name ?? '...'}</h1>
+          {renamingProject ? (
+            <form
+              className="flex items-center gap-1.5"
+              onSubmit={(event) => {
+                event.preventDefault();
+                const name = projectNameDraft.trim();
+                if (name && name !== project?.name) renameProjectMut.mutate(name);
+                else setRenamingProject(false);
+              }}
+            >
+              <input
+                autoFocus
+                value={projectNameDraft}
+                onChange={(event) => setProjectNameDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Escape') setRenamingProject(false);
+                }}
+                className="w-72 px-2 py-1 text-sm border border-indigo-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                aria-label="Project name"
+              />
+              <button
+                type="submit"
+                disabled={!projectNameDraft.trim() || renameProjectMut.isPending}
+                className="px-2 py-1 text-xs font-medium text-indigo-700 hover:bg-indigo-50 rounded disabled:opacity-50"
+              >
+                Save
+              </button>
+              <button
+                type="button"
+                onClick={() => setRenamingProject(false)}
+                className="px-2 py-1 text-xs text-gray-500 hover:bg-gray-100 rounded"
+              >
+                Cancel
+              </button>
+            </form>
+          ) : (
+            <div className="flex items-center gap-1.5">
+              <h1 className="font-semibold text-gray-900">{project?.name ?? '...'}</h1>
+              {project && !project.is_conflict_mirror && (
+                <button
+                  onClick={() => {
+                    setProjectNameDraft(project.name);
+                    setRenamingProject(true);
+                  }}
+                  className="p-1 text-gray-300 hover:text-indigo-600 hover:bg-indigo-50 rounded"
+                  title={project.shared_folder ? 'Rename project (the managed collaboration folder stays unchanged)' : 'Rename project'}
+                >
+                  <Pencil size={13} />
+                </button>
+              )}
+            </div>
+          )}
         </div>
         <div className="flex items-center gap-2">
           {project?.is_conflict_mirror ? (
@@ -408,10 +492,13 @@ export function ProjectView() {
             </div>
           ) : (
             <button
-              onClick={() => shareMut.mutate()}
+              onClick={() => {
+                setCollaborationPickerError(null);
+                setShowCollaborationPicker(true);
+              }}
               disabled={shareMut.isPending}
               className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-blue-50 hover:bg-blue-100 rounded-md text-blue-700 disabled:opacity-50"
-              title="Save this project automatically in your collaboration folder"
+              title="Choose where this project should collaborate"
             >
               <Cloud size={15} /> {shareMut.isPending ? 'Starting…' : 'Collaborate'}
             </button>
@@ -461,6 +548,97 @@ export function ProjectView() {
           <CloseAqdaButton />
         </div>
       </header>
+
+      {showCollaborationPicker && (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-gray-950/35 p-4"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !shareMut.isPending) {
+              setShowCollaborationPicker(false);
+            }
+          }}
+        >
+          <div className="w-full max-w-xl rounded-xl border border-gray-200 bg-white shadow-2xl">
+            <div className="flex items-start gap-3 border-b border-gray-100 px-5 py-4">
+              <div className="rounded-lg bg-blue-50 p-2 text-blue-700">
+                <Cloud size={20} />
+              </div>
+              <div className="min-w-0 flex-1">
+                <h2 className="font-semibold text-gray-900">Where should this project collaborate?</h2>
+                <p className="mt-1 text-xs text-gray-500">
+                  Choose the shared folder used by this project’s co-authors. AQDA remembers different locations for different teams.
+                </p>
+              </div>
+              <button
+                onClick={() => setShowCollaborationPicker(false)}
+                disabled={shareMut.isPending || chooseCollaborationFolderMut.isPending}
+                className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 disabled:opacity-40"
+                aria-label="Close collaboration location chooser"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="max-h-[55vh] space-y-3 overflow-auto p-5">
+              {sharedStatusLoading ? (
+                <p className="py-4 text-center text-sm text-gray-400">Loading saved locations…</p>
+              ) : sharedStatus?.roots.length ? (
+                <div className="space-y-2">
+                  {sharedStatus.roots.map((root) => (
+                    <button
+                      key={root.path}
+                      onClick={() => {
+                        setCollaborationPickerError(null);
+                        shareMut.mutate(root.path);
+                      }}
+                      disabled={!root.available || shareMut.isPending || chooseCollaborationFolderMut.isPending}
+                      className="flex w-full items-start gap-3 rounded-lg border border-gray-200 p-3 text-left hover:border-blue-300 hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      <FolderOpen size={18} className="mt-0.5 shrink-0 text-blue-600" />
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-sm font-medium text-gray-800">{root.name}</span>
+                        <span className="mt-0.5 block break-all text-[11px] text-gray-500">{root.path}</span>
+                        <span className="mt-1 block text-xs text-gray-400">
+                          {root.available
+                            ? `${root.project_count} collaborative project${root.project_count === 1 ? '' : 's'} here`
+                            : 'This folder is currently unavailable'}
+                        </span>
+                      </span>
+                      <span className="mt-1 text-xs font-medium text-blue-700">Use this folder</span>
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div className="rounded-lg bg-gray-50 px-4 py-3 text-sm text-gray-600">
+                  No collaboration locations are saved yet. Choose this project’s shared folder below.
+                </div>
+              )}
+
+              {collaborationPickerError && (
+                <div className="flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-800">
+                  <AlertTriangle size={15} className="mt-0.5 shrink-0" />
+                  <span>{collaborationPickerError}</span>
+                </div>
+              )}
+
+              <button
+                onClick={() => {
+                  setCollaborationPickerError(null);
+                  chooseCollaborationFolderMut.mutate();
+                }}
+                disabled={shareMut.isPending || chooseCollaborationFolderMut.isPending}
+                className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-gray-300 px-3 py-3 text-sm font-medium text-gray-700 hover:border-blue-300 hover:bg-blue-50 hover:text-blue-700 disabled:opacity-50"
+              >
+                <Plus size={16} />
+                {chooseCollaborationFolderMut.isPending ? 'Opening folder chooser…' : 'Choose another shared folder…'}
+              </button>
+              <p className="text-center text-[11px] text-gray-400">
+                Selecting a new folder also saves it for future projects. You can manage saved locations in Settings.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {project?.shared_sync_error && (
         <div className="shrink-0 flex items-start gap-3 border-b border-amber-200 bg-amber-50 px-4 py-2.5 text-sm text-amber-900">

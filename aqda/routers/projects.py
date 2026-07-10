@@ -216,7 +216,9 @@ async def _unique_project_name(dst, requested: str, suffix: str = "") -> str:
     candidate = f"{base}{suffix}"
     counter = 2
     while True:
-        cursor = await dst.execute("SELECT 1 FROM project WHERE name=?", (candidate,))
+        cursor = await dst.execute(
+            "SELECT 1 FROM project WHERE name=? AND deleted_at IS NULL", (candidate,)
+        )
         if not await cursor.fetchone():
             return candidate
         candidate = f"{base}{suffix} {counter}"

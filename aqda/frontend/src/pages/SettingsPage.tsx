@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useQuery, useMutation } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
-import { ArrowLeft, RefreshCw, Check, FolderOpen, Power, AlertTriangle } from 'lucide-react';
+import { ArrowLeft, RefreshCw, Check, FolderOpen, Power, AlertTriangle, Trash2 } from 'lucide-react';
 import { settings as settingsApi, shared } from '../api';
 import { CloseAqdaButton } from '../components/CloseAqdaButton';
 
@@ -29,8 +29,8 @@ export function SettingsPage() {
   });
 
   useEffect(() => {
-    if (sharedStatus?.root) setSharedPath(sharedStatus.root);
-  }, [sharedStatus]);
+    if (!sharedPath && sharedStatus?.root) setSharedPath(sharedStatus.root);
+  }, [sharedPath, sharedStatus?.root]);
 
   const chooseSharedMut = useMutation({
     mutationFn: shared.chooseFolder,
@@ -42,7 +42,18 @@ export function SettingsPage() {
 
   const setSharedMut = useMutation({
     mutationFn: () => shared.setFolder(sharedPath),
-    onSuccess: () => refetchShared(),
+    onSuccess: (result) => {
+      setSharedPath(result.path);
+      refetchShared();
+    },
+  });
+
+  const removeSharedMut = useMutation({
+    mutationFn: shared.removeFolder,
+    onSuccess: (_, path) => {
+      if (sharedPath === path) setSharedPath('');
+      refetchShared();
+    },
   });
 
   const { data: ollamaStatus, refetch: refreshModels } = useQuery({
@@ -91,6 +102,10 @@ export function SettingsPage() {
   const update = (key: string, value: string) => {
     setForm((f) => ({ ...f, [key]: value }));
   };
+
+  const selectedSharedRoot = sharedStatus?.roots.find(
+    (root) => root.path === sharedPath.trim()
+  );
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -149,9 +164,9 @@ export function SettingsPage() {
           <h2 className="text-lg font-medium text-gray-800 mb-4">Collaboration</h2>
           <div className="bg-white rounded-lg border border-gray-200 p-4 space-y-4">
             <div className="rounded-lg bg-blue-50 p-3 text-sm text-blue-900 space-y-1">
-              <p className="font-medium">One shared folder, no manual saving</p>
+              <p className="font-medium">Saved collaboration locations, no manual saving</p>
               <p className="text-xs text-blue-800">
-                Choose a Google Drive, Dropbox, or other synced folder. AQDA works from a hidden safe copy, saves every change immediately, and publishes complete snapshots in the background. If people work at once, AQDA keeps one clearly named reference per other version.
+                Add the Google Drive, university cloud, Dropbox, or ordinary shared folders used by your different projects. When you click Collaborate, AQDA asks which location that project should use.
               </p>
             </div>
             {sharedStatus?.sync_error && (
@@ -163,13 +178,13 @@ export function SettingsPage() {
               </div>
             )}
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Collaboration folder</label>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Add collaboration location</label>
               <div className="flex gap-2">
                 <input
                   value={sharedPath}
                   onChange={(event) => setSharedPath(event.target.value)}
                   className="flex-1 px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                  placeholder="Choose your Google Drive or Dropbox folder"
+                  placeholder="Choose or paste a shared folder path"
                 />
                 <button
                   onClick={() => chooseSharedMut.mutate()}
@@ -180,22 +195,88 @@ export function SettingsPage() {
                 </button>
                 <button
                   onClick={() => setSharedMut.mutate()}
-                  disabled={!sharedPath.trim() || setSharedMut.isPending}
-                  className="px-3 py-2 bg-indigo-600 text-white rounded-md text-sm hover:bg-indigo-700 disabled:opacity-50"
+                  disabled={!sharedPath.trim() || setSharedMut.isPending || Boolean(selectedSharedRoot)}
+                  className={`px-3 py-2 rounded-md text-sm disabled:opacity-70 ${
+                    selectedSharedRoot
+                      ? 'bg-green-100 text-green-800'
+                      : 'bg-indigo-600 text-white hover:bg-indigo-700'
+                  }`}
                 >
-                  Use folder
+                  {selectedSharedRoot ? 'Saved' : 'Add folder'}
                 </button>
               </div>
-              {(chooseSharedMut.error || setSharedMut.error) && (
+              {(chooseSharedMut.error || setSharedMut.error || removeSharedMut.error) && (
                 <p className="text-xs text-red-600 mt-1">
-                  {(chooseSharedMut.error as Error | null)?.message ?? (setSharedMut.error as Error | null)?.message}
+                  {(chooseSharedMut.error as Error | null)?.message
+                    ?? (setSharedMut.error as Error | null)?.message
+                    ?? (removeSharedMut.error as Error | null)?.message}
                 </p>
+              )}
+            </div>
+            {selectedSharedRoot && (
+              <div className="flex items-start gap-2 rounded-lg border border-green-200 bg-green-50 p-3 text-sm text-green-900">
+                <Check size={17} className="mt-0.5 shrink-0 text-green-700" />
+                <div>
+                  <p className="font-medium">Collaboration location saved</p>
+                  {selectedSharedRoot.project_count > 0 ? (
+                    <p className="text-xs text-green-800 mt-1">
+                      AQDA found {selectedSharedRoot.project_count} collaborative project{selectedSharedRoot.project_count === 1 ? '' : 's'} here.
+                    </p>
+                  ) : selectedSharedRoot.standalone_aqda_count > 0 ? (
+                    <p className="text-xs text-green-800 mt-1">
+                      AQDA found {selectedSharedRoot.standalone_aqda_count} standalone .aqda file{selectedSharedRoot.standalone_aqda_count === 1 ? '' : 's'}. These are import/archive files, not collaborative projects yet. Open or import a project, click <strong>Collaborate</strong>, and choose this location.
+                    </p>
+                  ) : (
+                    <p className="text-xs text-green-800 mt-1">
+                      No collaborative projects are here yet. Open a project, click <strong>Collaborate</strong>, and choose this location.
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+            <div>
+              <h3 className="text-sm font-medium text-gray-700 mb-2">Saved locations</h3>
+              {sharedStatus?.roots.length ? (
+                <div className="space-y-2">
+                  {sharedStatus.roots.map((root) => (
+                    <div key={root.path} className="flex items-start gap-3 rounded-md border border-gray-200 bg-gray-50 p-3">
+                      <FolderOpen size={17} className={`mt-0.5 shrink-0 ${root.available ? 'text-indigo-500' : 'text-red-500'}`} />
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-medium text-gray-800">{root.name}</p>
+                        <p className="text-[11px] text-gray-500 break-all mt-0.5">{root.path}</p>
+                        <p className={`text-xs mt-1 ${root.available ? 'text-gray-500' : 'text-red-600'}`}>
+                          {root.available
+                            ? `${root.project_count} collaborative project${root.project_count === 1 ? '' : 's'}${root.linked_project_count ? ` · ${root.linked_project_count} linked on this computer` : ''}`
+                            : 'Folder currently unavailable'}
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => {
+                          if (confirm(`Remove “${root.name}” from AQDA’s saved locations? No files will be deleted.`)) {
+                            removeSharedMut.mutate(root.path);
+                          }
+                        }}
+                        disabled={removeSharedMut.isPending || root.linked_project_count > 0}
+                        className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded disabled:opacity-30"
+                        title={root.linked_project_count > 0 ? 'Stop sharing linked projects from this location first' : 'Remove saved location'}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-xs text-gray-400">No collaboration locations saved yet.</p>
               )}
             </div>
             <div className="grid grid-cols-2 gap-3 text-xs">
               <div className="rounded-md bg-gray-50 border border-gray-200 p-3">
                 <p className="font-medium text-gray-700">Shared projects</p>
-                <p className="text-gray-500 mt-1">{sharedStatus?.discovered.length ?? 0} found in this folder</p>
+                <p className="text-gray-500 mt-1">
+                  {sharedStatus?.discovered.length
+                    ? `${sharedStatus.discovered.length} across all saved locations`
+                    : 'None found yet'}
+                </p>
               </div>
               <div className="rounded-md bg-gray-50 border border-gray-200 p-3">
                 <p className="font-medium text-gray-700">Safety backups</p>

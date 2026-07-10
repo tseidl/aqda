@@ -1,16 +1,17 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.0
 
 ### New features
 - **Safer turn-based collaboration** — `.aqda` files now carry stable project lineage and
   snapshot ancestry. A clean local project fast-forwards from a collaborator's newer
   snapshot after an automatic database backup; divergent edits are never overwritten and
   can be kept as a clearly named conflicting copy.
-- **Automatic shared-folder collaboration** — link a Google Drive, Dropbox, OneDrive, or
-  ordinary folder once. AQDA works from a hidden local cache, publishes immutable snapshots
-  in the background, pulls collaborators' changes, and automatically keeps both versions
-  when work diverges.
+- **Automatic shared-folder collaboration** — save multiple Google Drive, Dropbox, OneDrive,
+  university-cloud, or ordinary folders and choose the appropriate team location for each
+  project. AQDA works from a hidden local cache, publishes immutable snapshots in the
+  background, pulls collaborators' changes, and automatically keeps both versions when work
+  diverges.
 - **Safe Close AQDA button** — performs a final shared-project sync and graceful shutdown;
   pressing Ctrl+C once remains the terminal equivalent.
 
@@ -34,6 +35,19 @@
   state-changing localhost API requests reject cross-site browser origins.
 - Stopping collaboration removes this computer's writer snapshot, and unchanged manual
   `.aqda` exports reuse their existing snapshot node instead of growing history indefinitely.
+- Existing local copies can be connected to a shared project without duplication. If the
+  local copy has additional work, AQDA explicitly asks whether to publish it or use the shared
+  version after a safety backup.
+- Collaboration Settings now confirms when a folder is active and explains that standalone
+  `.aqda` files are import/archive files until a project is placed into collaboration.
+- Pausing and resuming collaboration reuses the project's existing managed folder instead of
+  creating numbered `(2)`, `(3)`, and later duplicates.
+- Re-importing a project no longer adds a numeric suffix merely because an older project with
+  that name remains in Trash.
+- Projects can now be renamed directly from the project header. Shared projects keep their
+  stable managed folder while publishing the new display name in subsequent snapshots.
+- Collaboration Settings remembers multiple locations, and the **Collaborate** button offers
+  a clear per-project choice between saved team folders or a new shared folder.
 
 ## 0.2.0
 

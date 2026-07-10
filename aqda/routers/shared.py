@@ -14,8 +14,10 @@ from aqda.db import get_db
 from aqda.services.shared_projects import (
     discover_shared_projects,
     get_shared_root,
+    get_shared_roots,
     get_sync_health,
     open_shared_project,
+    remove_shared_root,
     resolve_conflict_copy,
     set_shared_root,
     share_project,
@@ -33,10 +35,15 @@ class FolderUpdate(BaseModel):
 
 class OpenSharedProject(BaseModel):
     folder: str
+    local_newer_choice: str | None = None
 
 
 class ConflictResolution(BaseModel):
     choice: str
+
+
+class ShareProjectRequest(BaseModel):
+    root: str | None = None
 
 
 def _choose_folder_native() -> str | None:
@@ -89,6 +96,7 @@ def _choose_folder_native() -> str | None:
 @router.get("")
 async def shared_status():
     root = await get_shared_root()
+    roots = await get_shared_roots()
     db = await get_db()
     try:
         linked = await (
@@ -107,10 +115,34 @@ async def shared_status():
         if backup_dir.exists()
         else []
     )
+    discovered = await discover_shared_projects()
+    root_items = []
+    for item in roots:
+        available = item.is_dir()
+        root_items.append({
+            "path": str(item),
+            "name": item.name or str(item),
+            "available": available,
+            "project_count": sum(
+                1 for project in discovered if project.get("root") == str(item)
+            ),
+            "standalone_aqda_count": (
+                len(list(item.glob("*.aqda"))) if available else 0
+            ),
+            "linked_project_count": sum(
+                1
+                for project in linked
+                if Path(project["shared_folder"]).expanduser().resolve().parent == item
+            ),
+        })
     return {
         "root": str(root) if root else "",
+        "roots": root_items,
         "linked": [dict(row) for row in linked],
-        "discovered": await discover_shared_projects(),
+        "discovered": discovered,
+        "standalone_aqda_count": sum(
+            item["standalone_aqda_count"] for item in root_items
+        ),
         "backup_folder": str(backup_dir),
         "backup_count": len(backups),
         "latest_backup": str(backups[0]) if backups else None,
@@ -122,6 +154,11 @@ async def shared_status():
 async def update_shared_folder(data: FolderUpdate):
     root = await set_shared_root(data.path)
     return {"path": str(root), "discovered": await discover_shared_projects()}
+
+
+@router.delete("/folder", status_code=204)
+async def delete_shared_folder(data: FolderUpdate):
+    await remove_shared_root(data.path)
 
 
 @router.post("/folder/pick")
@@ -137,8 +174,11 @@ async def pick_shared_folder():
 
 
 @router.post("/projects/{project_id}/share")
-async def enable_project_sharing(project_id: int):
-    return await share_project(project_id)
+async def enable_project_sharing(
+    project_id: int,
+    data: ShareProjectRequest | None = None,
+):
+    return await share_project(project_id, data.root if data else None)
 
 
 @router.post("/projects/{project_id}/sync")
@@ -153,7 +193,7 @@ async def sync_everything():
 
 @router.post("/open")
 async def open_project(data: OpenSharedProject):
-    return await open_shared_project(data.folder)
+    return await open_shared_project(data.folder, data.local_newer_choice)
 
 
 @router.post("/conflicts/{conflict_project_id}/resolve")

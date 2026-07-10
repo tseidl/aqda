@@ -187,13 +187,21 @@ background. The local working copy lives with all your other projects inside the
 `~/.aqda/aqda.db` database; it is not another file you have to open or manage. You never
 need to save manually.
 
-**Set it up once:**
+**Set up a project:**
 
-1. Open **Settings → Collaboration**
-2. Choose a folder inside Google Drive, Dropbox, OneDrive, or another synced location
-3. Open a project and click **Collaborate**
-4. On the other researcher's computer, choose the same collaboration folder in Settings
-5. The project appears under **Shared projects available**; click **Open project** once
+1. Make a folder for that project or team inside Google Drive, Dropbox, OneDrive, your
+   university cloud, or another synced location.
+2. Open the project in AQDA and click **Collaborate**.
+3. Choose a previously saved location, or click **Choose another shared folder…** and select
+   the folder from step 1.
+4. On the other researcher's computer, add that same folder under
+   **Settings → Collaboration**.
+5. The project appears under **Shared projects available**; click **Open project** once.
+
+AQDA remembers multiple collaboration locations. A project with one co-author can use a
+Google Drive folder, another can use a university-cloud folder, and a third can use Dropbox;
+clicking **Collaborate** lets you choose the appropriate location for each project. Each
+project connects to one location at a time.
 
 After that, both researchers open the project normally from AQDA's project list. Changes
 save locally immediately and complete snapshots are published to the shared folder after a
@@ -221,7 +229,7 @@ two branches cannot safely be guessed together.
 Under the hood, the collaboration folder contains one `.aqda-project` folder with a complete
 snapshot file for each participating computer. These are managed by AQDA; collaborators should
 not rename or edit them manually. **Stop sharing** removes this computer's snapshot while keeping
-its local project intact.
+its local project intact; starting collaboration again reuses the same managed project folder.
 
 **Stopping AQDA:** use the **Close AQDA** button, or press Ctrl+C once in the terminal. Both
 perform a graceful final sync. Closing only the browser tab leaves the local AQDA server

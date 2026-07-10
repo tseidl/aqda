@@ -17,6 +17,10 @@ export function ProjectList() {
     file: File;
     conflicts: ProjectImportConflict[];
   } | null>(null);
+  const [pendingLocalConnection, setPendingLocalConnection] = useState<{
+    folder: string;
+    name: string;
+  } | null>(null);
 
   const { data: projectList = [], isLoading } = useQuery({
     queryKey: ['projects'],
@@ -37,10 +41,29 @@ export function ProjectList() {
   });
 
   const openSharedMut = useMutation({
-    mutationFn: (folder: string) => shared.openProject(folder),
-    onSuccess: (result) => {
+    mutationFn: ({
+      folder,
+      choice,
+    }: {
+      folder: string;
+      choice?: 'use_shared' | 'use_local';
+    }) => shared.openProject(folder, choice),
+    onSuccess: (result, variables) => {
+      if (result.needs_local_newer_choice) {
+        setPendingLocalConnection({
+          folder: result.folder ?? variables.folder,
+          name: result.shared_name ?? result.name,
+        });
+        return;
+      }
+      setPendingLocalConnection(null);
       queryClient.invalidateQueries({ queryKey: ['projects'] });
       queryClient.invalidateQueries({ queryKey: ['shared-status'] });
+      if (variables.choice === 'use_shared') {
+        alert('Connected to the shared version. AQDA created a full safety backup of your previous local data.');
+      } else if (variables.choice === 'use_local') {
+        alert('Connected and published the changes from this computer.');
+      }
       navigate(`/project/${result.project_id}`);
     },
     onError: (err: Error) => setImportMsg({ ok: false, text: `Could not open shared project: ${err.message}` }),
@@ -273,6 +296,57 @@ export function ProjectList() {
           </div>
         ))}
 
+        {pendingLocalConnection && (
+          <div className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 mb-4 text-sm text-amber-950">
+            <div className="flex items-start gap-3">
+              <AlertTriangle size={18} className="mt-0.5 shrink-0 text-amber-700" />
+              <div className="flex-1">
+                <p className="font-medium">This computer has additional local changes to “{pendingLocalConnection.name}”</p>
+                <p className="text-xs text-amber-800 mt-1">
+                  Choose which version should become the shared project. AQDA will not combine or discard them silently.
+                </p>
+                <div className="flex flex-wrap gap-2 mt-3">
+                  <button
+                    onClick={() => {
+                      if (confirm('Replace this computer’s local project with the shared version? AQDA will create a full database backup first.')) {
+                        openSharedMut.mutate({
+                          folder: pendingLocalConnection.folder,
+                          choice: 'use_shared',
+                        });
+                      }
+                    }}
+                    disabled={openSharedMut.isPending}
+                    className="px-3 py-1.5 rounded-md bg-amber-700 text-white text-xs font-medium hover:bg-amber-800 disabled:opacity-50"
+                  >
+                    Use shared version
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (confirm('Publish the changes currently saved on this computer to the collaboration folder?')) {
+                        openSharedMut.mutate({
+                          folder: pendingLocalConnection.folder,
+                          choice: 'use_local',
+                        });
+                      }
+                    }}
+                    disabled={openSharedMut.isPending}
+                    className="px-3 py-1.5 rounded-md bg-white border border-amber-300 text-amber-900 text-xs font-medium hover:bg-amber-100 disabled:opacity-50"
+                  >
+                    Publish my local changes
+                  </button>
+                  <button
+                    onClick={() => setPendingLocalConnection(null)}
+                    disabled={openSharedMut.isPending}
+                    className="px-3 py-1.5 text-xs text-amber-800 hover:text-amber-950 disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {sharedStatus?.root && sharedStatus.discovered.some((item) => !item.linked_project_id) && (
           <section className="rounded-lg border border-blue-200 bg-blue-50 p-4 mb-4">
             <div className="flex items-center justify-between mb-3">
@@ -299,16 +373,23 @@ export function ProjectList() {
                   <div>
                     <p className="text-sm font-medium text-gray-800">{item.name}</p>
                     <p className="text-xs text-gray-500">
-                      {item.updated_by ? `Last saved by ${item.updated_by}` : 'Shared AQDA project'}
+                      {item.local_project_id
+                        ? 'Your existing local project is ready to connect'
+                        : item.updated_by
+                          ? `Last saved by ${item.updated_by}`
+                          : 'Shared AQDA project'}
+                      {item.root
+                        ? ` · ${item.root.split(/[/\\]/).filter(Boolean).pop() ?? item.root}`
+                        : ''}
                       {item.head_count > 1 ? ' · concurrent versions detected' : ''}
                     </p>
                   </div>
                   <button
-                    onClick={() => openSharedMut.mutate(item.folder)}
+                    onClick={() => openSharedMut.mutate({ folder: item.folder })}
                     disabled={openSharedMut.isPending}
                     className="px-3 py-1.5 rounded-md bg-blue-600 text-white text-xs font-medium hover:bg-blue-700 disabled:opacity-50"
                   >
-                    Open project
+                    {item.local_project_id ? 'Connect existing project' : 'Open project'}
                   </button>
                 </div>
               ))}

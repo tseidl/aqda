@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS project (
     revision INTEGER NOT NULL DEFAULT 0,
     head_snapshot_id TEXT DEFAULT NULL,
     shared_folder TEXT DEFAULT NULL,
+    shared_previous_folder TEXT DEFAULT NULL,
     shared_last_published_revision INTEGER DEFAULT NULL,
     shared_last_snapshot_id TEXT DEFAULT NULL,
     shared_last_sync_at TEXT DEFAULT NULL,
@@ -109,8 +110,9 @@ INSERT OR IGNORE INTO setting (key, value) VALUES
     ('whisper_model', 'base'),
     ('coder_name', ''),
     ('shared_folder', ''),
+    ('shared_folders', '[]'),
     ('device_id', ''),
-    ('schema_version', '10');
+    ('schema_version', '11');
 
 CREATE TABLE IF NOT EXISTS project_snapshot (
     snapshot_id TEXT PRIMARY KEY,
@@ -257,6 +259,10 @@ MIGRATIONS = {
             updated_at TEXT DEFAULT (datetime('now')),
             UNIQUE(project_id, anchor_snapshot_id)
         )""",
+    ],
+    11: [
+        "ALTER TABLE project ADD COLUMN shared_previous_folder TEXT DEFAULT NULL",
+        "INSERT OR IGNORE INTO setting (key, value) VALUES ('shared_folders', '[]')",
     ],
 }
 

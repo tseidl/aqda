@@ -281,7 +281,7 @@ async def test_migration_assigns_lineage_to_legacy_projects(tmp_path, use_data_d
     migrated = await project_row(1)
     assert migrated["lineage_id"]
     assert migrated["revision"] == 0
-    assert list((data_dir / "backups").glob("aqda-before-migration-v10-*.db"))
+    assert list((data_dir / "backups").glob("aqda-before-migration-v11-*.db"))
 
 
 @pytest.mark.asyncio
