@@ -154,7 +154,19 @@ async def test_exporting_without_edits_does_not_create_a_false_conflict(tmp_path
 
     # Alice downloading another identical snapshot is metadata activity, not an edit.
     use_data_dir(alice)
+    head_before = (await project_row(alice_id))["head_snapshot_id"]
     await response_bytes(await export.export_aqda(alice_id))
+    assert (await project_row(alice_id))["head_snapshot_id"] == head_before
+    db = await db_module.get_db()
+    try:
+        snapshot_count = await (
+            await db.execute(
+                "SELECT COUNT(*) FROM project_snapshot WHERE project_id=?", (alice_id,)
+            )
+        ).fetchone()
+        assert snapshot_count[0] == 1
+    finally:
+        await db.close()
 
     use_data_dir(tmp_path / "bob")
     await projects.update_project(bob_id, projects.ProjectUpdate(description="Bob's notes"))
@@ -269,7 +281,7 @@ async def test_migration_assigns_lineage_to_legacy_projects(tmp_path, use_data_d
     migrated = await project_row(1)
     assert migrated["lineage_id"]
     assert migrated["revision"] == 0
-    assert list((data_dir / "backups").glob("aqda-before-migration-v9-*.db"))
+    assert list((data_dir / "backups").glob("aqda-before-migration-v10-*.db"))
 
 
 @pytest.mark.asyncio

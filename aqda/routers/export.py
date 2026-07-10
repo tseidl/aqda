@@ -388,27 +388,43 @@ async def build_aqda_snapshot(project_id: int) -> tuple[bytes, dict, str]:
         if not current:
             raise HTTPException(404, "Project not found")
 
-        cursor = await db.execute("SELECT value FROM setting WHERE key='coder_name'")
-        coder_row = await cursor.fetchone()
-        created_by = ((coder_row["value"] if coder_row else "") or "").strip() or "AQDA User"
-        snapshot_id = _uuid()
-        created_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        await db.execute(
-            "INSERT INTO project_snapshot "
-            "(snapshot_id, project_id, parent_snapshot_id, revision, created_at, created_by) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                snapshot_id,
-                project_id,
-                current["head_snapshot_id"],
-                current["revision"],
-                created_at,
-                created_by,
-            ),
-        )
-        await db.execute(
-            "UPDATE project SET head_snapshot_id=? WHERE id=?", (snapshot_id, project_id)
-        )
+        existing_head = None
+        if current["head_snapshot_id"]:
+            existing_head = await (
+                await db.execute(
+                    "SELECT snapshot_id, revision FROM project_snapshot "
+                    "WHERE snapshot_id=? AND project_id=?",
+                    (current["head_snapshot_id"], project_id),
+                )
+            ).fetchone()
+        if existing_head and existing_head["revision"] == current["revision"]:
+            # Exporting or force-syncing an unchanged project should not invent
+            # another ancestry node every time the user clicks the button.
+            snapshot_id = existing_head["snapshot_id"]
+        else:
+            cursor = await db.execute("SELECT value FROM setting WHERE key='coder_name'")
+            coder_row = await cursor.fetchone()
+            created_by = (
+                ((coder_row["value"] if coder_row else "") or "").strip() or "AQDA User"
+            )
+            snapshot_id = _uuid()
+            created_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            await db.execute(
+                "INSERT INTO project_snapshot "
+                "(snapshot_id, project_id, parent_snapshot_id, revision, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    snapshot_id,
+                    project_id,
+                    current["head_snapshot_id"],
+                    current["revision"],
+                    created_at,
+                    created_by,
+                ),
+            )
+            await db.execute(
+                "UPDATE project SET head_snapshot_id=? WHERE id=?", (snapshot_id, project_id)
+            )
 
         # Full snapshot: keep trashed codes/codings so round-tripping is exact.
         project, documents, codes, codings, memos = await _load_project_data(

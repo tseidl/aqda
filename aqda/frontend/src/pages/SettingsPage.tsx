@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useQuery, useMutation } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
-import { ArrowLeft, RefreshCw, Check, FolderOpen, Power } from 'lucide-react';
+import { ArrowLeft, RefreshCw, Check, FolderOpen, Power, AlertTriangle } from 'lucide-react';
 import { settings as settingsApi, shared } from '../api';
 import { CloseAqdaButton } from '../components/CloseAqdaButton';
 
@@ -25,6 +25,7 @@ export function SettingsPage() {
   const { data: sharedStatus, refetch: refetchShared } = useQuery({
     queryKey: ['shared-status'],
     queryFn: shared.status,
+    refetchInterval: 5000,
   });
 
   useEffect(() => {
@@ -150,9 +151,17 @@ export function SettingsPage() {
             <div className="rounded-lg bg-blue-50 p-3 text-sm text-blue-900 space-y-1">
               <p className="font-medium">One shared folder, no manual saving</p>
               <p className="text-xs text-blue-800">
-                Choose a Google Drive, Dropbox, or other synced folder. AQDA works from a hidden safe copy, saves every change immediately, and publishes complete snapshots in the background. If two people work at once, both versions are kept.
+                Choose a Google Drive, Dropbox, or other synced folder. AQDA works from a hidden safe copy, saves every change immediately, and publishes complete snapshots in the background. If people work at once, AQDA keeps one clearly named reference per other version.
               </p>
             </div>
+            {sharedStatus?.sync_error && (
+              <div className="flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-800">
+                <AlertTriangle size={16} className="shrink-0" />
+                <p>
+                  Sync is temporarily unavailable, but local work is safe. AQDA is retrying automatically: {sharedStatus.sync_error}
+                </p>
+              </div>
+            )}
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Collaboration folder</label>
               <div className="flex gap-2">

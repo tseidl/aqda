@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (unreleased)
 
 ### New features
 - **Safer turn-based collaboration** — `.aqda` files now carry stable project lineage and
@@ -26,6 +26,14 @@
   Unicode project filenames use standards-compliant download headers.
 - Embedding cache keys include chunk content and stale rows are invalidated automatically.
 - Unknown `/api` routes now return a JSON 404 instead of the frontend HTML.
+- Concurrent collaboration branches now stay in one local reference project that follows
+  later remote snapshots instead of multiplying projects and shared folders.
+- Collaborator-reference projects now offer an explicit resolution choice: keep the current
+  shared branch, or switch after creating both a full backup and a named local archive.
+- Background sync recovers from transient database errors and reports its health in the UI;
+  state-changing localhost API requests reject cross-site browser origins.
+- Stopping collaboration removes this computer's writer snapshot, and unchanged manual
+  `.aqda` exports reuse their existing snapshot node instead of growing history indefinitely.
 
 ## 0.2.0
 

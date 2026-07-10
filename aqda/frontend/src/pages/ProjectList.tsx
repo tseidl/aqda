@@ -169,7 +169,7 @@ export function ProjectList() {
               onClick={handleImportDb}
               disabled={importMut.isPending}
               className="flex items-center gap-2 px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 text-sm font-medium"
-              title="Import a project from an .aqda file (Export → Share Project) or another AQDA database"
+              title="Import a project from an .aqda file (Export → Save a copy to send) or another AQDA database"
             >
               <Upload size={16} /> {importMut.isPending ? 'Importing...' : 'Import Project'}
             </button>
@@ -197,6 +197,25 @@ export function ProjectList() {
               title="Dismiss"
             >
               <X size={14} />
+            </button>
+          </div>
+        )}
+
+        {sharedStatus?.sync_error && (
+          <div className="flex items-start gap-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3 mb-4 text-sm text-red-800">
+            <AlertTriangle size={18} className="mt-0.5 shrink-0" />
+            <div className="flex-1">
+              <p className="font-medium">Collaboration sync is temporarily unavailable</p>
+              <p className="text-xs mt-1">
+                Your work is still saved on this computer. AQDA is retrying automatically: {sharedStatus.sync_error}
+              </p>
+            </div>
+            <button
+              onClick={() => syncMut.mutate()}
+              disabled={syncMut.isPending}
+              className="text-xs font-medium underline disabled:opacity-50"
+            >
+              Retry now
             </button>
           </div>
         )}
@@ -357,7 +376,11 @@ export function ProjectList() {
                 <div>
                   <div className="flex items-center gap-2">
                     <h3 className="font-medium text-gray-900">{p.name}</h3>
-                    {p.shared_folder && (
+                    {p.is_conflict_mirror ? (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-amber-100 text-amber-800">
+                        <AlertTriangle size={11} /> Collaborator reference
+                      </span>
+                    ) : p.shared_folder && (
                       <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium ${
                         p.shared_sync_error
                           ? 'bg-amber-100 text-amber-800'
@@ -366,7 +389,7 @@ export function ProjectList() {
                             : 'bg-blue-100 text-blue-700'
                       }`}>
                         <Cloud size={11} />
-                        {p.shared_sync_error ? 'Kept both versions' : p.revision === p.shared_last_published_revision ? 'Shared · saved' : 'Shared · saving'}
+                        {p.shared_sync_error ? 'Needs attention' : p.revision === p.shared_last_published_revision ? 'Shared · saved' : 'Shared · saving'}
                       </span>
                     )}
                   </div>

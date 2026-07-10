@@ -22,7 +22,33 @@ async def lifespan(app: FastAPI):
         await stop_sync_service()
 
 
-app = FastAPI(title="AQDA", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="AQDA", version="0.3.0", lifespan=lifespan)
+
+_LOCAL_BROWSER_ORIGINS = {
+    "http://127.0.0.1:8765",
+    "http://localhost:8765",
+    # The Vite development server proxies /api requests to the same local app.
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+}
+
+
+@app.middleware("http")
+async def require_local_origin_for_changes(request, call_next):
+    """Reject browser-driven cross-site writes to the localhost API.
+
+    Origin-less requests remain available to the command line and native folder
+    picker. Browsers attach an Origin to cross-site POST/PUT/PATCH/DELETE requests,
+    which prevents an arbitrary website from closing AQDA or changing its data.
+    """
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        origin = request.headers.get("origin")
+        if origin and origin not in _LOCAL_BROWSER_ORIGINS:
+            return JSONResponse(
+                {"detail": "Cross-site requests to AQDA are not allowed"},
+                status_code=403,
+            )
+    return await call_next(request)
 
 # API routes
 app.include_router(projects.router, prefix="/api/projects", tags=["projects"])
@@ -40,6 +66,7 @@ app.include_router(system.router, prefix="/api/system", tags=["system"])
 @app.api_route(
     "/api/{path:path}",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    include_in_schema=False,
 )
 async def api_not_found(path: str):
     return JSONResponse({"detail": f"API route not found: /api/{path}"}, status_code=404)

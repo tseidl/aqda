@@ -14,11 +14,14 @@ from aqda.db import get_db
 from aqda.services.shared_projects import (
     discover_shared_projects,
     get_shared_root,
+    get_sync_health,
     open_shared_project,
+    resolve_conflict_copy,
     set_shared_root,
     share_project,
     sync_all_shared_projects,
     sync_project,
+    unlink_shared_project,
 )
 
 router = APIRouter()
@@ -30,6 +33,10 @@ class FolderUpdate(BaseModel):
 
 class OpenSharedProject(BaseModel):
     folder: str
+
+
+class ConflictResolution(BaseModel):
+    choice: str
 
 
 def _choose_folder_native() -> str | None:
@@ -107,6 +114,7 @@ async def shared_status():
         "backup_folder": str(backup_dir),
         "backup_count": len(backups),
         "latest_backup": str(backups[0]) if backups else None,
+        **get_sync_health(),
     }
 
 
@@ -148,16 +156,11 @@ async def open_project(data: OpenSharedProject):
     return await open_shared_project(data.folder)
 
 
+@router.post("/conflicts/{conflict_project_id}/resolve")
+async def resolve_conflict(conflict_project_id: int, data: ConflictResolution):
+    return await resolve_conflict_copy(conflict_project_id, data.choice)
+
+
 @router.delete("/projects/{project_id}/link", status_code=204)
 async def unlink_project(project_id: int):
-    db = await get_db()
-    try:
-        await db.execute(
-            "UPDATE project SET shared_folder=NULL, shared_last_published_revision=NULL, "
-            "shared_last_snapshot_id=NULL, shared_last_sync_at=NULL, shared_sync_error=NULL "
-            "WHERE id=?",
-            (project_id,),
-        )
-        await db.commit()
-    finally:
-        await db.close()
+    await unlink_shared_project(project_id)

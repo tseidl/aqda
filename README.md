@@ -76,7 +76,8 @@ Then start AQDA:
 aqda
 ```
 
-This opens your browser at `http://127.0.0.1:8765`. To stop, press `Ctrl+C` in the terminal.
+This opens your browser at `http://127.0.0.1:8765`. To stop, click **Close AQDA** in the
+app. Pressing `Ctrl+C` once in the terminal is the equivalent safe shutdown.
 
 
 <details>
@@ -182,13 +183,15 @@ the chosen backup into its place as `aqda.db`.
 
 Collaboration is designed to feel like opening the same document from a shared folder.
 AQDA quietly uses a safe local working copy and syncs complete, closed snapshots in the
-background. You never manage the local copy and you never need to save manually.
+background. The local working copy lives with all your other projects inside the hidden
+`~/.aqda/aqda.db` database; it is not another file you have to open or manage. You never
+need to save manually.
 
 **Set it up once:**
 
 1. Open **Settings → Collaboration**
 2. Choose a folder inside Google Drive, Dropbox, OneDrive, or another synced location
-3. Open a project and click **Share project**
+3. Open a project and click **Collaborate**
 4. On the other researcher's computer, choose the same collaboration folder in Settings
 5. The project appears under **Shared projects available**; click **Open project** once
 
@@ -198,11 +201,27 @@ short delay. Incoming changes appear automatically. Before replacing local proje
 AQDA creates and verifies a full safety backup.
 
 If two people happen to work at the same time—or one computer was offline—AQDA detects the
-two histories and keeps both as clearly named projects. Neither person's work is overwritten.
-You can compare them and decide which version to continue using.
+two histories and keeps neither person's work from overwriting the other. The original shared
+project remains your branch. AQDA creates exactly one clearly named **Collaborator reference**
+project for each other branch and updates that same reference as new work arrives; it does not
+make another copy or shared folder on every sync.
 
-Under the hood, the collaboration folder contains an `.aqda-project` folder with immutable
-snapshots. These are managed by AQDA; collaborators should not rename or edit them manually.
+Treat the collaborator reference as a comparison copy, not a new place to code. To resolve it:
+
+1. Compare the two projects and agree which branch everyone will continue from.
+2. On a computer where the current shared project is the chosen branch, open the collaborator
+   reference and click **Keep my current shared version**. The reference moves to Trash.
+3. On a computer where the collaborator reference is the chosen branch, open it and click
+   **Use this version for collaboration**. AQDA creates a full backup, switches the shared
+   project, and keeps the previous local branch as a clearly named local archive.
+
+This is an explicit choice rather than an automatic merge: qualitative coding decisions from
+two branches cannot safely be guessed together.
+
+Under the hood, the collaboration folder contains one `.aqda-project` folder with a complete
+snapshot file for each participating computer. These are managed by AQDA; collaborators should
+not rename or edit them manually. **Stop sharing** removes this computer's snapshot while keeping
+its local project intact.
 
 **Stopping AQDA:** use the **Close AQDA** button, or press Ctrl+C once in the terminal. Both
 perform a graceful final sync. Closing only the browser tab leaves the local AQDA server
@@ -220,7 +239,7 @@ Everything autosaves; no files or caches need to be managed.
 
 | Format | Use case |
 |--------|----------|
-| `.aqda` | Share a project with another AQDA user — full round-trip import/export |
+| `.aqda` | Save a standalone copy to send or archive — full AQDA round-trip import/export |
 | `.qdpx` | REFI-QDA text exchange — import into MAXQDA, ATLAS.ti, NVivo |
 | `.qdc` | Codebook XML — share code hierarchies between projects |
 | `.csv` | Coded segments as a table — for further analysis in R, Excel, etc. |

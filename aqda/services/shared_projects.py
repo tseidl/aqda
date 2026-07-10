@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import sqlite3
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,7 +16,7 @@ from urllib.parse import quote
 
 from fastapi import HTTPException
 
-from aqda.db import get_db
+from aqda.db import create_daily_backup, get_db
 
 SYNC_INTERVAL_SECONDS = 3
 PUBLISH_IDLE_SECONDS = 5
@@ -37,6 +39,10 @@ _sync_lock = asyncio.Lock()
 _sync_task: asyncio.Task | None = None
 _stop_event: asyncio.Event | None = None
 _snapshot_cache: dict[Path, tuple[int, int, SnapshotInfo]] = {}
+_global_sync_error: str | None = None
+_last_sync_check_at: str | None = None
+_last_daily_backup_day: str | None = None
+logger = logging.getLogger(__name__)
 
 
 def _inspect_snapshot(path: Path) -> SnapshotInfo:
@@ -79,6 +85,19 @@ def _inspect_snapshot(path: Path) -> SnapshotInfo:
         )
     finally:
         connection.close()
+
+
+def _inspect_snapshot_bytes(data: bytes) -> SnapshotInfo:
+    """Inspect the exact bytes read from a writer file, not a later replacement."""
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".aqda")
+    try:
+        temp.write(data)
+        temp.close()
+        return _inspect_snapshot(Path(temp.name))
+    finally:
+        if not temp.closed:
+            temp.close()
+        Path(temp.name).unlink(missing_ok=True)
 
 
 async def _snapshot_infos(folder: Path) -> list[SnapshotInfo]:
@@ -237,6 +256,11 @@ def _write_snapshot(
     return final_path
 
 
+def _writer_snapshot_path(folder: Path, writer_id: str) -> Path:
+    safe_writer = re.sub(r"[^A-Za-z0-9_-]", "-", writer_id)
+    return folder / "snapshots" / f"writer-{safe_writer}.aqda"
+
+
 async def _publish_project(project_id: int, force: bool = False) -> dict:
     project = await _project_row(project_id)
     if not project or not project["shared_folder"]:
@@ -285,6 +309,22 @@ async def share_project(project_id: int) -> dict:
         project = await _project_row(project_id)
         if not project:
             raise HTTPException(404, "Project not found")
+        db = await get_db()
+        try:
+            mirror = await (
+                await db.execute(
+                    "SELECT 1 FROM shared_conflict_branch "
+                    "WHERE conflict_project_id=? AND status='active'",
+                    (project_id,),
+                )
+            ).fetchone()
+        finally:
+            await db.close()
+        if mirror:
+            raise HTTPException(
+                409,
+                "This is a reference copy of concurrent work and cannot be shared separately.",
+            )
         folder = Path(project["shared_folder"]) if project["shared_folder"] else None
         if folder is None:
             folder = await asyncio.to_thread(_new_project_folder, root, project["name"])
@@ -326,6 +366,134 @@ async def _ignored_heads(project_id: int) -> set[str]:
         await db.close()
 
 
+def _descends_from(info: SnapshotInfo, ancestor_snapshot_id: str) -> bool:
+    current: str | None = info.head_snapshot_id
+    seen: set[str] = set()
+    while current and current not in seen:
+        if current == ancestor_snapshot_id:
+            return True
+        seen.add(current)
+        current = info.parent_by_id.get(current)
+    return False
+
+
+async def _active_conflict_branches(project_id: int) -> list[dict]:
+    db = await get_db()
+    try:
+        rows = await (
+            await db.execute(
+                "SELECT b.*, p.name AS conflict_name, p.revision AS conflict_revision, "
+                "p.deleted_at AS conflict_deleted_at FROM shared_conflict_branch b "
+                "LEFT JOIN project p ON p.id=b.conflict_project_id "
+                "WHERE b.project_id=? AND b.status='active' ORDER BY b.id",
+                (project_id,),
+            )
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        await db.close()
+
+
+async def _update_conflict_branch(branch_id: int, **fields) -> None:
+    if not fields:
+        return
+    db = await get_db()
+    try:
+        assignments = ", ".join(f"{key}=?" for key in fields)
+        await db.execute(
+            f"UPDATE shared_conflict_branch SET {assignments}, "
+            "updated_at=datetime('now') WHERE id=?",
+            [*fields.values(), branch_id],
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def _refresh_known_conflict_branch(
+    project_id: int,
+    info: SnapshotInfo,
+) -> dict | None:
+    """Update one existing conflict mirror when the remote branch advances.
+
+    Returning ``None`` means this head belongs to no known branch and should go
+    through normal conflict classification. Any returned dictionary means the
+    head was handled (including a dismissed or locally edited mirror).
+    """
+    branches = await _active_conflict_branches(project_id)
+    branch = next(
+        (
+            item
+            for item in branches
+            if item["source_lineage_id"] == info.lineage_id
+            and _descends_from(info, item["latest_snapshot_id"])
+        ),
+        None,
+    )
+    if branch is None:
+        return None
+
+    await _mark_ignored(project_id, info.head_snapshot_id)
+    common_updates = {
+        "latest_snapshot_id": info.head_snapshot_id,
+        "latest_snapshot_path": str(info.path),
+    }
+    conflict_id = branch["conflict_project_id"]
+    if conflict_id is None or branch["conflict_deleted_at"] is not None:
+        message = (
+            "Concurrent work still exists in the shared folder. Its local reference "
+            "copy was removed, so AQDA is no longer recreating it automatically."
+        )
+        await _update_conflict_branch(branch["id"], **common_updates)
+        await _update_sync_state(project_id, shared_sync_error=message)
+        return {
+            "handled": True,
+            "updated": False,
+            "reason": "mirror_removed",
+            "sync_error": message,
+        }
+
+    if branch["conflict_revision"] != branch["conflict_base_revision"]:
+        message = (
+            f'Concurrent work continues, but “{branch["conflict_name"]}” was edited '
+            "locally. AQDA will not overwrite those edits; agree which version to keep."
+        )
+        await _update_conflict_branch(branch["id"], **common_updates)
+        await _update_sync_state(project_id, shared_sync_error=message)
+        return {
+            "handled": True,
+            "updated": False,
+            "reason": "mirror_edited",
+            "sync_error": message,
+        }
+
+    from aqda.routers.projects import refresh_conflict_copy
+
+    refreshed = await refresh_conflict_copy(
+        await asyncio.to_thread(info.path.read_bytes),
+        conflict_id,
+        info.lineage_id,
+    )
+    mirror_message = (
+        "Reference copy of concurrent collaborator work. It updates automatically; "
+        "agree which version to keep before coding here."
+    )
+    await _update_sync_state(conflict_id, shared_sync_error=mirror_message)
+    await _update_conflict_branch(
+        branch["id"],
+        **common_updates,
+        conflict_base_revision=refreshed["revision"],
+    )
+    await _update_sync_state(
+        project_id,
+        shared_sync_error=(
+            f'Concurrent edits detected; “{refreshed["name"]}” is the single local '
+            "reference copy of the collaborator's branch and will keep updating."
+        ),
+    )
+    return {"handled": True, "updated": True, "project": refreshed}
+
+
 async def _create_conflict_copy(project_id: int, info: SnapshotInfo) -> dict | None:
     from aqda.routers.projects import import_package_bytes
 
@@ -337,21 +505,39 @@ async def _create_conflict_copy(project_id: int, info: SnapshotInfo) -> dict | N
     if not result["imported"]:
         return None
     copied = result["imported"][0]
-    root = await get_shared_root()
-    if root is not None:
-        copied_project = await _project_row(copied["id"])
-        folder = await asyncio.to_thread(_new_project_folder, root, copied_project["name"])
-        await _update_sync_state(
-            copied["id"],
-            shared_folder=str(folder),
-            shared_last_published_revision=None,
-            shared_last_snapshot_id=None,
+    copied_project = await _project_row(copied["id"])
+    mirror_message = (
+        "Reference copy of concurrent collaborator work. It updates automatically; "
+        "agree which version to keep before coding here."
+    )
+    await _update_sync_state(copied["id"], shared_sync_error=mirror_message)
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO shared_conflict_branch "
+            "(project_id, source_lineage_id, anchor_snapshot_id, latest_snapshot_id, "
+            "latest_snapshot_path, conflict_project_id, conflict_base_revision) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                project_id,
+                info.lineage_id,
+                info.head_snapshot_id,
+                info.head_snapshot_id,
+                str(info.path),
+                copied["id"],
+                copied_project["revision"],
+            ),
         )
-        await _publish_project(copied["id"], force=True)
+        await db.commit()
+    finally:
+        await db.close()
     await _mark_ignored(project_id, info.head_snapshot_id)
     await _update_sync_state(
         project_id,
-        shared_sync_error=f'Concurrent edits detected; kept both versions as "{copied["name"]}".',
+        shared_sync_error=(
+            f'Concurrent edits detected; “{copied["name"]}” is the single local '
+            "reference copy of the collaborator's branch and will keep updating."
+        ),
     )
     return copied
 
@@ -384,11 +570,19 @@ async def _sync_project(
     ignored = await _ignored_heads(project_id)
     imported = []
     conflicts = []
+    branch_errors: list[str] = []
 
     from aqda.routers.projects import import_package_bytes
 
     for info in heads:
         if info.head_snapshot_id in ignored or info.head_snapshot_id == project["head_snapshot_id"]:
+            continue
+        handled_branch = await _refresh_known_conflict_branch(project_id, info)
+        if handled_branch is not None:
+            if handled_branch.get("updated"):
+                conflicts.append(handled_branch["project"])
+            if handled_branch.get("sync_error"):
+                branch_errors.append(handled_branch["sync_error"])
             continue
         result = await import_package_bytes(
             await asyncio.to_thread(info.path.read_bytes), mode="auto"
@@ -421,9 +615,12 @@ async def _sync_project(
         await _update_sync_state(
             project_id,
             shared_sync_error=(
-                f'Concurrent edits detected; kept both versions as "{conflicts[-1]["name"]}".'
+                f'Concurrent edits detected; “{conflicts[-1]["name"]}” is the single local '
+                "reference copy of the collaborator's branch and will keep updating."
             ),
         )
+    elif branch_errors:
+        await _update_sync_state(project_id, shared_sync_error=branch_errors[-1])
     return {
         "project_id": project_id,
         "linked": True,
@@ -525,13 +722,20 @@ async def open_shared_project(folder_path: str) -> dict:
         )
         if result["conflicts"]:
             local_id = result["conflicts"][0]["id"]
+            await _update_sync_state(
+                local_id,
+                shared_folder=str(folder),
+                shared_last_published_revision=None,
+                shared_last_snapshot_id=None,
+                shared_last_sync_at=None,
+            )
             copied = await _create_conflict_copy(local_id, primary)
             if not copied:
                 raise HTTPException(409, "Concurrent versions were detected")
-            project_id = copied["id"]
+            project_id = local_id
             return {
                 "project_id": project_id,
-                "name": copied["name"],
+                "name": result["conflicts"][0]["name"],
                 "conflicts": result["conflicts"],
             }
         elif result["imported"]:
@@ -552,10 +756,306 @@ async def open_shared_project(folder_path: str) -> dict:
         return {"project_id": project_id, "name": primary.name, "conflicts": result["conflicts"]}
 
 
+def get_sync_health() -> dict[str, str | None]:
+    return {
+        "sync_error": _global_sync_error,
+        "last_checked_at": _last_sync_check_at,
+    }
+
+
+async def unlink_shared_project(project_id: int) -> None:
+    """Stop publishing this installation's writer snapshot, then clear the link."""
+    async with _sync_lock:
+        project = await _project_row(project_id)
+        if not project:
+            raise HTTPException(404, "Project not found")
+        if project["shared_folder"]:
+            folder = Path(project["shared_folder"])
+            if not folder.is_dir():
+                raise HTTPException(
+                    409,
+                    "The collaboration folder is unavailable. Reconnect it before stopping "
+                    "sharing so AQDA can remove this computer's snapshot.",
+                )
+            path = _writer_snapshot_path(folder, await _device_id())
+            try:
+                await asyncio.to_thread(path.unlink, missing_ok=True)
+                _snapshot_cache.pop(path, None)
+            except OSError as exc:
+                raise HTTPException(
+                    409,
+                    "AQDA could not remove this computer's shared snapshot. "
+                    "Reconnect the collaboration folder and try again.",
+                ) from exc
+        db = await get_db()
+        try:
+            mirrors = await (
+                await db.execute(
+                    "SELECT conflict_project_id FROM shared_conflict_branch "
+                    "WHERE project_id=? AND conflict_project_id IS NOT NULL",
+                    (project_id,),
+                )
+            ).fetchall()
+            await db.execute(
+                "UPDATE project SET shared_folder=NULL, "
+                "shared_last_published_revision=NULL, shared_last_snapshot_id=NULL, "
+                "shared_last_sync_at=NULL, shared_sync_error=NULL WHERE id=?",
+                (project_id,),
+            )
+            for mirror in mirrors:
+                await db.execute(
+                    "UPDATE project SET shared_sync_error=? WHERE id=?",
+                    (
+                        "Local archive of a former concurrent version. It no longer updates "
+                        "because collaboration was stopped.",
+                        mirror["conflict_project_id"],
+                    ),
+                )
+            await db.execute(
+                "DELETE FROM shared_conflict_branch WHERE project_id=?", (project_id,)
+            )
+            await db.execute("DELETE FROM shared_ignored_head WHERE project_id=?", (project_id,))
+            await db.commit()
+        finally:
+            await db.close()
+
+
+async def _rename_as_local_archive(project_id: int, original_name: str) -> dict:
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    base = f"{original_name} (previous local version, {stamp})"
+    db = await get_db()
+    try:
+        candidate = base
+        counter = 2
+        while await (
+            await db.execute(
+                "SELECT 1 FROM project WHERE name=? AND id<>?", (candidate, project_id)
+            )
+        ).fetchone():
+            candidate = f"{base} {counter}"
+            counter += 1
+        await db.execute(
+            "UPDATE project SET name=?, shared_sync_error=? WHERE id=?",
+            (
+                candidate,
+                "Local archive kept when collaboration switched to the other version. "
+                "It no longer updates automatically.",
+                project_id,
+            ),
+        )
+        await db.commit()
+        row = await (
+            await db.execute("SELECT * FROM project WHERE id=?", (project_id,))
+        ).fetchone()
+        return dict(row)
+    finally:
+        await db.close()
+
+
+async def resolve_conflict_copy(conflict_project_id: int, choice: str) -> dict:
+    """Resolve one local collaboration branch without discarding either side's work."""
+    if choice not in {"use_reference", "keep_current"}:
+        raise HTTPException(400, "Choose 'use_reference' or 'keep_current'")
+
+    async with _sync_lock:
+        db = await get_db()
+        try:
+            branch = await (
+                await db.execute(
+                    "SELECT b.*, original.name AS original_name, "
+                    "original.shared_folder AS original_shared_folder, "
+                    "mirror.name AS mirror_name, mirror.revision AS mirror_revision, "
+                    "mirror.deleted_at AS mirror_deleted_at "
+                    "FROM shared_conflict_branch b "
+                    "JOIN project original ON original.id=b.project_id "
+                    "LEFT JOIN project mirror ON mirror.id=b.conflict_project_id "
+                    "WHERE b.conflict_project_id=? AND b.status='active'",
+                    (conflict_project_id,),
+                )
+            ).fetchone()
+        finally:
+            await db.close()
+        if not branch or branch["mirror_deleted_at"] is not None:
+            raise HTTPException(404, "This collaborator reference is no longer active")
+
+        original_id = branch["project_id"]
+        if choice == "keep_current":
+            await _publish_project(original_id, force=True)
+            db = await get_db()
+            try:
+                await db.execute(
+                    "UPDATE shared_conflict_branch SET status='resolved', "
+                    "updated_at=datetime('now') WHERE id=?",
+                    (branch["id"],),
+                )
+                await db.execute(
+                    "UPDATE project SET deleted_at=datetime('now'), "
+                    "modified_at=datetime('now'), shared_sync_error=? WHERE id=?",
+                    (
+                        "Local archive of a resolved concurrent version. Restore it from "
+                        "Trash if you need to inspect it again.",
+                        conflict_project_id,
+                    ),
+                )
+                remaining = await (
+                    await db.execute(
+                        "SELECT COUNT(*) FROM shared_conflict_branch "
+                        "WHERE project_id=? AND status='active'",
+                        (original_id,),
+                    )
+                ).fetchone()
+                if remaining[0] == 0:
+                    await db.execute(
+                        "UPDATE project SET shared_sync_error=NULL WHERE id=?", (original_id,)
+                    )
+                else:
+                    await db.execute(
+                        "UPDATE project SET shared_sync_error=? WHERE id=?",
+                        (
+                            f"{remaining[0]} other concurrent version(s) still need a "
+                            "resolution choice.",
+                            original_id,
+                        ),
+                    )
+                await db.commit()
+            finally:
+                await db.close()
+            return {
+                "project_id": original_id,
+                "choice": choice,
+                "archived_project_id": conflict_project_id,
+                "message": "Kept the current shared version; the reference is in Trash.",
+            }
+
+        if branch["mirror_revision"] != branch["conflict_base_revision"]:
+            raise HTTPException(
+                409,
+                "This reference was edited locally, so AQDA will not replace either version "
+                "automatically. Export it as an .aqda copy before resolving manually.",
+            )
+        if not branch["original_shared_folder"]:
+            raise HTTPException(409, "The original project is no longer shared")
+
+        snapshot_path = Path(branch["latest_snapshot_path"])
+        if not snapshot_path.is_file():
+            raise HTTPException(409, "The collaborator snapshot is currently unavailable")
+        incoming_data = await asyncio.to_thread(snapshot_path.read_bytes)
+        info = await asyncio.to_thread(_inspect_snapshot_bytes, incoming_data)
+        if (
+            info.lineage_id != branch["source_lineage_id"]
+            or not _descends_from(info, branch["latest_snapshot_id"])
+        ):
+            raise HTTPException(
+                409,
+                "The collaborator snapshot changed unexpectedly. Wait for AQDA to sync and try again.",
+            )
+        from aqda.routers.export import build_aqda_snapshot
+        from aqda.routers.projects import import_package_bytes
+
+        local_data, _, _ = await build_aqda_snapshot(original_id)
+        archive_id: int | None = None
+        replaced = False
+        try:
+            archive_result = await import_package_bytes(
+                local_data,
+                mode="copy",
+                target_lineage_id=branch["source_lineage_id"],
+            )
+            if not archive_result["imported"]:
+                raise RuntimeError("AQDA could not preserve the previous local version")
+            archive_id = archive_result["imported"][0]["id"]
+            archive = await _rename_as_local_archive(archive_id, branch["original_name"])
+
+            replace_result = await import_package_bytes(
+                incoming_data,
+                mode="replace",
+                target_lineage_id=branch["source_lineage_id"],
+            )
+            if not replace_result["imported"]:
+                raise RuntimeError("AQDA could not switch to the collaborator version")
+            replaced = True
+
+            remaining_count = 0
+            db = await get_db()
+            try:
+                await db.execute(
+                    "UPDATE shared_conflict_branch SET status='resolved', "
+                    "updated_at=datetime('now') WHERE id=?",
+                    (branch["id"],),
+                )
+                await db.execute("DELETE FROM project WHERE id=?", (conflict_project_id,))
+                remaining = await (
+                    await db.execute(
+                        "SELECT COUNT(*) FROM shared_conflict_branch "
+                        "WHERE project_id=? AND status='active'",
+                        (original_id,),
+                    )
+                ).fetchone()
+                remaining_count = remaining[0]
+                await db.execute(
+                    "UPDATE project SET shared_sync_error=? WHERE id=?",
+                    (
+                        (
+                            f"{remaining_count} other concurrent version(s) still need a "
+                            "resolution choice."
+                            if remaining_count
+                            else None
+                        ),
+                        original_id,
+                    ),
+                )
+                await db.commit()
+            finally:
+                await db.close()
+            await _publish_project(original_id, force=True)
+            if remaining_count:
+                await _update_sync_state(
+                    original_id,
+                    shared_sync_error=(
+                        f"{remaining_count} other concurrent version(s) still need a "
+                        "resolution choice."
+                    ),
+                )
+            return {
+                "project_id": original_id,
+                "choice": choice,
+                "archived_project_id": archive["id"],
+                "archived_project_name": archive["name"],
+                "backup_path": replace_result["backup_path"],
+                "message": (
+                    "Switched collaboration to this version and kept the previous local "
+                    f'version as “{archive["name"]}”.'
+                ),
+            }
+        except Exception:
+            if archive_id is not None and not replaced:
+                cleanup = await get_db()
+                try:
+                    await cleanup.execute("DELETE FROM project WHERE id=?", (archive_id,))
+                    await cleanup.commit()
+                finally:
+                    await cleanup.close()
+            raise
+
+
 async def _sync_loop() -> None:
+    global _global_sync_error, _last_sync_check_at, _last_daily_backup_day
     assert _stop_event is not None
     while not _stop_event.is_set():
-        await sync_all_shared_projects()
+        try:
+            await sync_all_shared_projects()
+            day = datetime.now(timezone.utc).strftime("%Y%m%d")
+            if _last_daily_backup_day != day:
+                await asyncio.to_thread(create_daily_backup)
+                _last_daily_backup_day = day
+            _global_sync_error = None
+            _last_sync_check_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _global_sync_error = str(exc)
+            _last_sync_check_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            logger.exception("AQDA background synchronization failed; retrying")
         try:
             await asyncio.wait_for(_stop_event.wait(), timeout=SYNC_INTERVAL_SECONDS)
         except asyncio.TimeoutError:

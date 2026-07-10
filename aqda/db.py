@@ -110,7 +110,7 @@ INSERT OR IGNORE INTO setting (key, value) VALUES
     ('coder_name', ''),
     ('shared_folder', ''),
     ('device_id', ''),
-    ('schema_version', '9');
+    ('schema_version', '10');
 
 CREATE TABLE IF NOT EXISTS project_snapshot (
     snapshot_id TEXT PRIMARY KEY,
@@ -134,6 +134,21 @@ CREATE TABLE IF NOT EXISTS shared_ignored_head (
     snapshot_id TEXT NOT NULL,
     created_at TEXT DEFAULT (datetime('now')),
     PRIMARY KEY (project_id, snapshot_id)
+);
+
+CREATE TABLE IF NOT EXISTS shared_conflict_branch (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+    source_lineage_id TEXT NOT NULL,
+    anchor_snapshot_id TEXT NOT NULL,
+    latest_snapshot_id TEXT NOT NULL,
+    latest_snapshot_path TEXT NOT NULL,
+    conflict_project_id INTEGER REFERENCES project(id) ON DELETE SET NULL,
+    conflict_base_revision INTEGER DEFAULT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(project_id, anchor_snapshot_id)
 );
 
 CREATE TABLE IF NOT EXISTS embedding_cache (
@@ -227,6 +242,22 @@ MIGRATIONS = {
             PRIMARY KEY (project_id, snapshot_id)
         )""",
     ],
+    10: [
+        """CREATE TABLE IF NOT EXISTS shared_conflict_branch (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+            source_lineage_id TEXT NOT NULL,
+            anchor_snapshot_id TEXT NOT NULL,
+            latest_snapshot_id TEXT NOT NULL,
+            latest_snapshot_path TEXT NOT NULL,
+            conflict_project_id INTEGER REFERENCES project(id) ON DELETE SET NULL,
+            conflict_base_revision INTEGER DEFAULT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(project_id, anchor_snapshot_id)
+        )""",
+    ],
 }
 
 LATEST_SCHEMA_VERSION = max(MIGRATIONS)
@@ -242,8 +273,9 @@ def _db_path(project_id: int | None = None) -> Path:
 
 async def get_db() -> aiosqlite.Connection:
     """Get a database connection."""
-    db = await aiosqlite.connect(_db_path())
+    db = await aiosqlite.connect(_db_path(), timeout=15)
     db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA busy_timeout=15000")
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("PRAGMA foreign_keys=ON")
     return db

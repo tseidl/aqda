@@ -32,7 +32,9 @@ async def list_projects():
         cursor = await db.execute(
             "SELECT p.*, "
             "(SELECT COUNT(*) FROM document WHERE project_id=p.id) as doc_count, "
-            "(SELECT COUNT(*) FROM code WHERE project_id=p.id AND deleted_at IS NULL) as code_count "
+            "(SELECT COUNT(*) FROM code WHERE project_id=p.id AND deleted_at IS NULL) as code_count, "
+            "EXISTS(SELECT 1 FROM shared_conflict_branch b "
+            "WHERE b.conflict_project_id=p.id AND b.status='active') AS is_conflict_mirror "
             "FROM project p WHERE p.deleted_at IS NULL ORDER BY p.modified_at DESC"
         )
         rows = await cursor.fetchall()
@@ -51,7 +53,12 @@ async def create_project(data: ProjectCreate):
         )
         await db.commit()
         project_id = cursor.lastrowid
-        cursor = await db.execute("SELECT * FROM project WHERE id=?", (project_id,))
+        cursor = await db.execute(
+            "SELECT p.*, EXISTS(SELECT 1 FROM shared_conflict_branch b "
+            "WHERE b.conflict_project_id=p.id AND b.status='active') "
+            "AS is_conflict_mirror FROM project p WHERE p.id=?",
+            (project_id,),
+        )
         return dict(await cursor.fetchone())
     finally:
         await db.close()
@@ -77,7 +84,12 @@ async def list_trash():
 async def get_project(project_id: int):
     db = await get_db()
     try:
-        cursor = await db.execute("SELECT * FROM project WHERE id=?", (project_id,))
+        cursor = await db.execute(
+            "SELECT p.*, EXISTS(SELECT 1 FROM shared_conflict_branch b "
+            "WHERE b.conflict_project_id=p.id AND b.status='active') "
+            "AS is_conflict_mirror FROM project p WHERE p.id=?",
+            (project_id,),
+        )
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(404, "Project not found")
@@ -157,6 +169,18 @@ async def restore_project(project_id: int):
 @router.delete("/{project_id}/permanent", status_code=204)
 async def delete_project_permanent(project_id: int):
     """Permanently delete a project (no recovery)."""
+    db = await get_db()
+    try:
+        project = await (
+            await db.execute("SELECT shared_folder FROM project WHERE id=?", (project_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+    if project and project["shared_folder"]:
+        from aqda.services.shared_projects import unlink_shared_project
+
+        await unlink_shared_project(project_id)
+
     db = await get_db()
     try:
         await db.execute("DELETE FROM project WHERE id=?", (project_id,))
@@ -472,7 +496,7 @@ async def import_package_bytes(
                 raise HTTPException(
                     400,
                     "Not an AQDA project file. Expected an .aqda file "
-                    "(from Export → Share Project) or an AQDA database.",
+                    "(from Export → Save a copy to send) or an AQDA database.",
                 )
 
             # Reserve the write slot before inspecting local ancestry. This keeps
@@ -645,3 +669,90 @@ async def import_package_bytes(
         "count": len(imported),
         "backup_path": backup_path,
     }
+
+
+async def refresh_conflict_copy(
+    content: bytes,
+    target_project_id: int,
+    source_lineage_id: str,
+) -> dict:
+    """Refresh an untouched local conflict mirror from a newer remote snapshot.
+
+    Conflict mirrors deliberately have their own local lineage, so the normal
+    import classifier must not mistake them for the shared project itself. This
+    targeted replacement preserves the mirror's ID, name, and local-only status
+    while remapping all child-record IDs atomically.
+    """
+    if not content:
+        raise HTTPException(400, "The project snapshot is empty")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.write(content)
+    tmp.close()
+
+    src = dst = None
+    try:
+        src = await aiosqlite.connect(tmp.name)
+        src.row_factory = aiosqlite.Row
+        dst = await get_db()
+
+        check = await (await src.execute("PRAGMA quick_check")).fetchone()
+        if not check or check[0] != "ok":
+            raise HTTPException(400, "The collaboration snapshot is incomplete or corrupted")
+        try:
+            source_project = await (
+                await src.execute(
+                    "SELECT * FROM project WHERE lineage_id=? AND deleted_at IS NULL",
+                    (source_lineage_id,),
+                )
+            ).fetchone()
+        except aiosqlite.OperationalError as exc:
+            raise HTTPException(400, "The collaboration snapshot is missing lineage data") from exc
+        if not source_project:
+            raise HTTPException(400, "The expected project is missing from the collaboration snapshot")
+
+        await dst.execute("BEGIN IMMEDIATE")
+        target = await (
+            await dst.execute("SELECT * FROM project WHERE id=?", (target_project_id,))
+        ).fetchone()
+        if not target:
+            raise HTTPException(404, "Conflict copy no longer exists")
+
+        await dst.execute("DELETE FROM memo WHERE project_id=?", (target_project_id,))
+        await dst.execute("DELETE FROM document WHERE project_id=?", (target_project_id,))
+        await dst.execute(
+            "DELETE FROM code_deletion_batch WHERE project_id=?", (target_project_id,)
+        )
+        await dst.execute("DELETE FROM code WHERE project_id=?", (target_project_id,))
+        await dst.execute(
+            "DELETE FROM project_snapshot WHERE project_id=?", (target_project_id,)
+        )
+        await dst.execute(
+            "UPDATE project SET description=?, modified_at=datetime('now'), "
+            "deleted_at=NULL, revision=revision+1, head_snapshot_id=NULL, "
+            "shared_folder=NULL, shared_last_published_revision=NULL, "
+            "shared_last_snapshot_id=NULL, shared_last_sync_at=NULL WHERE id=?",
+            (
+                _value(source_project, "description", "") or "",
+                target_project_id,
+            ),
+        )
+        await _copy_project_contents(src, dst, source_project, target_project_id, [])
+
+        from aqda.services.offsets import repair_legacy_offsets
+
+        await repair_legacy_offsets(dst, [target_project_id])
+        await dst.commit()
+        refreshed = await (
+            await dst.execute("SELECT * FROM project WHERE id=?", (target_project_id,))
+        ).fetchone()
+        return dict(refreshed)
+    except Exception:
+        if dst and dst.in_transaction:
+            await dst.rollback()
+        raise
+    finally:
+        if src:
+            await src.close()
+        if dst:
+            await dst.close()
+        os.unlink(tmp.name)

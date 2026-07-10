@@ -192,5 +192,15 @@ async def test_export_fidelity_and_api_404(tmp_path, use_data_dir):
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/api/definitely-not-a-route")
+        cross_site = await client.post(
+            "/api/shared/sync", headers={"Origin": "https://attacker.example"}
+        )
+        local_site = await client.post(
+            "/api/definitely-not-a-route",
+            headers={"Origin": "http://127.0.0.1:8765"},
+        )
     assert response.status_code == 404
     assert response.json()["detail"].startswith("API route not found")
+    assert cross_site.status_code == 403
+    assert cross_site.json()["detail"] == "Cross-site requests to AQDA are not allowed"
+    assert local_site.status_code == 404

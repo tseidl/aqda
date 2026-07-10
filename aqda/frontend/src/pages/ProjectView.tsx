@@ -1,10 +1,10 @@
 import { useState, useCallback, useRef, useMemo, useEffect } from 'react';
-import { useParams, Link } from 'react-router-dom';
+import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowLeft, Upload, FileText, Tags, StickyNote, Search,
   Download, ChevronDown, Sparkles, Plus, Trash2, Settings,
-  Filter, LayoutList, CheckSquare, Square, Tag, BookMarked, Cloud,
+  Filter, LayoutList, CheckSquare, Square, Tag, BookMarked, Cloud, AlertTriangle,
 } from 'lucide-react';
 import { projects, documents, codes, codings, memos, shared, type Document as Doc } from '../api';
 import { CodeTree } from '../components/CodeTree';
@@ -21,12 +21,14 @@ export function ProjectView() {
   const { projectId: pid } = useParams();
   const projectId = Number(pid);
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
 
   const [activeTab, setActiveTab] = useState<Tab>('documents');
   const [selectedDocId, setSelectedDocId] = useState<number | null>(null);
   const [selectedCodeId, setSelectedCodeId] = useState<number | null>(null);
   const [selectedMemoId, setSelectedMemoId] = useState<number | null>(null);
   const [showExportMenu, setShowExportMenu] = useState(false);
+  const [collaborationNotice, setCollaborationNotice] = useState<string | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(280);
   const isResizing = useRef(false);
   const lastProjectRevision = useRef<number | undefined>(undefined);
@@ -94,9 +96,42 @@ export function ProjectView() {
     mutationFn: () => shared.shareProject(projectId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['project', projectId] });
-      alert('This project is now shared. AQDA will save complete snapshots automatically.');
+      alert('Collaboration is on. AQDA will save complete snapshots automatically.');
     },
     onError: (error: Error) => alert(error.message),
+  });
+
+  const unlinkMut = useMutation({
+    mutationFn: () => shared.unlinkProject(projectId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['project', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['projects'] });
+      queryClient.invalidateQueries({ queryKey: ['shared-status'] });
+      alert('Collaboration stopped. The project and all of your work remain safely on this computer.');
+    },
+    onError: (error: Error) => alert(error.message),
+  });
+
+  const resolveConflictMut = useMutation({
+    mutationFn: (choice: 'use_reference' | 'keep_current') =>
+      shared.resolveConflict(projectId, choice),
+    onSuccess: (result) => {
+      setSelectedDocId(null);
+      setSelectedCodeId(null);
+      setSelectedMemoId(null);
+      lastProjectRevision.current = undefined;
+      queryClient.invalidateQueries({ queryKey: ['projects'] });
+      queryClient.invalidateQueries({ queryKey: ['projects-trash'] });
+      queryClient.invalidateQueries({ queryKey: ['shared-status'] });
+      queryClient.invalidateQueries({ queryKey: ['project', result.project_id] });
+      queryClient.invalidateQueries({ queryKey: ['documents', result.project_id] });
+      queryClient.invalidateQueries({ queryKey: ['codes', result.project_id] });
+      queryClient.invalidateQueries({ queryKey: ['codings'] });
+      queryClient.invalidateQueries({ queryKey: ['memos', result.project_id] });
+      alert(result.message);
+      navigate(`/project/${result.project_id}`);
+    },
+    onError: (error: Error) => setCollaborationNotice(error.message),
   });
 
   const { data: docList = [] } = useQuery({
@@ -223,12 +258,31 @@ export function ProjectView() {
     },
   });
 
+  const showInFlightSaveError = (error: unknown, item: 'coding' | 'memo') => {
+    const details = error instanceof Error ? error.message : String(error);
+    const likelyCollaboratorRefresh = Boolean(
+      project?.shared_folder && /(?:^|\s)(400|404|422):/.test(details)
+    );
+    if (likelyCollaboratorRefresh) {
+      setCollaborationNotice(
+        item === 'coding'
+          ? 'This project changed while you were selecting text, probably because a collaborator\'s version arrived. Nothing was saved from that selection; please select the passage again.'
+          : 'This project changed while you were writing that passage memo, probably because a collaborator\'s version arrived. The memo was not saved; please reselect the passage and try again.'
+      );
+    } else {
+      setCollaborationNotice(`AQDA could not save the ${item}. ${details}`);
+    }
+    queryClient.invalidateQueries({ queryKey: ['documents', projectId] });
+    queryClient.invalidateQueries({ queryKey: ['codes', projectId] });
+  };
+
   const createCodingMut = useMutation({
     mutationFn: codings.create,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['codings'] });
       queryClient.invalidateQueries({ queryKey: ['codes', projectId] });
     },
+    onError: (error) => showInFlightSaveError(error, 'coding'),
   });
 
   const deleteCodingMut = useMutation({
@@ -242,6 +296,10 @@ export function ProjectView() {
   const createMemoMut = useMutation({
     mutationFn: memos.create,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos', projectId] }),
+    onError: (error) => {
+      showInFlightSaveError(error, 'memo');
+      queryClient.invalidateQueries({ queryKey: ['memos', projectId] });
+    },
   });
 
   // Create a memo anchored to the current document + selected passage.
@@ -322,10 +380,32 @@ export function ProjectView() {
           <h1 className="font-semibold text-gray-900">{project?.name ?? '...'}</h1>
         </div>
         <div className="flex items-center gap-2">
-          {project?.shared_folder ? (
-            <span className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-green-50 text-green-700 text-xs font-medium" title={project.shared_folder}>
-              <Cloud size={14} /> {project.revision === project.shared_last_published_revision ? 'Shared · saved' : 'Shared · saving'}
+          {project?.is_conflict_mirror ? (
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-amber-50 text-amber-800 text-xs font-medium" title="This reference follows the collaborator's concurrent branch">
+              <AlertTriangle size={14} /> Collaborator reference
             </span>
+          ) : project?.shared_folder ? (
+            <div className="flex items-center gap-1">
+              <span className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium ${
+                project.shared_sync_error
+                  ? 'bg-amber-50 text-amber-800'
+                  : 'bg-green-50 text-green-700'
+              }`} title={project.shared_folder}>
+                <Cloud size={14} /> {project.shared_sync_error ? 'Shared · attention' : project.revision === project.shared_last_published_revision ? 'Shared · saved' : 'Shared · saving'}
+              </span>
+              <button
+                onClick={() => {
+                  if (confirm('Stop collaboration for this project on this computer? Your local project and all its work will remain safe.')) {
+                    unlinkMut.mutate();
+                  }
+                }}
+                disabled={unlinkMut.isPending}
+                className="px-2 py-1.5 text-xs text-gray-500 hover:text-red-700 hover:bg-red-50 rounded-md disabled:opacity-50"
+                title="Stop syncing this project and remove this computer's shared snapshot"
+              >
+                Stop sharing
+              </button>
+            </div>
           ) : (
             <button
               onClick={() => shareMut.mutate()}
@@ -333,7 +413,7 @@ export function ProjectView() {
               className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-blue-50 hover:bg-blue-100 rounded-md text-blue-700 disabled:opacity-50"
               title="Save this project automatically in your collaboration folder"
             >
-              <Cloud size={15} /> {shareMut.isPending ? 'Sharing…' : 'Share project'}
+              <Cloud size={15} /> {shareMut.isPending ? 'Starting…' : 'Collaborate'}
             </button>
           )}
           <Link
@@ -360,7 +440,7 @@ export function ProjectView() {
             {showExportMenu && (
               <div className="absolute right-0 top-full mt-1 bg-white border border-gray-200 rounded-lg shadow-lg py-1 z-50 min-w-[160px]">
                 {[
-                  { label: 'Share Project Snapshot (.aqda)', path: 'aqda' },
+                  { label: 'Save a copy to send (.aqda)', path: 'aqda' },
                   { label: 'REFI-QDA (.qdpx)', path: 'qdpx' },
                   { label: 'Codebook (.qdc)', path: 'qdc' },
                   { label: 'Codings (.csv)', path: 'csv' },
@@ -381,6 +461,59 @@ export function ProjectView() {
           <CloseAqdaButton />
         </div>
       </header>
+
+      {project?.shared_sync_error && (
+        <div className="shrink-0 flex items-start gap-3 border-b border-amber-200 bg-amber-50 px-4 py-2.5 text-sm text-amber-900">
+          <AlertTriangle size={17} className="mt-0.5 shrink-0" />
+          <span>{project.shared_sync_error}</span>
+        </div>
+      )}
+
+      {Boolean(project?.is_conflict_mirror) && (
+        <div className="shrink-0 flex flex-wrap items-center gap-3 border-b border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-950">
+          <div className="flex-1 min-w-64">
+            <p className="font-medium">Which version should collaboration continue from?</p>
+            <p className="text-xs text-blue-800 mt-0.5">
+              Agree with your collaborator first. AQDA preserves the version you do not choose.
+            </p>
+          </div>
+          <button
+            onClick={() => {
+              if (confirm('Use this collaborator version as the shared project on this computer? AQDA will create a full backup and keep your current version as a clearly named local archive.')) {
+                resolveConflictMut.mutate('use_reference');
+              }
+            }}
+            disabled={resolveConflictMut.isPending}
+            className="px-3 py-1.5 rounded-md bg-blue-700 text-white text-xs font-medium hover:bg-blue-800 disabled:opacity-50"
+          >
+            Use this version for collaboration
+          </button>
+          <button
+            onClick={() => {
+              if (confirm('Keep your current shared version and move this collaborator reference to Trash? If the other branch keeps changing, AQDA will show it again.')) {
+                resolveConflictMut.mutate('keep_current');
+              }
+            }}
+            disabled={resolveConflictMut.isPending}
+            className="px-3 py-1.5 rounded-md bg-white border border-blue-300 text-blue-800 text-xs font-medium hover:bg-blue-100 disabled:opacity-50"
+          >
+            Keep my current shared version
+          </button>
+        </div>
+      )}
+
+      {collaborationNotice && (
+        <div className="shrink-0 flex items-start gap-3 border-b border-amber-200 bg-amber-50 px-4 py-2.5 text-sm text-amber-900">
+          <AlertTriangle size={17} className="mt-0.5 shrink-0" />
+          <span className="flex-1">{collaborationNotice}</span>
+          <button
+            onClick={() => setCollaborationNotice(null)}
+            className="text-xs font-medium text-amber-800 hover:text-amber-950 underline"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* Main workspace */}
       <div className="flex-1 flex overflow-hidden">

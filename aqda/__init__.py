@@ -1,3 +1,3 @@
 """AQDA - Open-source qualitative data analysis tool."""
 
-__version__ = "0.1.2"
+__version__ = "0.3.0"

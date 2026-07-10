@@ -30,6 +30,7 @@ export interface Project {
   shared_last_snapshot_id?: string | null;
   shared_last_sync_at?: string | null;
   shared_sync_error?: string | null;
+  is_conflict_mirror?: number;
 }
 
 export interface SharedDiscoveredProject {
@@ -50,6 +51,17 @@ export interface SharedStatus {
   backup_folder: string;
   backup_count: number;
   latest_backup?: string | null;
+  sync_error?: string | null;
+  last_checked_at?: string | null;
+}
+
+export interface ConflictResolutionResult {
+  project_id: number;
+  choice: 'use_reference' | 'keep_current';
+  archived_project_id?: number | null;
+  archived_project_name?: string | null;
+  backup_path?: string | null;
+  message: string;
 }
 
 export interface ProjectImportConflict {
@@ -251,6 +263,12 @@ export const shared = {
     }),
   unlinkProject: (projectId: number) =>
     request<void>(`/shared/projects/${projectId}/link`, { method: 'DELETE' }),
+  resolveConflict: (
+    conflictProjectId: number,
+    choice: 'use_reference' | 'keep_current',
+  ) => request<ConflictResolutionResult>(`/shared/conflicts/${conflictProjectId}/resolve`, {
+    method: 'POST', body: JSON.stringify({ choice }),
+  }),
 };
 
 export const system = {
