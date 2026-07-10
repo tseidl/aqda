@@ -1,18 +1,19 @@
-import { useState, useCallback, useRef, useMemo } from 'react';
+import { useState, useCallback, useRef, useMemo, useEffect } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowLeft, Upload, FileText, Tags, StickyNote, Search,
   Download, ChevronDown, Sparkles, Plus, Trash2, Settings,
-  Filter, LayoutList, CheckSquare, Square, Tag, BookMarked,
+  Filter, LayoutList, CheckSquare, Square, Tag, BookMarked, Cloud,
 } from 'lucide-react';
-import { projects, documents, codes, codings, memos, type Document as Doc } from '../api';
+import { projects, documents, codes, codings, memos, shared, type Document as Doc } from '../api';
 import { CodeTree } from '../components/CodeTree';
 import { DocumentViewer } from '../components/DocumentViewer';
 import { MemoPanel } from '../components/MemoPanel';
 import { SegmentsBrowser } from '../components/SegmentsBrowser';
 import { AiPanel } from '../components/AiPanel';
 import type { MentionCandidate } from '../components/mentions';
+import { CloseAqdaButton } from '../components/CloseAqdaButton';
 
 type Tab = 'codes' | 'documents' | 'memos' | 'segments' | 'ai';
 
@@ -28,6 +29,7 @@ export function ProjectView() {
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(280);
   const isResizing = useRef(false);
+  const lastProjectRevision = useRef<number | undefined>(undefined);
 
   // Document list controls
   const [docSort, setDocSort] = useState<'name' | 'date' | 'type'>('name');
@@ -71,6 +73,30 @@ export function ProjectView() {
   const { data: project } = useQuery({
     queryKey: ['project', projectId],
     queryFn: () => projects.get(projectId),
+    refetchInterval: 3000,
+  });
+
+  useEffect(() => {
+    if (project?.revision === undefined) return;
+    if (
+      lastProjectRevision.current !== undefined &&
+      lastProjectRevision.current !== project.revision
+    ) {
+      queryClient.invalidateQueries({ queryKey: ['documents', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['codes', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['codings'] });
+      queryClient.invalidateQueries({ queryKey: ['memos', projectId] });
+    }
+    lastProjectRevision.current = project.revision;
+  }, [project?.revision, projectId, queryClient]);
+
+  const shareMut = useMutation({
+    mutationFn: () => shared.shareProject(projectId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['project', projectId] });
+      alert('This project is now shared. AQDA will save complete snapshots automatically.');
+    },
+    onError: (error: Error) => alert(error.message),
   });
 
   const { data: docList = [] } = useQuery({
@@ -296,6 +322,20 @@ export function ProjectView() {
           <h1 className="font-semibold text-gray-900">{project?.name ?? '...'}</h1>
         </div>
         <div className="flex items-center gap-2">
+          {project?.shared_folder ? (
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-green-50 text-green-700 text-xs font-medium" title={project.shared_folder}>
+              <Cloud size={14} /> {project.revision === project.shared_last_published_revision ? 'Shared · saved' : 'Shared · saving'}
+            </span>
+          ) : (
+            <button
+              onClick={() => shareMut.mutate()}
+              disabled={shareMut.isPending}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-blue-50 hover:bg-blue-100 rounded-md text-blue-700 disabled:opacity-50"
+              title="Save this project automatically in your collaboration folder"
+            >
+              <Cloud size={15} /> {shareMut.isPending ? 'Sharing…' : 'Share project'}
+            </button>
+          )}
           <Link
             to="/settings"
             className="p-1.5 text-gray-400 hover:text-gray-600 rounded hover:bg-gray-100"
@@ -320,11 +360,11 @@ export function ProjectView() {
             {showExportMenu && (
               <div className="absolute right-0 top-full mt-1 bg-white border border-gray-200 rounded-lg shadow-lg py-1 z-50 min-w-[160px]">
                 {[
-                  { label: 'Share Project (.aqda)', path: 'aqda' },
+                  { label: 'Share Project Snapshot (.aqda)', path: 'aqda' },
                   { label: 'REFI-QDA (.qdpx)', path: 'qdpx' },
                   { label: 'Codebook (.qdc)', path: 'qdc' },
                   { label: 'Codings (.csv)', path: 'csv' },
-                  { label: 'Full Project (.json)', path: 'json' },
+                  { label: 'Analysis Data (.json)', path: 'json' },
                 ].map((fmt) => (
                   <a
                     key={fmt.path}
@@ -338,6 +378,7 @@ export function ProjectView() {
               </div>
             )}
           </div>
+          <CloseAqdaButton />
         </div>
       </header>
 

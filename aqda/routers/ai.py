@@ -151,9 +151,10 @@ def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[dic
     return chunks
 
 
-def _chunk_id(doc_id: int, start: int, end: int, model: str) -> str:
+def _chunk_id(doc_id: int, start: int, end: int, model: str, text: str) -> str:
     """Deterministic ID for a chunk embedding."""
-    raw = f"{doc_id}:{start}:{end}:{model}"
+    content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    raw = f"{doc_id}:{start}:{end}:{model}:{content_hash}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 
@@ -197,14 +198,32 @@ async def _ensure_doc_embedded(
     """Embed a document's chunks into SQLite cache if not already stored."""
     chunks = _chunk_text(doc_content, chunk_size, chunk_overlap)
     if not chunks:
+        conn = _sync_db()
+        try:
+            conn.execute(
+                "DELETE FROM embedding_cache WHERE document_id=? AND model=?",
+                (doc_id, embed_model),
+            )
+            conn.commit()
+        finally:
+            conn.close()
         return
 
-    chunk_ids = [_chunk_id(doc_id, c["start"], c["end"], embed_model) for c in chunks]
+    chunk_ids = [
+        _chunk_id(doc_id, c["start"], c["end"], embed_model, c["text"])
+        for c in chunks
+    ]
 
     # Step 1: Check existing chunks (sync sqlite3 — avoids aiosqlite memory leak)
     conn = _sync_db()
     try:
         placeholders = ",".join("?" * len(chunk_ids))
+        conn.execute(
+            f"DELETE FROM embedding_cache WHERE document_id=? AND model=? "
+            f"AND id NOT IN ({placeholders})",
+            [doc_id, embed_model, *chunk_ids],
+        )
+        conn.commit()
         cursor = conn.execute(
             f"SELECT id FROM embedding_cache WHERE id IN ({placeholders})", chunk_ids
         )

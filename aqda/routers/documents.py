@@ -6,7 +6,7 @@ import re
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 
-from aqda.db import get_db, MAX_UPLOAD_BYTES
+from aqda.db import get_db, MAX_UPLOAD_BYTES, touch_project, touch_projects
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
 AUDIO_EXTENSIONS = {'.mp3', '.wav', '.m4a', '.ogg', '.flac', '.webm', '.wma', '.aac'}
@@ -139,14 +139,18 @@ def _parse_filename_variables_cached(settings: dict[str, str], filename: str) ->
 
 async def _save_doc_variables(db, document_id: int, variables: dict[str, str]):
     """Save variables for a document."""
+    current = await _get_doc_variables(db, document_id)
+    changed = False
     for key, value in variables.items():
-        if value.strip():
+        if value.strip() and current.get(key) != value:
             await db.execute(
                 "INSERT INTO document_variable (document_id, key, value) "
                 "VALUES (?, ?, ?) "
                 "ON CONFLICT(document_id, key) DO UPDATE SET value=excluded.value",
                 (document_id, key, value),
             )
+            changed = True
+    return changed
 
 
 def _decode_text_bytes(data: bytes) -> str:
@@ -224,13 +228,13 @@ async def upload_document(
             "INSERT INTO document (project_id, name, content, source_type) VALUES (?, ?, ?, ?)",
             (project_id, filename, text, source_type),
         )
-        await db.commit()
         doc_id = cursor.lastrowid
         # Parse filename variables
         file_vars = await _parse_filename_variables(db, filename)
         if file_vars:
             await _save_doc_variables(db, doc_id, file_vars)
-            await db.commit()
+        await touch_project(db, project_id)
+        await db.commit()
         cursor = await db.execute(
             "SELECT id, project_id, name, source_type, created_at, modified_at "
             "FROM document WHERE id=?",
@@ -296,6 +300,8 @@ async def upload_documents_bulk(
             file_vars = _parse_filename_variables_cached(pattern_settings, filename)
             if file_vars:
                 await _save_doc_variables(db, doc_id, file_vars)
+        if doc_ids:
+            await touch_project(db, project_id)
         await db.commit()
         # Fetch all inserted documents in one query
         if doc_ids:
@@ -336,8 +342,10 @@ async def parse_variables_bulk(project_id: int):
         for doc in docs:
             file_vars = _parse_filename_variables_cached(pattern_settings, doc["name"])
             if file_vars:
-                await _save_doc_variables(db, doc["id"], file_vars)
-                updated += 1
+                if await _save_doc_variables(db, doc["id"], file_vars):
+                    updated += 1
+        if updated:
+            await touch_project(db, project_id)
         await db.commit()
         return {"updated": updated, "total": len(docs)}
     finally:
@@ -351,10 +359,15 @@ async def delete_documents_bulk(data: BulkDeleteRequest):
     db = await get_db()
     try:
         placeholders = ",".join("?" * len(data.ids))
+        cursor = await db.execute(
+            f"SELECT DISTINCT project_id FROM document WHERE id IN ({placeholders})", data.ids
+        )
+        project_ids = [row["project_id"] for row in await cursor.fetchall()]
         await db.execute(f"DELETE FROM document WHERE id IN ({placeholders})", data.ids)
         await db.execute(
             f"DELETE FROM document_variable WHERE document_id IN ({placeholders})", data.ids
         )
+        await touch_projects(db, project_ids)
         await db.commit()
     finally:
         await db.close()
@@ -381,6 +394,11 @@ async def get_document(document_id: int):
 async def update_document(document_id: int, data: DocumentUpdate):
     db = await get_db()
     try:
+        current = await (
+            await db.execute("SELECT * FROM document WHERE id=?", (document_id,))
+        ).fetchone()
+        if not current:
+            raise HTTPException(404, "Document not found")
         # Only update fields the client actually sent (so label can be cleared to '')
         fields = data.model_dump(exclude_unset=True)
         updates = []
@@ -390,6 +408,8 @@ async def update_document(document_id: int, data: DocumentUpdate):
                 continue
             if field == "exclude_from_ai":
                 val = 1 if val else 0
+            if current[field] == val:
+                continue
             updates.append(f"{field}=?")
             values.append(val)
         if updates:
@@ -398,11 +418,11 @@ async def update_document(document_id: int, data: DocumentUpdate):
             await db.execute(
                 f"UPDATE document SET {', '.join(updates)} WHERE id=?", values
             )
-            await db.commit()
         cursor = await db.execute("SELECT * FROM document WHERE id=?", (document_id,))
         row = await cursor.fetchone()
-        if not row:
-            raise HTTPException(404, "Document not found")
+        if updates:
+            await touch_project(db, row["project_id"])
+            await db.commit()
         return dict(row)
     finally:
         await db.close()
@@ -412,7 +432,11 @@ async def update_document(document_id: int, data: DocumentUpdate):
 async def delete_document(document_id: int):
     db = await get_db()
     try:
+        cursor = await db.execute("SELECT project_id FROM document WHERE id=?", (document_id,))
+        row = await cursor.fetchone()
         await db.execute("DELETE FROM document WHERE id=?", (document_id,))
+        if row:
+            await touch_project(db, row["project_id"])
         await db.commit()
     finally:
         await db.close()
@@ -431,19 +455,27 @@ async def get_variables(document_id: int):
 async def set_variables(document_id: int, items: list[VariableUpdate]):
     db = await get_db()
     try:
+        cursor = await db.execute("SELECT project_id FROM document WHERE id=?", (document_id,))
+        doc = await cursor.fetchone()
+        current = await _get_doc_variables(db, document_id)
+        changed = False
         for item in items:
-            if item.value.strip():
+            if item.value.strip() and current.get(item.key) != item.value:
                 await db.execute(
                     "INSERT INTO document_variable (document_id, key, value) "
                     "VALUES (?, ?, ?) "
                     "ON CONFLICT(document_id, key) DO UPDATE SET value=excluded.value",
                     (document_id, item.key, item.value),
                 )
-            else:
+                changed = True
+            elif not item.value.strip() and item.key in current:
                 await db.execute(
                     "DELETE FROM document_variable WHERE document_id=? AND key=?",
                     (document_id, item.key),
                 )
+                changed = True
+        if changed and doc:
+            await touch_project(db, doc["project_id"])
         await db.commit()
         return await _get_doc_variables(db, document_id)
     finally:
@@ -454,10 +486,14 @@ async def set_variables(document_id: int, items: list[VariableUpdate]):
 async def delete_variable(document_id: int, key: str):
     db = await get_db()
     try:
-        await db.execute(
+        cursor = await db.execute("SELECT project_id FROM document WHERE id=?", (document_id,))
+        doc = await cursor.fetchone()
+        deleted = await db.execute(
             "DELETE FROM document_variable WHERE document_id=? AND key=?",
             (document_id, key),
         )
+        if doc and deleted.rowcount:
+            await touch_project(db, doc["project_id"])
         await db.commit()
         return await _get_doc_variables(db, document_id)
     finally:
@@ -553,6 +589,10 @@ async def transcribe_audio(document_id: int):
                 "WHERE id=?",
                 (transcript, document_id),
             )
+            await db.execute(
+                "DELETE FROM embedding_cache WHERE document_id=?", (document_id,)
+            )
+            await touch_project(db, doc["project_id"])
             await db.commit()
 
             cursor = await db.execute("SELECT * FROM document WHERE id=?", (document_id,))

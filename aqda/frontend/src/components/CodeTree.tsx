@@ -106,6 +106,20 @@ function CodeNode({
     },
   });
 
+  const confirmDelete = async () => {
+    try {
+      const impact = await codesApi.deleteImpact(code.id);
+      const details = impact.child_count > 0
+        ? `\n\nThis also moves ${impact.child_count} child code${impact.child_count === 1 ? '' : 's'} and ${impact.coding_count} coded segment${impact.coding_count === 1 ? '' : 's'} to the code trash.`
+        : `\n\n${impact.coding_count} coded segment${impact.coding_count === 1 ? '' : 's'} will move to the code trash.`;
+      if (confirm(`Move code "${code.name}" to trash?${details}\n\nRestoring this code will restore exactly this deletion.`)) {
+        deleteMut.mutate();
+      }
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'Could not inspect this code.');
+    }
+  };
+
   const hasChildren = (code.children?.length ?? 0) > 0;
   const isSelected = selectedCodeId === code.id;
   const isDragging = dnd.draggingId === code.id;
@@ -230,7 +244,7 @@ function CodeNode({
           <button
             onClick={(e) => {
               e.stopPropagation();
-              if (confirm(`Delete code "${code.name}"?`)) deleteMut.mutate();
+              confirmDelete();
             }}
             className="p-0.5 text-gray-400 hover:text-red-500"
           >

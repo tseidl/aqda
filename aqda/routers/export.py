@@ -8,8 +8,10 @@ import sqlite3
 import tempfile
 import uuid
 import zipfile
+import unicodedata
+from datetime import datetime, timezone
+from urllib.parse import quote
 from xml.etree.ElementTree import Element, SubElement, tostring
-from xml.sax.saxutils import escape as xml_escape
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -24,8 +26,28 @@ def _uuid() -> str:
 
 
 def _safe_xml_text(text: str) -> str:
-    """Escape text for safe inclusion in XML, handling CDATA-breaking sequences."""
-    return xml_escape(text)
+    """Remove XML-forbidden control characters; ElementTree performs escaping."""
+    return "".join(char for char in text if char in "\t\n\r" or ord(char) >= 0x20)
+
+
+def _download_headers(filename: str) -> dict[str, str]:
+    """Standards-compliant Unicode download name with a conservative fallback."""
+    clean = (
+        filename.replace("\r", " ")
+        .replace("\n", " ")
+        .replace('"', "'")
+        .replace("/", "-")
+        .replace("\\", "-")
+    )
+    fallback = (
+        unicodedata.normalize("NFKD", clean).encode("ascii", "ignore").decode("ascii")
+        or "aqda-export"
+    )
+    return {
+        "Content-Disposition": (
+            f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{quote(clean)}'
+        )
+    }
 
 
 def _xs_datetime(ts: str | None) -> str | None:
@@ -40,14 +62,20 @@ def _attrs(**kwargs) -> dict[str, str]:
     return {k: v for k, v in kwargs.items() if v is not None}
 
 
-async def _load_project_data(project_id: int, include_deleted: bool = False):
+async def _load_project_data(
+    project_id: int,
+    include_deleted: bool = False,
+    db=None,
+):
     """Load all project data for export.
 
     By default, soft-deleted (trashed) codes and codings are excluded so they
     never leak into interchange formats (REFI-QDA, codebook, CSV, JSON). The
     standalone .aqda backup passes include_deleted=True to preserve full state.
     """
-    db = await get_db()
+    owns_connection = db is None
+    if owns_connection:
+        db = await get_db()
     try:
         cursor = await db.execute("SELECT * FROM project WHERE id=?", (project_id,))
         project = await cursor.fetchone()
@@ -85,7 +113,8 @@ async def _load_project_data(project_id: int, include_deleted: bool = False):
 
         return dict(project), [dict(d) for d in documents], [dict(c) for c in codes], [dict(cg) for cg in codings], [dict(m) for m in memos]
     finally:
-        await db.close()
+        if owns_connection:
+            await db.close()
 
 
 async def _get_coder_name() -> str:
@@ -246,7 +275,7 @@ async def export_qdpx(project_id: int):
     return StreamingResponse(
         buf,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers=_download_headers(filename),
     )
 
 
@@ -270,7 +299,7 @@ async def export_codebook(project_id: int):
     return StreamingResponse(
         io.BytesIO(xml_bytes),
         media_type="application/xml",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers=_download_headers(filename),
     )
 
 
@@ -299,19 +328,38 @@ async def export_csv(project_id: int):
     return StreamingResponse(
         io.BytesIO(content),
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers=_download_headers(filename),
     )
 
 
 @router.get("/{project_id}/json")
 async def export_json(project_id: int):
-    """Export full project as JSON."""
+    """Export analysis-oriented project data as JSON (not an archive format)."""
     project, documents, codes, codings, memos = await _load_project_data(project_id)
 
-    # Strip content from documents in the top-level list (include separately)
-    docs_meta = [{k: v for k, v in d.items() if k != "content"} for d in documents]
+    db = await get_db()
+    try:
+        variables: dict[int, dict[str, str]] = {}
+        rows = await (
+            await db.execute(
+                "SELECT dv.document_id, dv.key, dv.value FROM document_variable dv "
+                "JOIN document d ON d.id=dv.document_id WHERE d.project_id=?",
+                (project_id,),
+            )
+        ).fetchall()
+        for row in rows:
+            variables.setdefault(row["document_id"], {})[row["key"]] = row["value"]
+    finally:
+        await db.close()
+
+    docs_meta = []
+    for document in documents:
+        metadata = {key: value for key, value in document.items() if key != "content"}
+        metadata["variables"] = variables.get(document["id"], {})
+        docs_meta.append(metadata)
 
     data = {
+        "format": "AQDA analysis export (documents exclude source content)",
         "project": project,
         "documents": docs_meta,
         "codes": codes,
@@ -324,19 +372,48 @@ async def export_json(project_id: int):
     return StreamingResponse(
         io.BytesIO(content),
         media_type="application/json",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers=_download_headers(filename),
     )
 
 
-@router.get("/{project_id}/aqda")
-async def export_aqda(project_id: int):
-    """Export a single project as a standalone .aqda (SQLite) file for sharing."""
-    # Full backup: keep trashed codes/codings so the file round-trips exactly.
-    project, documents, codes, codings, memos = await _load_project_data(project_id, include_deleted=True)
-
-    # Also load document variables
+async def build_aqda_snapshot(project_id: int) -> tuple[bytes, dict, str]:
+    """Build a coherent immutable project snapshot and return bytes, project, ID."""
+    # Capture project data and its new snapshot record under one write lock. This
+    # ensures the package contents and revision metadata describe the same state.
     db = await get_db()
     try:
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute("SELECT * FROM project WHERE id=?", (project_id,))
+        current = await cursor.fetchone()
+        if not current:
+            raise HTTPException(404, "Project not found")
+
+        cursor = await db.execute("SELECT value FROM setting WHERE key='coder_name'")
+        coder_row = await cursor.fetchone()
+        created_by = ((coder_row["value"] if coder_row else "") or "").strip() or "AQDA User"
+        snapshot_id = _uuid()
+        created_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        await db.execute(
+            "INSERT INTO project_snapshot "
+            "(snapshot_id, project_id, parent_snapshot_id, revision, created_at, created_by) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                snapshot_id,
+                project_id,
+                current["head_snapshot_id"],
+                current["revision"],
+                created_at,
+                created_by,
+            ),
+        )
+        await db.execute(
+            "UPDATE project SET head_snapshot_id=? WHERE id=?", (snapshot_id, project_id)
+        )
+
+        # Full snapshot: keep trashed codes/codings so round-tripping is exact.
+        project, documents, codes, codings, memos = await _load_project_data(
+            project_id, include_deleted=True, db=db
+        )
         doc_ids = [d["id"] for d in documents]
         doc_vars = []
         if doc_ids:
@@ -346,21 +423,62 @@ async def export_aqda(project_id: int):
                 doc_ids,
             )
             doc_vars = [dict(r) for r in await cursor.fetchall()]
+        cursor = await db.execute(
+            "SELECT snapshot_id, parent_snapshot_id, revision, created_at, created_by "
+            "FROM project_snapshot WHERE project_id=? ORDER BY created_at",
+            (project_id,),
+        )
+        snapshot_history = [dict(row) for row in await cursor.fetchall()]
+        cursor = await db.execute(
+            "SELECT id, root_code_id, deleted_at FROM code_deletion_batch "
+            "WHERE project_id=? ORDER BY deleted_at",
+            (project_id,),
+        )
+        deletion_batches = [dict(row) for row in await cursor.fetchall()]
+        await db.commit()
+    except Exception:
+        if db.in_transaction:
+            await db.rollback()
+        raise
     finally:
         await db.close()
 
     # Build a standalone SQLite database with just this project
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
     tmp.close()
+    con = None
     try:
         con = sqlite3.connect(tmp.name)
         con.executescript(SCHEMA)
 
         # Insert project with id=1
         con.execute(
-            "INSERT INTO project (id, name, description, created_at, modified_at) VALUES (1, ?, ?, ?, ?)",
-            (project["name"], project["description"], project["created_at"], project["modified_at"]),
+            "INSERT INTO project (id, name, description, created_at, modified_at, lineage_id, "
+            "revision, head_snapshot_id) VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                project["name"],
+                project["description"],
+                project["created_at"],
+                project["modified_at"],
+                project["lineage_id"],
+                project["revision"],
+                project["head_snapshot_id"],
+            ),
         )
+
+        for snapshot in snapshot_history:
+            con.execute(
+                "INSERT INTO project_snapshot "
+                "(snapshot_id, project_id, parent_snapshot_id, revision, created_at, created_by) "
+                "VALUES (?, 1, ?, ?, ?, ?)",
+                (
+                    snapshot["snapshot_id"],
+                    snapshot["parent_snapshot_id"],
+                    snapshot["revision"],
+                    snapshot["created_at"],
+                    snapshot["created_by"],
+                ),
+            )
 
         # Documents — remap IDs sequentially
         doc_map: dict[int, int] = {}
@@ -387,46 +505,81 @@ async def export_aqda(project_id: int):
         code_map: dict[int, int] = {}
         for i, code in enumerate(codes, 1):
             code_map[code["id"]] = i
+        for batch in deletion_batches:
+            root_code_id = code_map.get(batch["root_code_id"])
+            if root_code_id is not None:
+                con.execute(
+                    "INSERT INTO code_deletion_batch "
+                    "(id, project_id, root_code_id, deleted_at) VALUES (?, 1, ?, ?)",
+                    (batch["id"], root_code_id, batch["deleted_at"]),
+                )
         for i, code in enumerate(codes, 1):
             new_parent = code_map.get(code["parent_id"]) if code["parent_id"] else None
             con.execute(
-                "INSERT INTO code (id, project_id, parent_id, name, description, color, sort_order, created_at, deleted_at) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)",
-                (i, new_parent, code["name"], code["description"], code["color"], code["sort_order"], code["created_at"], code.get("deleted_at")),
+                "INSERT INTO code (id, project_id, parent_id, name, description, color, "
+                "sort_order, created_at, deleted_at, deletion_batch_id) "
+                "VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (i, new_parent, code["name"], code["description"], code["color"],
+                 code["sort_order"], code["created_at"], code.get("deleted_at"),
+                 code.get("deletion_batch_id")),
             )
 
         # Codings
+        coding_map: dict[int, int] = {}
         for cg in codings:
             new_doc = doc_map.get(cg["document_id"])
             new_code = code_map.get(cg["code_id"])
             if new_doc and new_code:
-                con.execute(
-                    "INSERT INTO coding (document_id, code_id, start_pos, end_pos, selected_text, coder, created_at, deleted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (new_doc, new_code, cg["start_pos"], cg["end_pos"], cg["selected_text"], cg.get("coder", ""), cg["created_at"], cg.get("deleted_at")),
+                cursor = con.execute(
+                    "INSERT INTO coding (document_id, code_id, start_pos, end_pos, selected_text, "
+                    "coder, created_at, deleted_at, deletion_batch_id, offset_unit, repair_status) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (new_doc, new_code, cg["start_pos"], cg["end_pos"], cg["selected_text"],
+                     cg.get("coder", ""), cg["created_at"], cg.get("deleted_at"),
+                     cg.get("deletion_batch_id"), cg.get("offset_unit", "codepoint"),
+                     cg.get("repair_status")),
                 )
+                coding_map[cg["id"]] = cursor.lastrowid
 
         # Memos
         for memo in memos:
             con.execute(
-                "INSERT INTO memo (project_id, document_id, code_id, start_pos, end_pos, title, content, created_at, modified_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO memo (project_id, document_id, code_id, coding_id, start_pos, "
+                "end_pos, title, content, created_at, modified_at, offset_unit, repair_status) "
+                "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (doc_map.get(memo["document_id"]), code_map.get(memo["code_id"]),
+                 coding_map.get(memo.get("coding_id")),
                  memo.get("start_pos"), memo.get("end_pos"),
-                 memo["title"], memo["content"], memo["created_at"], memo["modified_at"]),
+                 memo["title"], memo["content"], memo["created_at"], memo["modified_at"],
+                 memo.get("offset_unit", "codepoint"), memo.get("repair_status")),
             )
 
         con.commit()
+        integrity = con.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or integrity[0] != "ok":
+            raise RuntimeError(f"Snapshot integrity check failed: {integrity}")
         con.close()
+        con = None
 
         # Read the file into memory so we can clean up the temp file
         with open(tmp.name, "rb") as f:
             data = f.read()
     finally:
+        if con is not None:
+            con.close()
         os.unlink(tmp.name)
 
-    from datetime import date
-    slug = project['name'].replace(' ', '_')
-    filename = f"{slug}_{date.today().isoformat()}.aqda"
+    return data, project, snapshot_id
+
+
+@router.get("/{project_id}/aqda")
+async def export_aqda(project_id: int):
+    """Download an immutable, lineage-aware project snapshot."""
+    data, project, snapshot_id = await build_aqda_snapshot(project_id)
+    slug = project["name"].replace(" ", "_")
+    filename = f"{slug}_r{project['revision']}_{snapshot_id[:8]}.aqda"
     return StreamingResponse(
         io.BytesIO(data),
         media_type="application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers=_download_headers(filename),
     )

@@ -22,6 +22,53 @@ export interface Project {
   modified_at: string;
   doc_count?: number;
   code_count?: number;
+  lineage_id?: string;
+  revision?: number;
+  head_snapshot_id?: string | null;
+  shared_folder?: string | null;
+  shared_last_published_revision?: number | null;
+  shared_last_snapshot_id?: string | null;
+  shared_last_sync_at?: string | null;
+  shared_sync_error?: string | null;
+}
+
+export interface SharedDiscoveredProject {
+  folder: string;
+  name: string;
+  lineage_id: string;
+  revision: number;
+  updated_at: string;
+  updated_by: string;
+  head_count: number;
+  linked_project_id?: number | null;
+}
+
+export interface SharedStatus {
+  root: string;
+  linked: Project[];
+  discovered: SharedDiscoveredProject[];
+  backup_folder: string;
+  backup_count: number;
+  latest_backup?: string | null;
+}
+
+export interface ProjectImportConflict {
+  id: number;
+  name: string;
+  incoming_name: string;
+  lineage_id: string;
+  local_revision: number;
+  incoming_revision: number;
+  incoming_coder?: string;
+  trashed?: boolean;
+}
+
+export interface ProjectImportResult {
+  imported: { id: number; name: string; action: 'create' | 'update' | 'copy'; lineage_id: string }[];
+  conflicts: ProjectImportConflict[];
+  unchanged: { id: number; name: string; lineage_id: string; reason: 'unchanged' | 'local_newer' }[];
+  count: number;
+  backup_path?: string | null;
 }
 
 export interface Document {
@@ -60,6 +107,8 @@ export interface Coding {
   end_pos: number;
   selected_text: string;
   coder?: string;
+  offset_unit?: 'codepoint' | 'legacy_utf16';
+  repair_status?: string | null;
   created_at: string;
   code_name?: string;
   code_color?: string;
@@ -152,9 +201,19 @@ export const projects = {
     request<Project>(`/projects/${id}/restore`, { method: 'POST' }),
   deletePermanent: (id: number) =>
     request<void>(`/projects/${id}/permanent`, { method: 'DELETE' }),
-  importDb: async (file: File): Promise<{ imported: { id: number; name: string }[]; count: number }> => {
+  importDb: async ({
+    file,
+    mode = 'auto',
+    targetLineageId,
+  }: {
+    file: File;
+    mode?: 'auto' | 'copy' | 'replace';
+    targetLineageId?: string;
+  }): Promise<ProjectImportResult> => {
     const form = new FormData();
     form.append('file', file);
+    form.append('mode', mode);
+    if (targetLineageId) form.append('target_lineage_id', targetLineageId);
     const res = await fetch(`${BASE}/projects/import-db`, { method: 'POST', body: form });
     if (!res.ok) {
       const text = await res.text();
@@ -168,6 +227,36 @@ export const projects = {
     }
     return res.json();
   },
+};
+
+export const shared = {
+  status: () => request<SharedStatus>('/shared'),
+  chooseFolder: () => request<{ path: string; discovered: SharedDiscoveredProject[] }>(
+    '/shared/folder/pick', { method: 'POST' }
+  ),
+  setFolder: (path: string) =>
+    request<{ path: string; discovered: SharedDiscoveredProject[] }>('/shared/folder', {
+      method: 'PUT', body: JSON.stringify({ path }),
+    }),
+  shareProject: (projectId: number) =>
+    request<{ project_id: number; folder: string; published: boolean }>(
+      `/shared/projects/${projectId}/share`, { method: 'POST' }
+    ),
+  syncProject: (projectId: number) =>
+    request(`/shared/projects/${projectId}/sync`, { method: 'POST' }),
+  syncAll: () => request('/shared/sync', { method: 'POST' }),
+  openProject: (folder: string) =>
+    request<{ project_id: number; name: string }>('/shared/open', {
+      method: 'POST', body: JSON.stringify({ folder }),
+    }),
+  unlinkProject: (projectId: number) =>
+    request<void>(`/shared/projects/${projectId}/link`, { method: 'DELETE' }),
+};
+
+export const system = {
+  shutdown: () => request<{ closing: boolean; message: string }>('/system/shutdown', {
+    method: 'POST',
+  }),
 };
 
 export const documents = {
@@ -234,6 +323,10 @@ export const codes = {
     request<Code>(`/codes/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   delete: (id: number) =>
     request<void>(`/codes/${id}`, { method: 'DELETE' }),
+  deleteImpact: (id: number) =>
+    request<{ name: string; code_count: number; child_count: number; coding_count: number }>(
+      `/codes/${id}/delete-impact`
+    ),
   trash: (projectId: number) => request<Code[]>(`/codes/trash?project_id=${projectId}`),
   restore: (id: number) =>
     request<Code>(`/codes/${id}/restore`, { method: 'POST' }),

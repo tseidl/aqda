@@ -2,13 +2,15 @@ import { useState, useEffect } from 'react';
 import { useQuery, useMutation } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { ArrowLeft, RefreshCw, Check, FolderOpen, Power } from 'lucide-react';
-import { settings as settingsApi } from '../api';
+import { settings as settingsApi, shared } from '../api';
+import { CloseAqdaButton } from '../components/CloseAqdaButton';
 
 export function SettingsPage() {
   const [form, setForm] = useState<Record<string, string>>({});
   const [saved, setSaved] = useState(false);
   const [saveError, setSaveError] = useState<Record<string, string> | null>(null);
   const [starting, setStarting] = useState(false);
+  const [sharedPath, setSharedPath] = useState('');
 
   const { data: currentSettings } = useQuery({
     queryKey: ['settings'],
@@ -18,6 +20,28 @@ export function SettingsPage() {
   const { data: dataDirInfo } = useQuery({
     queryKey: ['data-dir'],
     queryFn: settingsApi.dataDir,
+  });
+
+  const { data: sharedStatus, refetch: refetchShared } = useQuery({
+    queryKey: ['shared-status'],
+    queryFn: shared.status,
+  });
+
+  useEffect(() => {
+    if (sharedStatus?.root) setSharedPath(sharedStatus.root);
+  }, [sharedStatus]);
+
+  const chooseSharedMut = useMutation({
+    mutationFn: shared.chooseFolder,
+    onSuccess: (result) => {
+      setSharedPath(result.path);
+      refetchShared();
+    },
+  });
+
+  const setSharedMut = useMutation({
+    mutationFn: () => shared.setFolder(sharedPath),
+    onSuccess: () => refetchShared(),
   });
 
   const { data: ollamaStatus, refetch: refreshModels } = useQuery({
@@ -74,7 +98,8 @@ export function SettingsPage() {
           <Link to="/" className="p-1.5 text-gray-500 hover:text-gray-700 rounded hover:bg-gray-100">
             <ArrowLeft size={18} />
           </Link>
-          <h1 className="text-xl font-semibold text-gray-900">Settings</h1>
+          <h1 className="text-xl font-semibold text-gray-900 flex-1">Settings</h1>
+          <CloseAqdaButton />
         </div>
       </header>
 
@@ -109,12 +134,68 @@ export function SettingsPage() {
               </div>
             </div>
             <p className="text-xs text-gray-400">
-              All projects and data are stored in this single SQLite file. You can back it up, share it via cloud storage (Google Drive, Dropbox), or move it to another machine.
+              AQDA keeps its working database private on this computer. Do not place this live file in Google Drive or Dropbox.
               To change the location, set the <code className="bg-gray-100 px-1 rounded">AQDA_DATA_DIR</code> environment variable before starting AQDA.
             </p>
             <div className="text-xs text-gray-500 bg-gray-50 rounded p-2 font-mono">
               AQDA_DATA_DIR=/path/to/folder aqda
             </div>
+          </div>
+        </section>
+
+        {/* Collaboration */}
+        <section>
+          <h2 className="text-lg font-medium text-gray-800 mb-4">Collaboration</h2>
+          <div className="bg-white rounded-lg border border-gray-200 p-4 space-y-4">
+            <div className="rounded-lg bg-blue-50 p-3 text-sm text-blue-900 space-y-1">
+              <p className="font-medium">One shared folder, no manual saving</p>
+              <p className="text-xs text-blue-800">
+                Choose a Google Drive, Dropbox, or other synced folder. AQDA works from a hidden safe copy, saves every change immediately, and publishes complete snapshots in the background. If two people work at once, both versions are kept.
+              </p>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Collaboration folder</label>
+              <div className="flex gap-2">
+                <input
+                  value={sharedPath}
+                  onChange={(event) => setSharedPath(event.target.value)}
+                  className="flex-1 px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  placeholder="Choose your Google Drive or Dropbox folder"
+                />
+                <button
+                  onClick={() => chooseSharedMut.mutate()}
+                  disabled={chooseSharedMut.isPending}
+                  className="px-3 py-2 bg-gray-100 text-gray-700 rounded-md text-sm hover:bg-gray-200 disabled:opacity-50"
+                >
+                  Browse…
+                </button>
+                <button
+                  onClick={() => setSharedMut.mutate()}
+                  disabled={!sharedPath.trim() || setSharedMut.isPending}
+                  className="px-3 py-2 bg-indigo-600 text-white rounded-md text-sm hover:bg-indigo-700 disabled:opacity-50"
+                >
+                  Use folder
+                </button>
+              </div>
+              {(chooseSharedMut.error || setSharedMut.error) && (
+                <p className="text-xs text-red-600 mt-1">
+                  {(chooseSharedMut.error as Error | null)?.message ?? (setSharedMut.error as Error | null)?.message}
+                </p>
+              )}
+            </div>
+            <div className="grid grid-cols-2 gap-3 text-xs">
+              <div className="rounded-md bg-gray-50 border border-gray-200 p-3">
+                <p className="font-medium text-gray-700">Shared projects</p>
+                <p className="text-gray-500 mt-1">{sharedStatus?.discovered.length ?? 0} found in this folder</p>
+              </div>
+              <div className="rounded-md bg-gray-50 border border-gray-200 p-3">
+                <p className="font-medium text-gray-700">Safety backups</p>
+                <p className="text-gray-500 mt-1">{sharedStatus?.backup_count ?? 0} in {sharedStatus?.backup_folder ?? 'the AQDA data folder'}</p>
+              </div>
+            </div>
+            <p className="text-xs text-gray-500">
+              You do not need a Save button. Closing AQDA with the Close AQDA button or pressing Ctrl+C once performs a final sync. If the computer stops unexpectedly, the hidden local copy is recovered and synced next time.
+            </p>
           </div>
         </section>
 

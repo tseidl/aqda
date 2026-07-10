@@ -5,16 +5,21 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from aqda.db import init_db
-from aqda.routers import projects, documents, codes, codings, memos, settings, ai, export
+from aqda.routers import projects, documents, codes, codings, memos, settings, ai, export, shared, system
+from aqda.services.shared_projects import start_sync_service, stop_sync_service
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    yield
+    await start_sync_service()
+    try:
+        yield
+    finally:
+        await stop_sync_service()
 
 
 app = FastAPI(title="AQDA", version="0.2.0", lifespan=lifespan)
@@ -28,6 +33,16 @@ app.include_router(memos.router, prefix="/api/memos", tags=["memos"])
 app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
 app.include_router(ai.router, prefix="/api/ai", tags=["ai"])
 app.include_router(export.router, prefix="/api/export", tags=["export"])
+app.include_router(shared.router, prefix="/api/shared", tags=["shared"])
+app.include_router(system.router, prefix="/api/system", tags=["system"])
+
+
+@app.api_route(
+    "/api/{path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+)
+async def api_not_found(path: str):
+    return JSONResponse({"detail": f"API route not found: /api/{path}"}, status_code=404)
 
 # Serve frontend
 FRONTEND_DIR = Path(__file__).parent / "frontend" / "dist"

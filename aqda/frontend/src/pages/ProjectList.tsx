@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, Link } from 'react-router-dom';
-import { Plus, FolderOpen, Trash2, Settings, FileText, Tags, Upload, RotateCcw, ChevronDown, X } from 'lucide-react';
-import { projects, type Project } from '../api';
+import { Plus, FolderOpen, Trash2, Settings, FileText, Tags, Upload, RotateCcw, ChevronDown, X, AlertTriangle, Cloud, RefreshCw } from 'lucide-react';
+import { projects, shared, type Project, type ProjectImportConflict } from '../api';
+import { CloseAqdaButton } from '../components/CloseAqdaButton';
 
 export function ProjectList() {
   const navigate = useNavigate();
@@ -12,16 +13,45 @@ export function ProjectList() {
   const [newDesc, setNewDesc] = useState('');
   const [showTrash, setShowTrash] = useState(false);
   const [importMsg, setImportMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [pendingConflict, setPendingConflict] = useState<{
+    file: File;
+    conflicts: ProjectImportConflict[];
+  } | null>(null);
 
   const { data: projectList = [], isLoading } = useQuery({
     queryKey: ['projects'],
     queryFn: projects.list,
+    refetchInterval: 3000,
   });
 
   const { data: trashList = [] } = useQuery({
     queryKey: ['projects-trash'],
     queryFn: projects.trash,
     enabled: showTrash,
+  });
+
+  const { data: sharedStatus } = useQuery({
+    queryKey: ['shared-status'],
+    queryFn: shared.status,
+    refetchInterval: 5000,
+  });
+
+  const openSharedMut = useMutation({
+    mutationFn: (folder: string) => shared.openProject(folder),
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: ['projects'] });
+      queryClient.invalidateQueries({ queryKey: ['shared-status'] });
+      navigate(`/project/${result.project_id}`);
+    },
+    onError: (err: Error) => setImportMsg({ ok: false, text: `Could not open shared project: ${err.message}` }),
+  });
+
+  const syncMut = useMutation({
+    mutationFn: shared.syncAll,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['projects'] });
+      queryClient.invalidateQueries({ queryKey: ['shared-status'] });
+    },
   });
 
   const createMut = useMutation({
@@ -55,14 +85,44 @@ export function ProjectList() {
 
   const importMut = useMutation({
     mutationFn: projects.importDb,
-    onSuccess: (result) => {
+    onSuccess: (result, variables) => {
       queryClient.invalidateQueries({ queryKey: ['projects'] });
-      if (result.count === 0) {
-        setImportMsg({ ok: false, text: 'No projects found in that file.' });
-      } else if (result.count === 1) {
-        setImportMsg({ ok: true, text: `Imported "${result.imported[0].name}".` });
+      if (variables.mode === 'copy') {
+        setPendingConflict((current) => {
+          if (!current || !variables.targetLineageId) return null;
+          const remaining = current.conflicts.filter(
+            (item) => item.lineage_id !== variables.targetLineageId
+          );
+          return remaining.length ? { ...current, conflicts: remaining } : null;
+        });
+      } else if (result.conflicts.length) {
+        setPendingConflict({ file: variables.file, conflicts: result.conflicts });
       } else {
-        setImportMsg({ ok: true, text: `Imported ${result.count} projects.` });
+        setPendingConflict(null);
+      }
+
+      const updated = result.imported.filter((item) => item.action === 'update');
+      const copied = result.imported.filter((item) => item.action === 'copy');
+      const created = result.imported.filter((item) => item.action === 'create');
+      if (updated.length === 1) {
+        setImportMsg({
+          ok: true,
+          text: `Updated "${updated[0].name}" from the shared snapshot. A safety backup was created.`,
+        });
+      } else if (copied.length === 1) {
+        setImportMsg({ ok: true, text: `Kept both versions. The incoming work is "${copied[0].name}".` });
+      } else if (created.length === 1) {
+        setImportMsg({ ok: true, text: `Imported "${created[0].name}".` });
+      } else if (result.count > 1) {
+        setImportMsg({ ok: true, text: `Imported or updated ${result.count} projects.` });
+      } else if (result.unchanged.some((item) => item.reason === 'local_newer')) {
+        setImportMsg({ ok: true, text: 'Your local project is already newer than this snapshot; nothing was replaced.' });
+      } else if (result.unchanged.length) {
+        setImportMsg({ ok: true, text: 'This snapshot has already been imported; nothing changed.' });
+      } else if (result.conflicts.length) {
+        setImportMsg(null);
+      } else if (result.count === 0) {
+        setImportMsg({ ok: false, text: 'No projects found in that file.' });
       }
     },
     onError: (err: Error) => {
@@ -77,7 +137,8 @@ export function ProjectList() {
     input.onchange = () => {
       if (input.files?.length) {
         setImportMsg(null);
-        importMut.mutate(input.files[0]);
+        setPendingConflict(null);
+        importMut.mutate({ file: input.files[0] });
       }
     };
     input.click();
@@ -88,12 +149,15 @@ export function ProjectList() {
       <header className="bg-white border-b border-gray-200">
         <div className="max-w-5xl mx-auto px-6 py-4 flex items-center justify-between">
           <h1 className="text-xl font-semibold text-gray-900">AQDA</h1>
-          <Link
-            to="/settings"
-            className="p-2 text-gray-500 hover:text-gray-700 rounded-lg hover:bg-gray-100"
-          >
-            <Settings size={20} />
-          </Link>
+          <div className="flex items-center gap-1">
+            <CloseAqdaButton />
+            <Link
+              to="/settings"
+              className="p-2 text-gray-500 hover:text-gray-700 rounded-lg hover:bg-gray-100"
+            >
+              <Settings size={20} />
+            </Link>
+          </div>
         </div>
       </header>
 
@@ -135,6 +199,102 @@ export function ProjectList() {
               <X size={14} />
             </button>
           </div>
+        )}
+
+        {pendingConflict && pendingConflict.conflicts.map((conflict) => (
+          <div
+            key={conflict.lineage_id}
+            className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 mb-4 text-sm text-amber-900"
+          >
+            <div className="flex items-start gap-3">
+              <AlertTriangle size={18} className="mt-0.5 shrink-0 text-amber-600" />
+              <div className="flex-1">
+                <p className="font-medium">
+                  {conflict.trashed ? `“${conflict.name}” is currently in your trash` : `Both copies of “${conflict.name}” were edited`}
+                </p>
+                <p className="text-xs text-amber-800 mt-1">
+                  AQDA did not overwrite either version. Keep both, or use the incoming version after creating a full safety backup.
+                </p>
+                <div className="flex gap-2 mt-3">
+                  <button
+                    onClick={() => importMut.mutate({
+                      file: pendingConflict.file,
+                      mode: 'copy',
+                      targetLineageId: conflict.lineage_id,
+                    })}
+                    disabled={importMut.isPending}
+                    className="px-3 py-1.5 rounded-md bg-amber-600 text-white text-xs font-medium hover:bg-amber-700 disabled:opacity-50"
+                  >
+                    Keep both versions
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (confirm('Replace your local version with the incoming one? AQDA will create a full safety backup first.')) {
+                        importMut.mutate({
+                          file: pendingConflict.file,
+                          mode: 'replace',
+                          targetLineageId: conflict.lineage_id,
+                        });
+                      }
+                    }}
+                    disabled={importMut.isPending}
+                    className="px-3 py-1.5 rounded-md bg-white border border-amber-300 text-amber-800 text-xs font-medium hover:bg-amber-100 disabled:opacity-50"
+                  >
+                    Use incoming version
+                  </button>
+                  <button
+                    onClick={() => setPendingConflict(null)}
+                    className="px-3 py-1.5 rounded-md bg-white border border-amber-300 text-amber-800 text-xs hover:bg-amber-100"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        ))}
+
+        {sharedStatus?.root && sharedStatus.discovered.some((item) => !item.linked_project_id) && (
+          <section className="rounded-lg border border-blue-200 bg-blue-50 p-4 mb-4">
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <h3 className="text-sm font-medium text-blue-900 flex items-center gap-2">
+                  <Cloud size={16} /> Shared projects available
+                </h3>
+                <p className="text-xs text-blue-700 mt-1">
+                  Open once; AQDA will then save and sync these projects automatically.
+                </p>
+              </div>
+              <button
+                onClick={() => syncMut.mutate()}
+                disabled={syncMut.isPending}
+                className="p-2 text-blue-600 hover:bg-blue-100 rounded-md"
+                title="Check for shared changes now"
+              >
+                <RefreshCw size={15} className={syncMut.isPending ? 'animate-spin' : ''} />
+              </button>
+            </div>
+            <div className="space-y-2">
+              {sharedStatus.discovered.filter((item) => !item.linked_project_id).map((item) => (
+                <div key={`${item.folder}-${item.lineage_id}`} className="flex items-center justify-between bg-white rounded-md border border-blue-100 px-3 py-2">
+                  <div>
+                    <p className="text-sm font-medium text-gray-800">{item.name}</p>
+                    <p className="text-xs text-gray-500">
+                      {item.updated_by ? `Last saved by ${item.updated_by}` : 'Shared AQDA project'}
+                      {item.head_count > 1 ? ' · concurrent versions detected' : ''}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => openSharedMut.mutate(item.folder)}
+                    disabled={openSharedMut.isPending}
+                    className="px-3 py-1.5 rounded-md bg-blue-600 text-white text-xs font-medium hover:bg-blue-700 disabled:opacity-50"
+                  >
+                    Open project
+                  </button>
+                </div>
+              ))}
+            </div>
+          </section>
         )}
 
         {showNew && (
@@ -195,9 +355,26 @@ export function ProjectList() {
                 onClick={() => navigate(`/project/${p.id}`)}
               >
                 <div>
-                  <h3 className="font-medium text-gray-900">{p.name}</h3>
+                  <div className="flex items-center gap-2">
+                    <h3 className="font-medium text-gray-900">{p.name}</h3>
+                    {p.shared_folder && (
+                      <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium ${
+                        p.shared_sync_error
+                          ? 'bg-amber-100 text-amber-800'
+                          : p.revision === p.shared_last_published_revision
+                            ? 'bg-green-100 text-green-700'
+                            : 'bg-blue-100 text-blue-700'
+                      }`}>
+                        <Cloud size={11} />
+                        {p.shared_sync_error ? 'Kept both versions' : p.revision === p.shared_last_published_revision ? 'Shared · saved' : 'Shared · saving'}
+                      </span>
+                    )}
+                  </div>
                   {p.description && (
                     <p className="text-sm text-gray-500 mt-0.5">{p.description}</p>
+                  )}
+                  {p.shared_sync_error && (
+                    <p className="text-xs text-amber-700 mt-1">{p.shared_sync_error}</p>
                   )}
                   <div className="flex gap-4 mt-2 text-xs text-gray-400">
                     <span className="flex items-center gap-1"><FileText size={12} /> {p.doc_count ?? 0} docs</span>

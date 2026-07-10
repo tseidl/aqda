@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Trash2 } from 'lucide-react';
+import { AlertTriangle, Trash2 } from 'lucide-react';
 import { codings as codingsApi, type Code, type Coding } from '../api';
 
 interface Props {
@@ -108,6 +108,14 @@ export function SegmentsBrowser({ projectId, codes, onNavigate }: Props) {
                 </span>
                 {coding.coder && (
                   <span className="text-[10px] text-gray-400 shrink-0" title="Coder">{coding.coder}</span>
+                )}
+                {coding.repair_status?.startsWith('review_') && (
+                  <span
+                    className="text-amber-600 shrink-0"
+                    title="AQDA repaired this older segment to the nearest matching text. Please verify it."
+                  >
+                    <AlertTriangle size={12} />
+                  </span>
                 )}
                 <button
                   onClick={(e) => { e.stopPropagation(); deleteCodingMut.mutate(coding.id); }}

@@ -2,6 +2,9 @@
 
 import aiosqlite
 import os
+import sqlite3
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 DATA_DIR = Path(os.environ.get("AQDA_DATA_DIR", Path.home() / ".aqda"))
@@ -13,7 +16,15 @@ CREATE TABLE IF NOT EXISTS project (
     description TEXT DEFAULT '',
     created_at TEXT DEFAULT (datetime('now')),
     modified_at TEXT DEFAULT (datetime('now')),
-    deleted_at TEXT DEFAULT NULL
+    deleted_at TEXT DEFAULT NULL,
+    lineage_id TEXT DEFAULT NULL,
+    revision INTEGER NOT NULL DEFAULT 0,
+    head_snapshot_id TEXT DEFAULT NULL,
+    shared_folder TEXT DEFAULT NULL,
+    shared_last_published_revision INTEGER DEFAULT NULL,
+    shared_last_snapshot_id TEXT DEFAULT NULL,
+    shared_last_sync_at TEXT DEFAULT NULL,
+    shared_sync_error TEXT DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS document (
@@ -38,7 +49,8 @@ CREATE TABLE IF NOT EXISTS code (
     color TEXT DEFAULT '#6366f1',
     sort_order INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now')),
-    deleted_at TEXT DEFAULT NULL
+    deleted_at TEXT DEFAULT NULL,
+    deletion_batch_id TEXT DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS coding (
@@ -50,7 +62,10 @@ CREATE TABLE IF NOT EXISTS coding (
     selected_text TEXT NOT NULL,
     coder TEXT DEFAULT '',
     created_at TEXT DEFAULT (datetime('now')),
-    deleted_at TEXT DEFAULT NULL
+    deleted_at TEXT DEFAULT NULL,
+    deletion_batch_id TEXT DEFAULT NULL,
+    offset_unit TEXT NOT NULL DEFAULT 'codepoint',
+    repair_status TEXT DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS memo (
@@ -64,7 +79,9 @@ CREATE TABLE IF NOT EXISTS memo (
     title TEXT DEFAULT '',
     content TEXT DEFAULT '',
     created_at TEXT DEFAULT (datetime('now')),
-    modified_at TEXT DEFAULT (datetime('now'))
+    modified_at TEXT DEFAULT (datetime('now')),
+    offset_unit TEXT NOT NULL DEFAULT 'codepoint',
+    repair_status TEXT DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS document_variable (
@@ -91,7 +108,33 @@ INSERT OR IGNORE INTO setting (key, value) VALUES
     ('filename_variables', ''),
     ('whisper_model', 'base'),
     ('coder_name', ''),
-    ('schema_version', '7');
+    ('shared_folder', ''),
+    ('device_id', ''),
+    ('schema_version', '9');
+
+CREATE TABLE IF NOT EXISTS project_snapshot (
+    snapshot_id TEXT PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+    parent_snapshot_id TEXT DEFAULT NULL,
+    revision INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    created_by TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_snapshot_project ON project_snapshot(project_id, created_at);
+
+CREATE TABLE IF NOT EXISTS code_deletion_batch (
+    id TEXT PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+    root_code_id INTEGER NOT NULL,
+    deleted_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS shared_ignored_head (
+    project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+    snapshot_id TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (project_id, snapshot_id)
+);
 
 CREATE TABLE IF NOT EXISTS embedding_cache (
     id TEXT PRIMARY KEY,
@@ -143,7 +186,50 @@ MIGRATIONS = {
     7: [
         "ALTER TABLE coding ADD COLUMN coder TEXT DEFAULT ''",
     ],
+    8: [
+        "ALTER TABLE project ADD COLUMN lineage_id TEXT DEFAULT NULL",
+        "ALTER TABLE project ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE project ADD COLUMN head_snapshot_id TEXT DEFAULT NULL",
+        """CREATE TABLE IF NOT EXISTS project_snapshot (
+            snapshot_id TEXT PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+            parent_snapshot_id TEXT DEFAULT NULL,
+            revision INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            created_by TEXT DEFAULT ''
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_snapshot_project ON project_snapshot(project_id, created_at)",
+    ],
+    9: [
+        "ALTER TABLE project ADD COLUMN shared_folder TEXT DEFAULT NULL",
+        "ALTER TABLE project ADD COLUMN shared_last_published_revision INTEGER DEFAULT NULL",
+        "ALTER TABLE project ADD COLUMN shared_last_snapshot_id TEXT DEFAULT NULL",
+        "ALTER TABLE project ADD COLUMN shared_last_sync_at TEXT DEFAULT NULL",
+        "ALTER TABLE project ADD COLUMN shared_sync_error TEXT DEFAULT NULL",
+        "ALTER TABLE code ADD COLUMN deletion_batch_id TEXT DEFAULT NULL",
+        "ALTER TABLE coding ADD COLUMN deletion_batch_id TEXT DEFAULT NULL",
+        "ALTER TABLE coding ADD COLUMN offset_unit TEXT NOT NULL DEFAULT 'legacy_utf16'",
+        "ALTER TABLE coding ADD COLUMN repair_status TEXT DEFAULT NULL",
+        "ALTER TABLE memo ADD COLUMN offset_unit TEXT NOT NULL DEFAULT 'legacy_utf16'",
+        "ALTER TABLE memo ADD COLUMN repair_status TEXT DEFAULT NULL",
+        "INSERT OR IGNORE INTO setting (key, value) VALUES ('shared_folder', '')",
+        "INSERT OR IGNORE INTO setting (key, value) VALUES ('device_id', '')",
+        """CREATE TABLE IF NOT EXISTS code_deletion_batch (
+            id TEXT PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+            root_code_id INTEGER NOT NULL,
+            deleted_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS shared_ignored_head (
+            project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+            snapshot_id TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (project_id, snapshot_id)
+        )""",
+    ],
 }
+
+LATEST_SCHEMA_VERSION = max(MIGRATIONS)
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 
@@ -189,13 +275,135 @@ async def _run_migrations(db: aiosqlite.Connection):
         )
         await db.commit()
 
+    # Lineage IDs are application-generated UUIDs. Populate legacy rows after
+    # migration 8 rather than relying on a SQLite expression as a column default.
+    cursor = await db.execute("SELECT id FROM project WHERE lineage_id IS NULL OR lineage_id='' ")
+    for row in await cursor.fetchall():
+        await db.execute(
+            "UPDATE project SET lineage_id=? WHERE id=?",
+            (str(uuid.uuid4()), row["id"]),
+        )
+    await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_project_lineage ON project(lineage_id)"
+    )
+    cursor = await db.execute("SELECT value FROM setting WHERE key='device_id'")
+    device = await cursor.fetchone()
+    if not device or not device["value"].strip():
+        await db.execute(
+            "INSERT OR REPLACE INTO setting (key, value) VALUES ('device_id', ?)",
+            (str(uuid.uuid4()),),
+        )
+    await db.commit()
+
+
+async def touch_project(db: aiosqlite.Connection, project_id: int | None):
+    """Record a substantive project change for ordering and snapshot conflict checks."""
+    if project_id is None:
+        return
+    await db.execute(
+        "UPDATE project SET revision=revision+1, modified_at=datetime('now') WHERE id=?",
+        (project_id,),
+    )
+
+
+async def touch_projects(db: aiosqlite.Connection, project_ids):
+    """Touch each distinct project ID once within the caller's transaction."""
+    for project_id in sorted({pid for pid in project_ids if pid is not None}):
+        await touch_project(db, project_id)
+
+
+def create_backup(label: str = "backup") -> Path:
+    """Create and verify a consistent backup of the live database.
+
+    The SQLite backup API is safe while other connections are open. Backups use
+    immutable timestamped names so cloud-sync tools never observe a half-replaced
+    database file.
+    """
+    source_path = _db_path()
+    if not source_path.exists():
+        raise FileNotFoundError("AQDA database does not exist")
+
+    backup_dir = DATA_DIR / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    safe_label = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in label)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    backup_path = backup_dir / f"aqda-{safe_label}-{stamp}.db"
+
+    source = sqlite3.connect(source_path)
+    destination = sqlite3.connect(backup_path)
+    try:
+        source.backup(destination)
+        result = destination.execute("PRAGMA integrity_check").fetchone()
+        if not result or result[0] != "ok":
+            raise RuntimeError(f"Backup integrity check failed: {result}")
+    except Exception:
+        destination.close()
+        source.close()
+        backup_path.unlink(missing_ok=True)
+        raise
+    else:
+        destination.close()
+        source.close()
+    return backup_path
+
+
+def _existing_schema_version(path: Path) -> int | None:
+    """Read a database version without creating or migrating the database."""
+    if not path.exists() or path.stat().st_size == 0:
+        return None
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        row = connection.execute(
+            "SELECT value FROM setting WHERE key='schema_version'"
+        ).fetchone()
+        return int(row[0]) if row else 1
+    except sqlite3.DatabaseError:
+        return 1
+    finally:
+        connection.close()
+
+
+def _prune_backups(prefix: str, keep: int) -> None:
+    backup_dir = DATA_DIR / "backups"
+    if not backup_dir.exists():
+        return
+    matches = sorted(backup_dir.glob(f"aqda-{prefix}-*.db"), reverse=True)
+    for stale in matches[keep:]:
+        stale.unlink(missing_ok=True)
+
+
+def create_daily_backup() -> Path | None:
+    """Create at most one verified rolling backup per UTC day."""
+    backup_dir = DATA_DIR / "backups"
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    already_created = (
+        any(backup_dir.glob(f"aqda-daily-{day}T*.db"))
+        if backup_dir.exists()
+        else False
+    )
+    if already_created:
+        return None
+    path = create_backup("daily")
+    _prune_backups("daily", keep=7)
+    return path
+
 
 async def init_db():
     """Initialize the database schema and run migrations."""
+    path = _db_path()
+    existing_version = _existing_schema_version(path)
+    if existing_version is not None and existing_version < LATEST_SCHEMA_VERSION:
+        create_backup(f"before-migration-v{LATEST_SCHEMA_VERSION}")
     db = await get_db()
     try:
         await db.executescript(SCHEMA)
         await db.commit()
         await _run_migrations(db)
+        from aqda.services.offsets import repair_legacy_offsets
+
+        await repair_legacy_offsets(db)
+        await db.commit()
     finally:
         await db.close()
+    if existing_version is not None:
+        create_daily_backup()

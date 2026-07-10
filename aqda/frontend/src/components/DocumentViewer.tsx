@@ -26,8 +26,17 @@ interface TextSelection {
   rect: { top: number; bottom: number; left: number };
 }
 
+function utf16ToCodePointOffset(text: string, offset: number): number {
+  return Array.from(text.slice(0, Math.max(0, offset))).length;
+}
+
+function codePointToUtf16Offset(text: string, offset: number): number {
+  return Array.from(text).slice(0, Math.max(0, offset)).join('').length;
+}
+
 export function DocumentViewer({ document: doc, codings, codes, memos, selectedCodeId, onApplyCode, onDeleteCoding, onAddMemo, highlightRange, onHighlightClear }: Props) {
   const contentRef = useRef<HTMLDivElement>(null);
+  const textContentRef = useRef<HTMLDivElement>(null);
   const queryClient = useQueryClient();
   const [selection, setSelection] = useState<TextSelection | null>(null);
   const [docFontSize, setDocFontSize] = useState(14);
@@ -140,13 +149,16 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
 
   // In-document find: positions of every case-insensitive match of the query.
   const findMatches = useMemo(() => {
-    if (!findOpen || !findQuery) return [] as number[];
+    if (!findOpen || !findQuery) return [] as { start: number; end: number }[];
     const hay = codeableText.toLowerCase();
     const needle = findQuery.toLowerCase();
-    const out: number[] = [];
+    const out: { start: number; end: number }[] = [];
     let idx = hay.indexOf(needle);
     while (idx !== -1 && out.length < 5000) {
-      out.push(idx);
+      out.push({
+        start: utf16ToCodePointOffset(codeableText, idx),
+        end: utf16ToCodePointOffset(codeableText, idx + needle.length),
+      });
       idx = hay.indexOf(needle, idx + Math.max(1, needle.length));
     }
     return out;
@@ -158,11 +170,10 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
   // parent-driven highlight (memo/AI navigation) while find is open.
   const activeHighlight = useMemo(() => {
     if (findOpen && findMatches.length > 0) {
-      const s = findMatches[safeFindIdx];
-      return { start: s, end: s + findQuery.length };
+      return findMatches[safeFindIdx];
     }
     return highlightRange ?? null;
-  }, [findOpen, findMatches, safeFindIdx, findQuery.length, highlightRange]);
+  }, [findOpen, findMatches, safeFindIdx, highlightRange]);
 
   const gotoNextMatch = useCallback(() => {
     if (findMatches.length) setFindIdx((i) => (i + 1) % findMatches.length);
@@ -233,8 +244,9 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     let lastPos = 0;
 
     for (const ev of events) {
-      if (ev.pos > lastPos) {
-        segments.push({ text: text.slice(lastPos, ev.pos), codings: [...active], highlighted: isHighlighted });
+      const jsPos = codePointToUtf16Offset(text, ev.pos);
+      if (jsPos > lastPos) {
+        segments.push({ text: text.slice(lastPos, jsPos), codings: [...active], highlighted: isHighlighted });
       }
       if (ev.highlight) {
         isHighlighted = ev.type === 'start';
@@ -242,7 +254,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
         if (ev.type === 'start') active.add(ev.coding);
         else active.delete(ev.coding);
       }
-      lastPos = ev.pos;
+      lastPos = jsPos;
     }
     if (lastPos < text.length) {
       segments.push({ text: text.slice(lastPos), codings: [], highlighted: false });
@@ -257,29 +269,33 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     if (popupClickRef.current) { popupClickRef.current = false; return; }
 
     const sel = window.getSelection();
-    if (!sel || !contentRef.current) return;
+    if (!sel || !contentRef.current || !textContentRef.current) return;
 
     // Text was selected — show apply-code popup
     if (!sel.isCollapsed) {
       setClickedCoding(null);
       setMemoDraft(null);
       const range = sel.getRangeAt(0);
-      const text = sel.toString().trim();
-      if (!text) { setSelection(null); return; }
+      if (!textContentRef.current.contains(range.startContainer) ||
+          !textContentRef.current.contains(range.endContainer)) return;
 
-      const walker = document.createTreeWalker(contentRef.current, NodeFilter.SHOW_TEXT);
+      const walker = document.createTreeWalker(textContentRef.current, NodeFilter.SHOW_TEXT);
       let offset = 0;
-      let startPos = -1;
-      let endPos = -1;
+      let rawStart = -1;
+      let rawEnd = -1;
 
       while (walker.nextNode()) {
         const node = walker.currentNode;
-        if (node === range.startContainer) startPos = offset + range.startOffset;
-        if (node === range.endContainer) { endPos = offset + range.endOffset; break; }
+        if (node === range.startContainer) rawStart = offset + range.startOffset;
+        if (node === range.endContainer) { rawEnd = offset + range.endOffset; break; }
         offset += node.textContent?.length ?? 0;
       }
 
-      if (startPos >= 0 && endPos > startPos) {
+      if (rawStart >= 0 && rawEnd > rawStart) {
+        const text = codeableText.slice(rawStart, rawEnd);
+        if (!text.trim()) { setSelection(null); return; }
+        const startPos = utf16ToCodePointOffset(codeableText, rawStart);
+        const endPos = utf16ToCodePointOffset(codeableText, rawEnd);
         const rect = range.getBoundingClientRect();
         const containerRect = contentRef.current.getBoundingClientRect();
         setSelection({
@@ -295,17 +311,18 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     }
 
     // No selection — check if clicked on a coded passage
-    if (sel.anchorNode) {
-      const walker = document.createTreeWalker(contentRef.current, NodeFilter.SHOW_TEXT);
+    if (sel.anchorNode && textContentRef.current.contains(sel.anchorNode)) {
+      const walker = document.createTreeWalker(textContentRef.current, NodeFilter.SHOW_TEXT);
       let offset = 0;
-      let clickPos = -1;
+      let rawClickPos = -1;
       while (walker.nextNode()) {
         const node = walker.currentNode;
-        if (node === sel.anchorNode) { clickPos = offset + sel.anchorOffset; break; }
+        if (node === sel.anchorNode) { rawClickPos = offset + sel.anchorOffset; break; }
         offset += node.textContent?.length ?? 0;
       }
 
-      if (clickPos >= 0) {
+      if (rawClickPos >= 0) {
+        const clickPos = utf16ToCodePointOffset(codeableText, rawClickPos);
         const overlapping = codings.filter(c => c.start_pos <= clickPos && c.end_pos > clickPos);
         if (overlapping.length > 0) {
           const range = document.createRange();
@@ -332,7 +349,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     setShowNewCodeInput(false);
     setAnalysisText(null);
     setMemoDraft(null);
-  }, [codings]);
+  }, [codings, codeableText]);
 
   // Apply code to selection
   const applyCode = useCallback(
@@ -653,7 +670,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
             </div>
             {/* Transcript (codeable text) */}
             {doc.transcript && (
-              <div className="p-6 max-w-4xl mx-auto text-gray-800 whitespace-pre-wrap select-text" style={{ fontSize: `${docFontSize}px`, lineHeight: 1.8 }}>
+              <div ref={textContentRef} className="p-6 max-w-4xl mx-auto text-gray-800 whitespace-pre-wrap select-text" style={{ fontSize: `${docFontSize}px`, lineHeight: 1.8 }}>
                 {renderedContent.map((seg, i) => {
                   const isFirstHighlight = seg.highlighted && !renderedContent.slice(0, i).some((s) => s.highlighted);
                   if (seg.codings.length === 0 && !seg.highlighted) {
@@ -690,7 +707,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
             )}
           </div>
         ) : (<>
-        <div className="p-6 max-w-4xl mx-auto text-gray-800 whitespace-pre-wrap select-text" style={{ fontSize: `${docFontSize}px`, lineHeight: 1.8 }}>
+        <div ref={textContentRef} className="p-6 max-w-4xl mx-auto text-gray-800 whitespace-pre-wrap select-text" style={{ fontSize: `${docFontSize}px`, lineHeight: 1.8 }}>
           {renderedContent.map((seg, i) => {
             const isFirstHighlight = seg.highlighted && !renderedContent.slice(0, i).some((s) => s.highlighted);
             if (seg.codings.length === 0 && !seg.highlighted) {

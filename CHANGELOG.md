@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### New features
+- **Safer turn-based collaboration** — `.aqda` files now carry stable project lineage and
+  snapshot ancestry. A clean local project fast-forwards from a collaborator's newer
+  snapshot after an automatic database backup; divergent edits are never overwritten and
+  can be kept as a clearly named conflicting copy.
+- **Automatic shared-folder collaboration** — link a Google Drive, Dropbox, OneDrive, or
+  ordinary folder once. AQDA works from a hidden local cache, publishes immutable snapshots
+  in the background, pulls collaborators' changes, and automatically keeps both versions
+  when work diverges.
+- **Safe Close AQDA button** — performs a final shared-project sync and graceful shutdown;
+  pressing Ctrl+C once remains the terminal equivalent.
+
+### Improvements
+- Project activity now advances a revision and updates the project modification time.
+- `.aqda` round-trips preserve memo-to-coding links.
+- Canonical Unicode code-point offsets, server-side span validation, and automatic repair
+  of legacy codings prevent find-bar and emoji-related annotation drift.
+- Parent-code deletion now warns about impact, moves the complete subtree to trash, and
+  restores only the codes/codings deleted by that exact operation.
+- Verified pre-migration and rolling daily backups are stored in `~/.aqda/backups/`.
+- JSON analysis exports include document variables; XML exports avoid double escaping;
+  Unicode project filenames use standards-compliant download headers.
+- Embedding cache keys include chunk content and stale rows are invalidated automatically.
+- Unknown `/api` routes now return a JSON 404 instead of the frontend HTML.
+
 ## 0.2.0
 
 ### New features

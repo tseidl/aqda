@@ -163,27 +163,56 @@ This removes the app but keeps your data in `~/.aqda/`. To remove everything, al
 
 ## Your Data
 
-All your data lives in a single file: `~/.aqda/aqda.db`. This file contains all your projects. You can change the location in **Settings**.
+AQDA saves every change immediately. There is no Save button. Its private working database
+lives at `~/.aqda/aqda.db`; normal users never need to open or move this file.
 
-- **Back it up** by copying this file
-- **Move between machines** by copying it to another computer
+- **Automatic backups** — AQDA keeps seven verified daily backups in `~/.aqda/backups/`
+  and creates an extra backup before migrations or replacing a project from a collaborator
+- **Move or archive a project** with an `.aqda` snapshot from the Export menu
 - **Deleted projects** go to a trash bin and can be restored
 
-### Sharing a Project
+Do not put the live `aqda.db` in Google Drive, Dropbox, OneDrive, or a network folder.
+AQDA's collaboration feature below provides the same convenient shared-folder experience
+without exposing a live SQLite database to cloud-sync races.
 
-AQDA supports sharing individual projects via `.aqda` files — small, self-contained databases with everything in that project (documents, codes, codings, memos).
+To restore a full backup, close AQDA, keep the current `aqda.db` as an extra copy, and copy
+the chosen backup into its place as `aqda.db`.
 
-**The workflow:**
+### Collaboration — Google Drive, Dropbox, or a Shared Folder
 
-1. In your project, click **Export → Share Project (.aqda)** — downloads a file like `My_Project.aqda`
-2. Send the file to your collaborator (email, Google Drive, USB stick — whatever works)
-3. They open AQDA, click **Import Project** on the project list, and select the `.aqda` file
-4. The project appears in their AQDA with all data intact
-5. When they're done, they export and send it back
+Collaboration is designed to feel like opening the same document from a shared folder.
+AQDA quietly uses a safe local working copy and syncs complete, closed snapshots in the
+background. You never manage the local copy and you never need to save manually.
 
-Each import creates a **new project** — it never overwrites existing work. This is turn-based collaboration: one person works at a time.
+**Set it up once:**
 
-> **Not supported:** merging two people's independent changes made in parallel.
+1. Open **Settings → Collaboration**
+2. Choose a folder inside Google Drive, Dropbox, OneDrive, or another synced location
+3. Open a project and click **Share project**
+4. On the other researcher's computer, choose the same collaboration folder in Settings
+5. The project appears under **Shared projects available**; click **Open project** once
+
+After that, both researchers open the project normally from AQDA's project list. Changes
+save locally immediately and complete snapshots are published to the shared folder after a
+short delay. Incoming changes appear automatically. Before replacing local project data,
+AQDA creates and verifies a full safety backup.
+
+If two people happen to work at the same time—or one computer was offline—AQDA detects the
+two histories and keeps both as clearly named projects. Neither person's work is overwritten.
+You can compare them and decide which version to continue using.
+
+Under the hood, the collaboration folder contains an `.aqda-project` folder with immutable
+snapshots. These are managed by AQDA; collaborators should not rename or edit them manually.
+
+**Stopping AQDA:** use the **Close AQDA** button, or press Ctrl+C once in the terminal. Both
+perform a graceful final sync. Closing only the browser tab leaves the local AQDA server
+running, which is harmless; reopen `http://127.0.0.1:8765` to return. If the computer stops
+unexpectedly, the hidden local copy is retained and syncs on the next launch.
+
+> **Not supported:** automatically merging two independently edited versions into one.
+
+For one-person local work, nothing changes: create a project, work normally, and close AQDA.
+Everything autosaves; no files or caches need to be managed.
 
 ---
 
@@ -192,10 +221,13 @@ Each import creates a **new project** — it never overwrites existing work. Thi
 | Format | Use case |
 |--------|----------|
 | `.aqda` | Share a project with another AQDA user — full round-trip import/export |
-| `.qdpx` | REFI-QDA standard — import into MAXQDA, ATLAS.ti, NVivo |
+| `.qdpx` | REFI-QDA text exchange — import into MAXQDA, ATLAS.ti, NVivo |
 | `.qdc` | Codebook XML — share code hierarchies between projects |
 | `.csv` | Coded segments as a table — for further analysis in R, Excel, etc. |
-| `.json` | Full project data — for custom processing or archival |
+| `.json` | Analysis data and document variables — for R, Python, or custom processing |
+
+QDPX currently exports text and audio transcripts as text sources. Original audio and image
+media are not embedded in the QDPX package; use `.aqda` when an exact AQDA round-trip is needed.
 
 ---
 

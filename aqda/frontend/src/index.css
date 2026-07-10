@@ -6,20 +6,6 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* Tiptap editor styles */
-.tiptap {
-  outline: none;
-  min-height: 100%;
-  padding: 1rem;
-  font-size: 0.95rem;
-  line-height: 1.7;
-  white-space: pre-wrap;
-}
-
-.tiptap p {
-  margin: 0 0 0.5em 0;
-}
-
 /* Code highlight marks — inline colored backgrounds for codings */
 mark[data-color] {
   border-radius: 2px;
