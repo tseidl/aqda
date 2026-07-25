@@ -15,6 +15,7 @@ jobs:
     name: Build and publish to PyPI
     runs-on: ubuntu-latest
     permissions:
+      contents: read # job-level permissions replace the workflow-level block
       id-token: write # required for Trusted Publishing
     steps:
       - uses: actions/checkout@v7
@@ -35,6 +36,31 @@ jobs:
             echo "::error::Tag $GITHUB_REF_NAME does not match pyproject version $pkg"
             exit 1
           fi
+
+      # pyproject is not the only place a version lives. A stale __version__
+      # would ship a package that misreports itself, and the artifact cannot
+      # be replaced once uploaded.
+      - name: Check package __version__ matches pyproject
+        run: |
+          python - <<'EOF'
+          import pathlib, re, sys, tomllib
+          cfg = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]
+          want = cfg["version"]
+          mod = cfg["name"].replace("-", "_")
+          found = False
+          for c in (pathlib.Path("src") / mod / "__init__.py", pathlib.Path(mod) / "__init__.py"):
+              if not c.exists():
+                  continue
+              found = True
+              m = re.search(r'__version__\s*=\s*["\']([^"\']+)', c.read_text())
+              if not m:
+                  sys.exit(f"no __version__ found in {c}")
+              if m.group(1) != want:
+                  sys.exit(f"{c} has __version__ {m.group(1)}, pyproject has {want}")
+              print(f"{c}: {m.group(1)} matches pyproject")
+          if not found:
+              sys.exit(f"could not locate __init__.py for module {mod}")
+          EOF
 
       - name: Build and check
         run: |

@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 
+from aqda import __version__
 from aqda.db import init_db
 from aqda.routers import projects, documents, codes, codings, memos, settings, ai, export, shared, system
 from aqda.services.shared_projects import start_sync_service, stop_sync_service
@@ -22,7 +23,7 @@ async def lifespan(app: FastAPI):
         await stop_sync_service()
 
 
-app = FastAPI(title="AQDA", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="AQDA", version=__version__, lifespan=lifespan)
 
 _LOCAL_BROWSER_ORIGINS = {
     "http://127.0.0.1:8765",

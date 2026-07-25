@@ -1,13 +1,14 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "aqda"
-version = "0.3.0"
+version = "0.3.1"
 description = "AQDA — Augmented Qualitative Data Analysis. Local-first QDA with AI."
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Timo Seidl" }]
 keywords = ["qualitative-research", "qda", "coding", "social-science", "refi-qda"]
@@ -47,6 +48,11 @@ aqda = "aqda.__main__:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["aqda*"]
+# Without this, namespace discovery walks the node_modules symlink under
+# aqda/frontend/ and packages stray .py files from JS dependencies. The
+# pre-built frontend itself still ships, via package-data below.
+exclude = ["aqda.frontend*"]
+namespaces = false
 
 [tool.setuptools.package-data]
 aqda = ["frontend/dist/**/*"]
