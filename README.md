@@ -67,7 +67,7 @@ You need one of each. They are configured in **Settings**.
 Open a terminal and run:
 
 ```bash
-pipx install git+https://github.com/tseidl/aqda.git
+pipx install aqda
 ```
 
 Already installed? Refresh AQDA to the current version with:
@@ -155,7 +155,7 @@ This extracts `date`, `source`, and `title` as document variables automatically 
 ### Updating
 
 ```bash
-pipx install --force git+https://github.com/tseidl/aqda.git
+pipx upgrade aqda
 ```
 
 ### Uninstalling
