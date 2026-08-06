@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### New features
+- **Filter documents by variables** — the Docs panel's filter controls now offer one
+  dropdown per document variable (with per-value counts); active filters combine, the
+  funnel icon turns indigo while any filter is active, and a one-click reset clears them.
+  Variables with more than 25 distinct values (IDs, dates) are not offered as filters.
+
 ## 0.3.0
 
 ### New features

@@ -41,6 +41,7 @@ export function ProjectView() {
   // Document list controls
   const [docSort, setDocSort] = useState<'name' | 'date' | 'type'>('name');
   const [docFilter, setDocFilter] = useState<'all' | 'text' | 'pdf' | 'image' | 'audio'>('all');
+  const [docVarFilters, setDocVarFilters] = useState<Record<string, string>>({});
   const [showDocVars, setShowDocVars] = useState(false);
   const [showDocControls, setShowDocControls] = useState(false);
   const [highlightRange, setHighlightRange] = useState<{ start: number; end: number } | null>(null);
@@ -182,6 +183,9 @@ export function ProjectView() {
     if (docFilter !== 'all') {
       docs = docs.filter((d) => d.source_type === (docFilter === 'text' ? 'text' : docFilter));
     }
+    for (const [key, value] of Object.entries(docVarFilters)) {
+      docs = docs.filter((d) => (d.variables?.[key] ?? '') === value);
+    }
     docs.sort((a, b) => {
       if (docSort === 'name') return a.name.localeCompare(b.name);
       if (docSort === 'date') return (b.modified_at ?? '').localeCompare(a.modified_at ?? '');
@@ -189,7 +193,24 @@ export function ProjectView() {
       return 0;
     });
     return docs;
-  }, [docList, docFilter, docSort, docSearch]);
+  }, [docList, docFilter, docSort, docSearch, docVarFilters]);
+
+  // Variable keys -> sorted (value, count) pairs across all docs, for the filter rows.
+  // Keys with more than 25 distinct values (IDs, dates) are not offered as filters.
+  const docVarOptions = useMemo(() => {
+    const byKey = new Map<string, Map<string, number>>();
+    for (const d of docList) {
+      for (const [k, v] of Object.entries(d.variables ?? {})) {
+        const m = byKey.get(k) ?? new Map<string, number>();
+        m.set(v, (m.get(v) ?? 0) + 1);
+        byKey.set(k, m);
+      }
+    }
+    return [...byKey.entries()]
+      .filter(([, m]) => m.size <= 25)
+      .map(([k, m]) => [k, [...m.entries()].sort((a, b) => a[0].localeCompare(b[0]))] as const)
+      .sort((a, b) => a[0].localeCompare(b[0]));
+  }, [docList]);
 
   const { data: codeList = [] } = useQuery({
     queryKey: ['codes', projectId],
@@ -814,7 +835,7 @@ export function ProjectView() {
                   <div className="flex items-center gap-1 px-1 mb-2">
                     <button
                       onClick={() => setShowDocControls(!showDocControls)}
-                      className={`p-1 rounded text-gray-400 hover:text-gray-600 hover:bg-gray-100 ${showDocControls ? 'bg-gray-100 text-gray-600' : ''}`}
+                      className={`p-1 rounded text-gray-400 hover:text-gray-600 hover:bg-gray-100 ${showDocControls ? 'bg-gray-100 text-gray-600' : ''} ${docFilter !== 'all' || Object.keys(docVarFilters).length > 0 ? 'text-indigo-600' : ''}`}
                       title="Filter & sort"
                     >
                       <Filter size={13} />
@@ -895,6 +916,36 @@ export function ProjectView() {
                           ))}
                         </div>
                       </div>
+                      {docVarOptions.map(([key, values]) => (
+                        <div key={key} className="flex items-center gap-2">
+                          <span className="text-[10px] text-gray-400 uppercase w-10 shrink-0 truncate" title={key}>{key}</span>
+                          <select
+                            value={docVarFilters[key] ?? ''}
+                            onChange={(e) =>
+                              setDocVarFilters((prev) => {
+                                const next = { ...prev };
+                                if (e.target.value === '') delete next[key];
+                                else next[key] = e.target.value;
+                                return next;
+                              })
+                            }
+                            className={`text-[10px] flex-1 min-w-0 px-1 py-0.5 rounded border ${docVarFilters[key] !== undefined ? 'border-indigo-300 bg-indigo-50 text-indigo-700' : 'border-gray-200 bg-gray-50 text-gray-500'}`}
+                          >
+                            <option value="">any</option>
+                            {values.map(([v, n]) => (
+                              <option key={v} value={v}>{`${v} (${n})`}</option>
+                            ))}
+                          </select>
+                        </div>
+                      ))}
+                      {Object.keys(docVarFilters).length > 0 && (
+                        <button
+                          onClick={() => setDocVarFilters({})}
+                          className="text-[10px] px-2 py-0.5 rounded bg-gray-50 text-gray-500 hover:bg-gray-100"
+                        >
+                          Clear variable filters
+                        </button>
+                      )}
                       <button
                         onClick={() => parseVarsMut.mutate()}
                         disabled={parseVarsMut.isPending}
