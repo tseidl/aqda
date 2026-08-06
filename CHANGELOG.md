@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.2
 
 ### New features
 - **Filter documents by variables** — the Docs panel's filter controls now offer one
