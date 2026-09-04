@@ -254,10 +254,10 @@ export function ProjectView() {
       queryClient.invalidateQueries({ queryKey: ['documents', projectId] });
       if (res.documents.length === 1 && res.skipped.length === 0) setSelectedDocId(res.documents[0].id);
       if (res.skipped.length > 0) {
-        const names = res.skipped.slice(0, 3).map((s) => s.name).join(', ');
+        const shown = res.skipped.slice(0, 3).map((s) => `${s.name}: ${s.reason}`).join('; ');
         setUploadNotice(
-          `Skipped ${res.skipped.length} file${res.skipped.length !== 1 ? 's' : ''}` +
-          `${names ? ` (${names}${res.skipped.length > 3 ? ', …' : ''})` : ''} — empty, unreadable, or too large.`
+          `Skipped ${res.skipped.length} file${res.skipped.length !== 1 ? 's' : ''} — ` +
+          `${shown}${res.skipped.length > 3 ? '; …' : ''}`
         );
       }
     },
@@ -314,6 +314,14 @@ export function ProjectView() {
 
   const showInFlightSaveError = (error: unknown, item: 'coding' | 'memo') => {
     const details = error instanceof Error ? error.message : String(error);
+    const alreadyApplied = /^409:\s*/.test(details);
+    if (alreadyApplied) {
+      setCollaborationNotice(details.replace(/^409:\s*/, ''));
+      // The existing coding may have been made in another tab; show it.
+      queryClient.invalidateQueries({ queryKey: ['codings'] });
+      queryClient.invalidateQueries({ queryKey: ['codes', projectId] });
+      return;
+    }
     const likelyCollaboratorRefresh = Boolean(
       project?.shared_folder && /(?:^|\s)(400|404|422):/.test(details)
     );
@@ -379,7 +387,7 @@ export function ProjectView() {
     const input = document.createElement('input');
     input.type = 'file';
     input.multiple = true;
-    input.accept = '.txt,.pdf,.text,.jpg,.jpeg,.png,.gif,.bmp,.webp,.mp3,.wav,.m4a,.ogg,.flac,.webm,.aac';
+    input.accept = '.txt,.text,.docx,.pdf,.jpg,.jpeg,.png,.gif,.bmp,.webp,.mp3,.wav,.m4a,.ogg,.flac,.webm,.aac';
     input.onchange = () => {
       if (input.files?.length) {
         uploadMut.mutate(Array.from(input.files));

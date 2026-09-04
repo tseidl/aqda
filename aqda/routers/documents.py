@@ -10,6 +10,9 @@ from aqda.db import get_db, MAX_UPLOAD_BYTES, touch_project, touch_projects
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
 AUDIO_EXTENSIONS = {'.mp3', '.wav', '.m4a', '.ogg', '.flac', '.webm', '.wma', '.aac'}
+# Binary office formats AQDA cannot read; decoding them as text yields garbage.
+UNSUPPORTED_EXTENSIONS = {'.doc', '.odt', '.rtf', '.pages', '.ppt', '.pptx', '.xls', '.xlsx', '.zip'}
+UNSUPPORTED_MESSAGE = "This format is not supported. Save the file as .docx, .txt, or .pdf first."
 
 AUDIO_MIME_MAP = {
     '.mp3': 'audio/mpeg',
@@ -185,14 +188,40 @@ def _decode_text_bytes(data: bytes) -> str:
 
 
 def _detect_source_type(filename: str) -> str:
+    """Classify an upload; 'docx' and 'unsupported' are import-time kinds, not stored types."""
     ext = '.' + filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
     if ext == '.pdf':
         return 'pdf'
+    if ext == '.docx':
+        return 'docx'
     if ext in IMAGE_EXTENSIONS:
         return 'image'
     if ext in AUDIO_EXTENSIONS:
         return 'audio'
+    if ext in UNSUPPORTED_EXTENSIONS:
+        return 'unsupported'
     return 'text'
+
+
+async def _read_upload_text(filename: str, content_bytes: bytes) -> tuple[str, str]:
+    """Return (stored source_type, content) for an upload; raises ValueError if unreadable."""
+    source_type = _detect_source_type(filename)
+    if source_type == "unsupported":
+        raise ValueError(UNSUPPORTED_MESSAGE)
+    if source_type == "pdf":
+        return "pdf", await _extract_pdf_text(content_bytes)
+    if source_type == "docx":
+        # Word documents become plain text documents once their paragraphs are extracted.
+        return "text", await _extract_docx_text(content_bytes)
+    if source_type == "image":
+        ext = filename.rsplit('.', 1)[-1].lower()
+        mime = f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}"
+        return "image", f"data:{mime};base64,{base64.b64encode(content_bytes).decode('ascii')}"
+    if source_type == "audio":
+        ext = '.' + filename.rsplit('.', 1)[-1].lower()
+        mime = AUDIO_MIME_MAP.get(ext, 'audio/mpeg')
+        return "audio", f"data:{mime};base64,{base64.b64encode(content_bytes).decode('ascii')}"
+    return "text", _decode_text_bytes(content_bytes)
 
 
 @router.post("", status_code=201)
@@ -204,20 +233,12 @@ async def upload_document(
     if len(content_bytes) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, f"File too large. Maximum size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
     filename = file.filename or "untitled"
-    source_type = _detect_source_type(filename)
-
-    if source_type == "pdf":
-        text = await _extract_pdf_text(content_bytes)
-    elif source_type == "image":
-        ext = filename.rsplit('.', 1)[-1].lower()
-        mime = f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}"
-        text = f"data:{mime};base64,{base64.b64encode(content_bytes).decode('ascii')}"
-    elif source_type == "audio":
-        ext = '.' + filename.rsplit('.', 1)[-1].lower()
-        mime = AUDIO_MIME_MAP.get(ext, 'audio/mpeg')
-        text = f"data:{mime};base64,{base64.b64encode(content_bytes).decode('ascii')}"
-    else:
-        text = _decode_text_bytes(content_bytes)
+    try:
+        source_type, text = await _read_upload_text(filename, content_bytes)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception:
+        raise HTTPException(400, "Document could not be read")
 
     if not text.strip():
         raise HTTPException(400, "Document is empty or could not be read")
@@ -268,22 +289,13 @@ async def upload_documents_bulk(
             if len(content_bytes) > MAX_UPLOAD_BYTES:
                 skipped.append({"name": filename, "reason": f"exceeds {MAX_UPLOAD_BYTES // (1024*1024)} MB limit"})
                 continue
-            source_type = _detect_source_type(filename)
             # Isolate per-file extraction failures (e.g. a corrupt PDF) so one bad
             # file is skipped instead of aborting the whole batch before commit.
             try:
-                if source_type == "pdf":
-                    text = await _extract_pdf_text(content_bytes)
-                elif source_type == "image":
-                    ext = filename.rsplit('.', 1)[-1].lower()
-                    mime = f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}"
-                    text = f"data:{mime};base64,{base64.b64encode(content_bytes).decode('ascii')}"
-                elif source_type == "audio":
-                    ext = '.' + filename.rsplit('.', 1)[-1].lower()
-                    mime = AUDIO_MIME_MAP.get(ext, 'audio/mpeg')
-                    text = f"data:{mime};base64,{base64.b64encode(content_bytes).decode('ascii')}"
-                else:
-                    text = _decode_text_bytes(content_bytes)
+                source_type, text = await _read_upload_text(filename, content_bytes)
+            except ValueError as exc:
+                skipped.append({"name": filename, "reason": str(exc)})
+                continue
             except Exception:
                 skipped.append({"name": filename, "reason": "could not be read"})
                 continue
@@ -517,6 +529,81 @@ def _extract_pdf_text_sync(content_bytes: bytes) -> str:
 async def _extract_pdf_text(content_bytes: bytes) -> str:
     """Extract PDF text off the event loop so uploads don't block other requests."""
     return await asyncio.to_thread(_extract_pdf_text_sync, content_bytes)
+
+
+# WordprocessingML comes in the common transitional flavour and the ISO strict one.
+_WORD_NAMESPACES = {
+    "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+    "http://purl.oclc.org/ooxml/wordprocessingml/main",
+}
+# Markup-compatibility fallbacks repeat the content of the preferred choice (text boxes).
+_MC_FALLBACK = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
+# The upload limit applies to the compressed file; the XML inside may be much larger.
+MAX_DOCX_XML_BYTES = 100 * 1024 * 1024
+
+
+def _read_zip_member(archive, name: str, limit: int) -> bytes:
+    """Read one archive member, refusing to expand beyond ``limit`` bytes."""
+    with archive.open(name) as stream:
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("The Word document is too large to read")
+    return data
+
+
+def _extract_docx_text_sync(content_bytes: bytes) -> str:
+    """Extract paragraph text from a .docx with the standard library only.
+
+    Every WordprocessingML paragraph (including those inside tables and text
+    boxes) becomes one line; runs, tabs, and line breaks are joined in document
+    order. Formatting, images, and headers/footers are dropped.
+    """
+    import io
+    import zipfile
+    from xml.etree import ElementTree
+
+    with zipfile.ZipFile(io.BytesIO(content_bytes)) as archive:
+        xml = _read_zip_member(archive, "word/document.xml", MAX_DOCX_XML_BYTES)
+    root = ElementTree.fromstring(xml)
+    namespace = root.tag[1:root.tag.index("}")] if root.tag.startswith("{") else ""
+    if namespace not in _WORD_NAMESPACES:
+        raise ValueError("Not a Word document")
+    tag = {kind: f"{{{namespace}}}{kind}" for kind in ("p", "t", "tab", "br", "cr")}
+
+    def paragraphs(node):
+        """Yield paragraphs in document order, skipping duplicated fallback markup."""
+        for child in node:
+            if child.tag == _MC_FALLBACK:
+                continue
+            if child.tag == tag["p"]:
+                yield child
+            yield from paragraphs(child)
+
+    def collect(node, parts: list[str]) -> None:
+        """Gather one paragraph's own text; nested paragraphs are yielded separately."""
+        for child in node:
+            if child.tag in (tag["p"], _MC_FALLBACK):
+                continue
+            if child.tag == tag["t"]:
+                parts.append(child.text or "")
+            elif child.tag == tag["tab"]:
+                parts.append("\t")
+            elif child.tag in (tag["br"], tag["cr"]):
+                parts.append("\n")
+            else:
+                collect(child, parts)
+
+    lines = []
+    for paragraph in paragraphs(root):
+        parts: list[str] = []
+        collect(paragraph, parts)
+        lines.append("".join(parts))
+    return "\n".join(lines)
+
+
+async def _extract_docx_text(content_bytes: bytes) -> str:
+    """Extract Word text off the event loop."""
+    return await asyncio.to_thread(_extract_docx_text_sync, content_bytes)
 
 
 @router.post("/{document_id}/transcribe")

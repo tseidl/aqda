@@ -1,11 +1,15 @@
 """AI integration routes — embedding, similarity search, and LLM analysis."""
 
+import asyncio
 import hashlib
 import json
 import math
 import re
 import sqlite3
+import statistics
 import struct
+
+from collections.abc import Callable
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -28,6 +32,23 @@ def _get_http_client() -> httpx.AsyncClient:
 
 # Track embedding progress for the UI
 _embedding_progress: dict = {"active": False, "current": 0, "total": 0, "doc_name": ""}
+
+# Cancellation tokens. Each embedding task takes the next number at handler entry;
+# POST /ai/cancel marks the newest task (and thereby every older one) as cancelled,
+# so a cancel can neither be erased by a later task nor spill over onto it.
+_latest_task = 0
+_cancelled_up_to = 0
+
+
+def _begin_cancellable_task() -> int:
+    global _latest_task
+    _latest_task += 1
+    return _latest_task
+
+
+def _check_cancelled(task: int) -> None:
+    if task <= _cancelled_up_to:
+        raise HTTPException(409, "Cancelled")
 
 # Source types whose text AQDA embeds for search. text/pdf embed `content`;
 # audio embeds its (non-empty) transcript, so offsets index into the transcript.
@@ -120,8 +141,12 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[dict]:
+def _chunk_text(
+    text: str, chunk_size: int = 500, overlap: int = 50, mode: str = "fixed"
+) -> list[dict]:
     """Split text into overlapping chunks, returning offset info."""
+    if mode == "paragraph":
+        return _chunk_paragraphs(text, chunk_size, overlap)
     if chunk_size <= overlap:
         overlap = 0
     chunks = []
@@ -148,6 +173,31 @@ def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[dic
         # chunk, `end - overlap` can land at or before `start`; force forward progress
         # so the loop can never spin forever.
         start = max(end - overlap, start + 1)
+    return chunks
+
+
+def _chunk_paragraphs(text: str, chunk_size: int, overlap: int) -> list[dict]:
+    """One chunk per non-empty line (a paragraph or speaker turn); long lines use fixed windows.
+
+    Suited to transcripts with one turn per line. Text with a hard line break at
+    every line (some PDFs) produces many tiny chunks, which the Settings page warns about.
+    """
+    chunks = []
+    for match in re.finditer(r"[^\n]+", text):
+        line = match.group()
+        stripped = line.strip()
+        if not stripped:
+            continue
+        line_start = match.start() + (len(line) - len(line.lstrip()))
+        if len(stripped) <= chunk_size:
+            chunks.append({"text": stripped, "start": line_start, "end": line_start + len(stripped)})
+            continue
+        for chunk in _chunk_text(stripped, chunk_size, overlap):
+            chunks.append({
+                "text": chunk["text"],
+                "start": line_start + chunk["start"],
+                "end": line_start + chunk["end"],
+            })
     return chunks
 
 
@@ -187,16 +237,54 @@ def _snap_to_sentences(text: str, start: int, end: int) -> tuple[int, int]:
     return s, e
 
 
+def _finalize_suggestions(
+    results: list[dict],
+    get_text: Callable[[int], str | None],
+    existing: dict[int, list[tuple[int, int]]],
+    top_k: int,
+) -> list[dict]:
+    """Snap raw chunks to sentences, then drop duplicates and already-coded spans.
+
+    Snapping can widen a chunk into a passage that already carries this code, and
+    two overlapping chunks can snap to the same sentences, so both checks must run
+    on the final spans: otherwise 'Apply' would create overlapping duplicate codings.
+    Document text is fetched through ``get_text`` only for documents actually
+    reached before ``top_k`` suggestions survive.
+    """
+    seen: set[tuple[int, int, int]] = set()
+    final: list[dict] = []
+    texts: dict[int, str] = {}
+    for result in results:
+        doc_id = result["document_id"]
+        start, end, text = result["start_pos"], result["end_pos"], result["text"]
+        if doc_id not in texts:
+            texts[doc_id] = get_text(doc_id) or ""
+        content = texts[doc_id]
+        if content:
+            start, end = _snap_to_sentences(content, start, end)
+            text = content[start:end]
+        if not text.strip() or (doc_id, start, end) in seen:
+            continue
+        if any(start < c_end and end > c_start for c_start, c_end in existing.get(doc_id, [])):
+            continue
+        seen.add((doc_id, start, end))
+        final.append({**result, "start_pos": start, "end_pos": end, "text": text})
+        if len(final) >= top_k:
+            break
+    return final
+
+
 EMBED_BATCH_SIZE = 10  # embed this many chunks per Ollama call
 
 
 async def _ensure_doc_embedded(
     doc_id: int, doc_content: str, project_id: int,
     embed_model: str, ollama_url: str,
-    chunk_size: int, chunk_overlap: int,
+    chunk_size: int, chunk_overlap: int, chunk_mode: str = "fixed",
+    task: int = 0,
 ):
     """Embed a document's chunks into SQLite cache if not already stored."""
-    chunks = _chunk_text(doc_content, chunk_size, chunk_overlap)
+    chunks = _chunk_text(doc_content, chunk_size, chunk_overlap, chunk_mode)
     if not chunks:
         conn = _sync_db()
         try:
@@ -214,20 +302,25 @@ async def _ensure_doc_embedded(
         for c in chunks
     ]
 
-    # Step 1: Check existing chunks (sync sqlite3 — avoids aiosqlite memory leak)
+    # Step 1: Compare with cached chunks in Python; paragraph mode can produce far
+    # more chunks than SQLite accepts as bound parameters in a single statement.
+    wanted_ids = set(chunk_ids)
     conn = _sync_db()
     try:
-        placeholders = ",".join("?" * len(chunk_ids))
-        conn.execute(
-            f"DELETE FROM embedding_cache WHERE document_id=? AND model=? "
-            f"AND id NOT IN ({placeholders})",
-            [doc_id, embed_model, *chunk_ids],
-        )
-        conn.commit()
         cursor = conn.execute(
-            f"SELECT id FROM embedding_cache WHERE id IN ({placeholders})", chunk_ids
+            "SELECT id FROM embedding_cache WHERE document_id=? AND model=?",
+            (doc_id, embed_model),
         )
-        existing_ids = {row["id"] for row in cursor.fetchall()}
+        cached_ids = {row["id"] for row in cursor.fetchall()}
+        stale_ids = sorted(cached_ids - wanted_ids)
+        for batch_start in range(0, len(stale_ids), 500):
+            batch = stale_ids[batch_start:batch_start + 500]
+            conn.execute(
+                f"DELETE FROM embedding_cache WHERE id IN ({','.join('?' * len(batch))})",
+                batch,
+            )
+        conn.commit()
+        existing_ids = cached_ids & wanted_ids
     finally:
         conn.close()
 
@@ -241,6 +334,7 @@ async def _ensure_doc_embedded(
     # Step 2: Embed via Ollama — no DB connection held open.
     embedded: list[tuple[str, dict, bytes]] = []
     for batch_start in range(0, len(new_chunks), EMBED_BATCH_SIZE):
+        _check_cancelled(task)
         batch = new_chunks[batch_start:batch_start + EMBED_BATCH_SIZE]
         texts = [chunk["text"] for _, chunk in batch]
         try:
@@ -251,6 +345,8 @@ async def _ensure_doc_embedded(
         except Exception:
             continue
 
+    # A cancel that arrived during the last Ollama call must not be followed by writes.
+    _check_cancelled(task)
     if not embedded:
         return
 
@@ -323,34 +419,12 @@ async def embedding_progress():
     return _embedding_progress
 
 
-@router.get("/embedding-status")
-async def embedding_status(project_id: int):
-    """Check which documents have cached embeddings."""
-    conn = _sync_db()
-    try:
-        cursor = conn.execute(
-            f"SELECT id, name FROM document "
-            f"WHERE project_id=? AND ({_EMBEDDABLE_SOURCE_SQL})",
-            (project_id,),
-        )
-        docs = cursor.fetchall()
-
-        cursor = conn.execute(
-            "SELECT DISTINCT document_id FROM embedding_cache WHERE project_id=?",
-            (project_id,),
-        )
-        embedded_ids = {row["document_id"] for row in cursor.fetchall()}
-    finally:
-        conn.close()
-
-    return {
-        "documents": [
-            {"id": d["id"], "name": d["name"], "embedded": d["id"] in embedded_ids}
-            for d in docs
-        ],
-        "embedded_count": len(embedded_ids),
-        "total_count": len(docs),
-    }
+@router.post("/cancel")
+async def cancel_ai_task():
+    """Stop the running embedding task after its current batch; cached chunks are kept."""
+    global _cancelled_up_to
+    _cancelled_up_to = _latest_task
+    return {"cancelled": True}
 
 
 class SimilarSearchRequest(BaseModel):
@@ -366,11 +440,13 @@ class SimilarSearchRequest(BaseModel):
 @router.post("/similar")
 async def find_similar(req: SimilarSearchRequest):
     """Find passages similar to a query or code description using embeddings."""
+    task = _begin_cancellable_task()  # registered before the first await
     settings = await _get_settings()
     ollama_url = settings.get("ollama_url", "http://localhost:11434")
     embed_model = req.embedding_model or settings.get("embedding_model", "nomic-embed-text")
     chunk_size = int(settings.get("chunk_size", "500"))
     chunk_overlap = int(settings.get("chunk_overlap", "50"))
+    chunk_mode = settings.get("chunk_mode", "fixed")
 
     if not embed_model:
         raise HTTPException(
@@ -422,6 +498,7 @@ async def find_similar(req: SimilarSearchRequest):
     _embedding_progress["total"] = len(docs)
     try:
         for i, doc in enumerate(docs):
+            _check_cancelled(task)
             _embedding_progress["current"] = i + 1
             _embedding_progress["doc_name"] = doc["name"]
             # Load content with sync sqlite3 (avoids aiosqlite memory leak)
@@ -437,12 +514,13 @@ async def find_similar(req: SimilarSearchRequest):
                 conn.close()
             await _ensure_doc_embedded(
                 doc["id"], content, req.project_id,
-                embed_model, ollama_url, chunk_size, chunk_overlap,
+                embed_model, ollama_url, chunk_size, chunk_overlap, chunk_mode, task,
             )
     finally:
         _embedding_progress["active"] = False
 
     # Embed query and search
+    _check_cancelled(task)
     try:
         query_embedding = await _ollama_embed(query_text, embed_model, ollama_url)
     except httpx.ConnectError:
@@ -452,6 +530,7 @@ async def find_similar(req: SimilarSearchRequest):
 
     # Scope the search to the resolved (non-excluded, still-existing) documents so
     # cached chunks from reference/deleted docs never surface in results.
+    _check_cancelled(task)
     search_doc_ids = [doc["id"] for doc in docs]
     results = await _search_embeddings(
         query_embedding, req.project_id, embed_model,
@@ -465,44 +544,6 @@ async def find_similar(req: SimilarSearchRequest):
         r["similarity"] = round(max(0, r["similarity"]), 4)
 
     return results
-
-
-class AnalyzeRequest(BaseModel):
-    text: str
-    instruction: str = (
-        "Analyze this passage from a qualitative research perspective. "
-        "Identify key themes, patterns, and notable aspects."
-    )
-    llm_model: str | None = None
-
-
-@router.post("/analyze")
-async def analyze_text(req: AnalyzeRequest):
-    """Use an LLM to analyze a text passage."""
-    settings = await _get_settings()
-    ollama_url = settings.get("ollama_url", "http://localhost:11434")
-    llm_model = req.llm_model or settings.get("llm_model", "")
-
-    if not llm_model:
-        raise HTTPException(
-            400, "No LLM model configured. Set one in Settings or select in the AI panel."
-        )
-
-    system = (
-        "You are a qualitative research assistant. You help researchers analyze text data "
-        "by identifying themes, patterns, and notable aspects. Be concise and analytical. "
-        "Focus on what the text reveals, not on summarizing it."
-    )
-    prompt = f"{req.instruction}\n\nText passage:\n\"\"\"\n{req.text}\n\"\"\""
-
-    try:
-        think = settings.get("think_mode", "off") == "on"
-        response = await _ollama_generate(prompt, llm_model, ollama_url, system, think=think)
-        return {"analysis": response}
-    except httpx.ConnectError:
-        raise HTTPException(503, "Cannot connect to Ollama. Make sure it is running.")
-    except Exception as e:
-        raise HTTPException(503, f"Ollama generation failed: {e}")
 
 
 class AutoCodeRequest(BaseModel):
@@ -550,63 +591,50 @@ async def suggest_codings(req: AutoCodeRequest):
         for ex in examples:
             query += f"- {ex['selected_text'][:200]}\n"
 
-    # Fetch extra results so we still have enough after filtering
+    # Fetch extra results so we still have enough after filtering. The query
+    # already carries the code's name and definition, so no code_id here.
     fetch_k = req.top_k * 3 + len(existing_codings)
     similar_results = await find_similar(SimilarSearchRequest(
         project_id=req.project_id,
         query=query,
-        code_id=req.code_id,
         top_k=fetch_k,
         embedding_model=req.embedding_model,
     ))
+    if not similar_results:
+        return []
 
-    # Filter out passages overlapping existing codings for this code
-    codings_by_doc: dict[int, list[tuple[int, int]]] = {}
-    for ec in existing_codings:
-        doc_id = ec["document_id"]
-        if doc_id not in codings_by_doc:
-            codings_by_doc[doc_id] = []
-        codings_by_doc[doc_id].append((ec["start_pos"], ec["end_pos"]))
-
-    filtered = []
-    for result in similar_results:
-        doc_id = result["document_id"]
-        r_start = result["start_pos"]
-        r_end = result["end_pos"]
-        overlaps = False
-        if doc_id in codings_by_doc:
-            for c_start, c_end in codings_by_doc[doc_id]:
-                if r_start < c_end and r_end > c_start:
-                    overlaps = True
-                    break
-        if not overlaps:
-            filtered.append(result)
-            if len(filtered) >= req.top_k:
-                break
-
-    # Snap suggestions to sentence boundaries so they don't start mid-sentence
-    # and 'accepting' one applies a clean span.
-    if filtered:
+    # Document text is needed to snap suggestions to sentence boundaries so that
+    # they don't start mid-sentence and 'Apply' records a clean span. Only the
+    # codeable text is read (never base64 audio), and only in a worker thread.
+    # Existing spans are re-read here, after the (possibly long) embedding work,
+    # so a coding made in the meantime is respected too.
+    def finalize() -> list[dict]:
         conn = _sync_db()
         try:
-            contents: dict[int, str] = {}
-            for doc_id in {r["document_id"] for r in filtered}:
-                cur = conn.execute(
-                    "SELECT content, transcript, source_type FROM document WHERE id=?",
-                    (doc_id,),
+            codings_by_doc: dict[int, list[tuple[int, int]]] = {}
+            for row in conn.execute(
+                "SELECT c.document_id, c.start_pos, c.end_pos FROM coding c "
+                "JOIN document d ON c.document_id = d.id "
+                "WHERE c.code_id=? AND d.project_id=? AND c.deleted_at IS NULL",
+                (req.code_id, req.project_id),
+            ):
+                codings_by_doc.setdefault(row["document_id"], []).append(
+                    (row["start_pos"], row["end_pos"])
                 )
-                row = cur.fetchone()
-                contents[doc_id] = _embed_text_for(row) if row else ""
+
+            def get_text(doc_id: int) -> str | None:
+                row = conn.execute(
+                    "SELECT CASE WHEN source_type='audio' THEN transcript ELSE content END "
+                    "AS text FROM document WHERE id=?",
+                    (doc_id,),
+                ).fetchone()
+                return row["text"] if row else None
+
+            return _finalize_suggestions(similar_results, get_text, codings_by_doc, req.top_k)
         finally:
             conn.close()
-        for r in filtered:
-            content = contents.get(r["document_id"], "")
-            if content:
-                s, e = _snap_to_sentences(content, r["start_pos"], r["end_pos"])
-                r["start_pos"], r["end_pos"] = s, e
-                r["text"] = content[s:e]
 
-    return filtered
+    return await asyncio.to_thread(finalize)
 
 
 class SummarizeCodeRequest(BaseModel):
@@ -678,16 +706,37 @@ async def summarize_code(req: SummarizeCodeRequest):
 # 1. POST /ai/consistency-check — Code Consistency Checker
 # ---------------------------------------------------------------------------
 
+MIN_OUTLIER_SEGMENTS = 4  # below this, a code's similarity spread is not meaningful
+
+
+def _outlier_cutoff(similarities: list[float]) -> float | None:
+    """Adaptive cutoff below which a segment counts as an outlier for its code.
+
+    Cosine similarities to a code centroid depend on the embedding model (with
+    nomic-embed-text even unrelated text scores around 0.6), so a fixed absolute
+    threshold never fires. Instead flag segments more than 1.5 standard deviations
+    below the code's own mean, requiring a gap of at least 0.05 so that a tightly
+    consistent code does not produce false alarms.
+    """
+    if len(similarities) < MIN_OUTLIER_SEGMENTS:
+        return None
+    mean = statistics.fmean(similarities)
+    spread = statistics.pstdev(similarities)
+    return mean - max(1.5 * spread, 0.05)
+
+
 class ConsistencyCheckRequest(BaseModel):
     project_id: int
     code_id: int | None = None
-    similarity_threshold: float = 0.3
+    # Explicit absolute cutoff; None selects the adaptive per-code rule.
+    similarity_threshold: float | None = None
     embedding_model: str | None = None
 
 
 @router.post("/consistency-check")
 async def consistency_check(req: ConsistencyCheckRequest):
     """Check coding consistency by flagging segments that are outliers for their code."""
+    task = _begin_cancellable_task()
     settings = await _get_settings()
     ollama_url = settings.get("ollama_url", "http://localhost:11434")
     embed_model = req.embedding_model or settings.get("embedding_model", "nomic-embed-text")
@@ -734,6 +783,7 @@ async def consistency_check(req: ConsistencyCheckRequest):
             embeddings = []
             valid_segments = []
             for batch_start in range(0, len(segments), EMBED_BATCH_SIZE):
+                _check_cancelled(task)
                 batch = segments[batch_start:batch_start + EMBED_BATCH_SIZE]
                 try:
                     batch_embs = await _ollama_embed(
@@ -748,6 +798,7 @@ async def consistency_check(req: ConsistencyCheckRequest):
                 except Exception:
                     continue
 
+            _check_cancelled(task)
             if len(valid_segments) < 2:
                 continue
 
@@ -762,10 +813,15 @@ async def consistency_check(req: ConsistencyCheckRequest):
 
             similarities = [_cosine_similarity(emb, centroid) for emb in embeddings]
             avg_similarity = sum(similarities) / len(similarities)
+            cutoff = (
+                req.similarity_threshold
+                if req.similarity_threshold is not None
+                else _outlier_cutoff(similarities)
+            )
 
             outliers = []
             for i, sim in enumerate(similarities):
-                if sim < req.similarity_threshold:
+                if cutoff is not None and sim < cutoff:
                     seg = valid_segments[i]
                     outliers.append({
                         "coding_id": seg["coding_id"],
@@ -782,6 +838,7 @@ async def consistency_check(req: ConsistencyCheckRequest):
                 "code_name": code["name"],
                 "segment_count": len(valid_segments),
                 "avg_similarity": round(avg_similarity, 4),
+                "outlier_cutoff": round(cutoff, 4) if cutoff is not None else None,
                 "outliers": outliers,
             })
 
@@ -789,86 +846,6 @@ async def consistency_check(req: ConsistencyCheckRequest):
         await db.close()
 
     return {"results": results}
-
-
-# ---------------------------------------------------------------------------
-# 2. POST /ai/negative-cases — Negative Case Finder
-# ---------------------------------------------------------------------------
-
-class NegativeCaseRequest(BaseModel):
-    project_id: int
-    code_id: int
-    top_k: int = 10
-    embedding_model: str | None = None
-
-
-@router.post("/negative-cases")
-async def find_negative_cases(req: NegativeCaseRequest):
-    """Find uncoded passages semantically similar to a code — potential negative cases."""
-    db = await get_db()
-    try:
-        cursor = await db.execute(
-            "SELECT name, description FROM code WHERE id=?", (req.code_id,)
-        )
-        code = await cursor.fetchone()
-        if not code:
-            raise HTTPException(404, "Code not found")
-
-        cursor = await db.execute(
-            "SELECT c.selected_text, c.document_id, c.start_pos, c.end_pos "
-            "FROM coding c "
-            "JOIN document d ON c.document_id = d.id "
-            "WHERE c.code_id=? AND d.project_id=? AND c.deleted_at IS NULL",
-            (req.code_id, req.project_id),
-        )
-        existing_codings = await cursor.fetchall()
-    finally:
-        await db.close()
-
-    query = f"Code: {code['name']}"
-    if code["description"]:
-        query += f"\nDescription: {code['description']}"
-    if existing_codings:
-        query += "\nExamples of coded passages:\n"
-        for ex in existing_codings[:5]:
-            query += f"- {ex['selected_text'][:200]}\n"
-
-    fetch_k = req.top_k * 3 + len(existing_codings)
-    similar_results = await find_similar(SimilarSearchRequest(
-        project_id=req.project_id,
-        query=query,
-        code_id=req.code_id,
-        top_k=fetch_k,
-        embedding_model=req.embedding_model,
-    ))
-
-    # Filter out passages overlapping existing codings for this code
-    codings_by_doc: dict[int, list[tuple[int, int]]] = {}
-    for ec in existing_codings:
-        doc_id = ec["document_id"]
-        if doc_id not in codings_by_doc:
-            codings_by_doc[doc_id] = []
-        codings_by_doc[doc_id].append((ec["start_pos"], ec["end_pos"]))
-
-    filtered = []
-    for result in similar_results:
-        doc_id = result["document_id"]
-        r_start = result["start_pos"]
-        r_end = result["end_pos"]
-
-        overlaps = False
-        if doc_id in codings_by_doc:
-            for c_start, c_end in codings_by_doc[doc_id]:
-                if r_start < c_end and r_end > c_start:
-                    overlaps = True
-                    break
-
-        if not overlaps:
-            filtered.append(result)
-            if len(filtered) >= req.top_k:
-                break
-
-    return filtered
 
 
 # ---------------------------------------------------------------------------

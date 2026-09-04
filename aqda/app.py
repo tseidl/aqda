@@ -2,6 +2,7 @@
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
@@ -25,55 +26,79 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="AQDA", version=__version__, lifespan=lifespan)
 
-_LOCAL_BROWSER_ORIGINS = {
-    "http://127.0.0.1:8765",
-    "http://localhost:8765",
-    "http://[::1]:8765",
-    # The Vite development server proxies /api requests to the same local app.
-    "http://127.0.0.1:5173",
-    "http://localhost:5173",
-    "http://[::1]:5173",
-}
 _LOCAL_BROWSER_HOSTS = {"127.0.0.1", "localhost", "::1"}
+# The Vite development server proxies /api requests to the local app.
+_DEV_SERVER_PORT = 5173
 
 
-def _hostname_from_host_header(value: str) -> str:
-    """Return a normalized hostname while rejecting malformed port syntax."""
+def _parse_port(text: str) -> int | None:
+    """Return a valid TCP port from ASCII digits only; str.isdigit also accepts '²'."""
+    if not text or not text.isascii() or not text.isdigit():
+        return None
+    port = int(text)
+    return port if 1 <= port <= 65535 else None
+
+
+def _split_host_header(value: str) -> tuple[str, int | None] | None:
+    """Return (hostname, port) from a Host header, or None when it is malformed."""
     host = value.strip().lower()
     if host.startswith("["):
         closing = host.find("]")
-        suffix = host[closing + 1:] if closing >= 0 else ""
-        if closing < 0 or (
-            suffix and not (suffix.startswith(":") and suffix[1:].isdigit())
-        ):
-            return ""
-        return host[1:closing]
+        if closing < 0 or ":" not in host[1:closing]:
+            return None
+        suffix = host[closing + 1:]
+        if not suffix:
+            return host[1:closing], None
+        port = _parse_port(suffix[1:]) if suffix.startswith(":") else None
+        return (host[1:closing], port) if port else None
     if host.count(":") == 1:
-        hostname, port = host.rsplit(":", 1)
-        if not port.isdigit():
-            return ""
-        return hostname
-    return host if ":" not in host else ""
+        hostname, port_text = host.rsplit(":", 1)
+        port = _parse_port(port_text)
+        return (hostname, port) if port else None
+    return (host, None) if ":" not in host else None
+
+
+def _is_local_origin(origin: str, request_port: int | None) -> bool:
+    """Accept only the origin of this app itself (whatever port it runs on) or the dev server.
+
+    Browsers send an Origin header on every same-origin POST too, so this must
+    follow the port chosen with ``aqda --port`` instead of a fixed list.
+    """
+    try:
+        parts = urlsplit(origin.strip().lower())
+        origin_port = parts.port
+    except ValueError:
+        return False
+    if parts.scheme != "http" or parts.hostname not in _LOCAL_BROWSER_HOSTS:
+        return False
+    return (origin_port or 80) in {request_port or 80, _DEV_SERVER_PORT}
 
 
 @app.middleware("http")
 async def require_local_http_context(request, call_next):
-    """Reject DNS-rebinding reads and browser-driven cross-site writes.
+    """Reject DNS-rebinding reads and browser-driven cross-site requests.
 
     Every request must retain a localhost Host header. Origin-less local requests
     remain available to the command line and native folder picker. Browsers attach
     an Origin to cross-site POST/PUT/PATCH/DELETE requests, which prevents an
-    arbitrary website from closing AQDA or changing its data.
+    arbitrary website from closing AQDA or changing its data. They also label every
+    cross-site request, including image or iframe loads of GET routes such as the
+    snapshot export, with Sec-Fetch-Site, so those are refused for all methods.
     """
-    hostname = _hostname_from_host_header(request.headers.get("host", ""))
-    if hostname not in _LOCAL_BROWSER_HOSTS:
+    host = _split_host_header(request.headers.get("host", ""))
+    if host is None or host[0] not in _LOCAL_BROWSER_HOSTS:
         return JSONResponse(
             {"detail": "AQDA only accepts requests addressed to localhost"},
             status_code=400,
         )
+    if request.headers.get("sec-fetch-site", "").strip().lower() == "cross-site":
+        return JSONResponse(
+            {"detail": "Cross-site requests to AQDA are not allowed"},
+            status_code=403,
+        )
     if request.method not in {"GET", "HEAD", "OPTIONS"}:
         origin = request.headers.get("origin")
-        if origin and origin not in _LOCAL_BROWSER_ORIGINS:
+        if origin and not _is_local_origin(origin, host[1]):
             return JSONResponse(
                 {"detail": "Cross-site requests to AQDA are not allowed"},
                 status_code=403,

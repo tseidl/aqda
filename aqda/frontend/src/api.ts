@@ -1,13 +1,24 @@
 const BASE = '/api';
 
+/** The API's human-readable `detail` when the error body carries one, else the raw body. */
+async function errorDetail(res: Response): Promise<string> {
+  const text = await res.text();
+  try {
+    const parsed = JSON.parse(text);
+    if (typeof parsed?.detail === 'string') return parsed.detail;
+  } catch {
+    // not JSON, keep raw text
+  }
+  return text;
+}
+
 async function request<T>(path: string, opts?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json' },
     ...opts,
   });
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`${res.status}: ${text}`);
+    throw new Error(`${res.status}: ${await errorDetail(res)}`);
   }
   if (res.status === 204) return undefined as T;
   return res.json();
@@ -204,6 +215,8 @@ export interface ConsistencyResult {
   code_name: string;
   segment_count: number;
   avg_similarity: number;
+  /** Adaptive per-code cutoff; null when the code has too few segments to judge. */
+  outlier_cutoff: number | null;
   outliers: ConsistencyOutlier[];
 }
 
@@ -250,16 +263,7 @@ export const projects = {
     form.append('mode', mode);
     if (targetLineageId) form.append('target_lineage_id', targetLineageId);
     const res = await fetch(`${BASE}/projects/import-db`, { method: 'POST', body: form });
-    if (!res.ok) {
-      const text = await res.text();
-      let message = text;
-      try {
-        message = JSON.parse(text).detail ?? text;
-      } catch {
-        // not JSON, keep raw text
-      }
-      throw new Error(message);
-    }
+    if (!res.ok) throw new Error(await errorDetail(res));
     return res.json();
   },
 };
@@ -319,7 +323,7 @@ export const documents = {
     form.append('project_id', String(projectId));
     form.append('file', file);
     const res = await fetch(`${BASE}/documents`, { method: 'POST', body: form });
-    if (!res.ok) throw new Error(await res.text());
+    if (!res.ok) throw new Error(await errorDetail(res));
     return res.json();
   },
   uploadBulk: async (
@@ -336,7 +340,7 @@ export const documents = {
       form.append('project_id', String(projectId));
       for (const f of batch) form.append('files', f);
       const res = await fetch(`${BASE}/documents/bulk`, { method: 'POST', body: form });
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) throw new Error(await errorDetail(res));
       const data: BulkUploadResult = await res.json();
       documents.push(...data.documents);
       skipped.push(...data.skipped);
@@ -379,9 +383,6 @@ export const codes = {
     request<{ name: string; code_count: number; child_count: number; coding_count: number }>(
       `/codes/${id}/delete-impact`
     ),
-  trash: (projectId: number) => request<Code[]>(`/codes/trash?project_id=${projectId}`),
-  restore: (id: number) =>
-    request<Code>(`/codes/${id}/restore`, { method: 'POST' }),
 };
 
 export const codings = {
@@ -427,22 +428,17 @@ export const settings = {
 export const ai = {
   findSimilar: (data: { project_id: number; query: string; code_id?: number; document_ids?: number[]; top_k?: number; embedding_model?: string }, signal?: AbortSignal) =>
     request<SimilarResult[]>('/ai/similar', { method: 'POST', body: JSON.stringify(data), signal }),
-  analyze: (data: { text: string; instruction?: string; llm_model?: string }, signal?: AbortSignal) =>
-    request<{ analysis: string }>('/ai/analyze', { method: 'POST', body: JSON.stringify(data), signal }),
   autoCode: (data: { project_id: number; code_id: number; top_k?: number; embedding_model?: string }, signal?: AbortSignal) =>
     request<SimilarResult[]>('/ai/autocode', { method: 'POST', body: JSON.stringify(data), signal }),
   summarizeCode: (data: { project_id: number; code_id: number; llm_model?: string }, signal?: AbortSignal) =>
     request<{ summary: string; segment_count: number }>('/ai/summarize-code', { method: 'POST', body: JSON.stringify(data), signal }),
   consistencyCheck: (data: { project_id: number; code_id?: number; similarity_threshold?: number; embedding_model?: string }, signal?: AbortSignal) =>
     request<{ results: ConsistencyResult[] }>('/ai/consistency-check', { method: 'POST', body: JSON.stringify(data), signal }),
-  negativeCases: (data: { project_id: number; code_id: number; top_k?: number; embedding_model?: string }, signal?: AbortSignal) =>
-    request<SimilarResult[]>('/ai/negative-cases', { method: 'POST', body: JSON.stringify(data), signal }),
   suggestHierarchy: (data: { project_id: number; llm_model?: string }, signal?: AbortSignal) =>
     request<HierarchySuggestion>('/ai/suggest-hierarchy', { method: 'POST', body: JSON.stringify(data), signal }),
   generateDefinition: (data: { project_id: number; code_id: number; llm_model?: string }, signal?: AbortSignal) =>
     request<{ definition: string; segment_count: number }>('/ai/generate-definition', { method: 'POST', body: JSON.stringify(data), signal }),
   embeddingProgress: () =>
     request<{ active: boolean; current: number; total: number; doc_name: string }>('/ai/embedding-progress'),
-  embeddingStatus: (projectId: number) =>
-    request<{ documents: { id: number; name: string; embedded: boolean }[]; embedded_count: number; total_count: number }>(`/ai/embedding-status?project_id=${projectId}`),
+  cancel: () => request<{ cancelled: boolean }>('/ai/cancel', { method: 'POST' }),
 };

@@ -1,5 +1,67 @@
 # Changelog
 
+## Unreleased
+
+### New features
+- **Word documents** — `.docx` files import as plain text (paragraphs preserved, formatting
+  dropped). Other office formats (`.doc`, `.rtf`, `.odt`, spreadsheets, presentations) are
+  refused with a clear message instead of being imported as garbage.
+- **Richer REFI-QDA export** — `.qdpx` now carries document variables (as REFI variables on
+  each source) and memos linked to their code, coded passage, passage (as a selection of its
+  own), or document; project memos are linked to the project. Empty projects export without
+  schema-invalid empty containers. Validated against the official REFI-QDA XSD.
+- **Filter box in the apply-code popup** — with more than eight codes, typing narrows the
+  list and Enter applies the first match.
+- **Paragraph-aware chunking (optional)** — Settings › Text Chunking can keep AI search
+  chunks within one line (one paragraph or speaker turn), with a warning about formats that
+  break every line.
+
+### Bug fixes
+- **`aqda --port` works again** — the same-origin check followed a fixed port list, so on
+  any other port the browser's own requests were rejected as cross-site and nothing could
+  be saved. The check now follows the port AQDA runs on.
+- **Consistency Check now finds outliers** — its fixed similarity threshold never fired with
+  real embedding models (even unrelated text scores above it). Outliers are now flagged
+  relative to each code: more than 1.5 standard deviations below the code's mean, with a
+  minimum gap, for codes with at least four segments; codes with fewer say so instead of
+  reporting "consistent".
+- **Code Suggest never proposes an already-coded passage** — suggestions are now checked
+  against existing codings and de-duplicated *after* snapping to sentence boundaries, applying
+  one removes overlapping suggestions from the list, and results stay bound to the code they
+  were produced for even if the selector changes afterwards.
+- **Restored codes no longer vanish from exports** — a code restored while its former parent
+  is still in the trash (or a code caught in a parent cycle in imported data) is exported as
+  a top-level code instead of being dropped together with its codings.
+- **Typing a code definition no longer loses keystrokes** when an autosave completes
+  mid-sentence; edits arriving from elsewhere are still picked up while the draft is untouched.
+- **Topic Search no longer silently narrows to a code** selected earlier in another AI mode.
+- **Project dates** are read as UTC (Safari showed "Invalid Date", Chrome shifted them by the
+  local timezone); a missing date no longer breaks the project list.
+- **Cross-site image or iframe loads** can no longer trigger snapshot exports; browsers'
+  `Sec-Fetch-Site` header is honoured for every request method.
+- A malformed `Host` port now returns a clear 400 instead of a server error.
+
+### Improvements
+- **Collaboration backups are pruned** — the full-database backup taken before a
+  collaborator's version replaces local data used to accumulate without limit; the ten newest
+  are kept by default (Settings › Collaboration).
+- **Cancel in the AI panel stops the server too** — embedding halts after the current batch
+  and already-embedded chunks stay cached.
+- **The same code cannot be applied twice to exactly the same passage**; different codes on
+  one passage remain possible as before.
+- Large documents stay responsive: coding offsets, find matches, and selections no longer
+  re-scan the whole text per conversion.
+- Building a collaboration snapshot runs off the event loop, so background publishing of
+  large (audio) projects no longer freezes the UI.
+- Error messages show the server's explanation instead of a raw JSON body.
+- The fresh-database schema version is derived from the migration table.
+
+### Removed
+- **AI Analyze** (free-form LLM interpretation of a selected passage) — the one feature where
+  the model produced the analysis itself rather than reflecting on the researcher's coding.
+- The `--host` flag: AQDA is localhost-only by design, and the flag could not work anyway.
+- Unused API endpoints (`negative-cases`, `embedding-status`, `analyze`).
+
 ## 0.3.2
 
 ### New features

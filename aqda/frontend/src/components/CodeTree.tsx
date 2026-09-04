@@ -286,25 +286,40 @@ function CodeDescriptionEditor({ code, projectId, codes, memos, onJumpToMention 
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [summarySegments, setSummarySegments] = useState(0);
   const [copied, setCopied] = useState(false);
-
-  // Sync when switching codes
-  useEffect(() => {
-    setDesc(code.description);
-    setSummaryText(null);
-    setSummarySegments(0);
-  }, [code.id, code.description]);
+  const [saveFailed, setSaveFailed] = useState(false);
+  // confirmedRef: the description known to be stored on the server.
+  // pendingRef: the latest local value not yet confirmed saved (debounced or in flight).
+  const confirmedRef = useRef(code.description);
+  const pendingRef = useRef<string | null>(null);
 
   const updateMut = useMutation({
     mutationFn: (description: string) => codesApi.update(code.id, { description }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['codes', projectId] }),
+    onSuccess: (_, value) => {
+      confirmedRef.current = value;
+      if (pendingRef.current === value) pendingRef.current = null;
+      setSaveFailed(false);
+      queryClient.invalidateQueries({ queryKey: ['codes', projectId] });
+    },
+    onError: () => setSaveFailed(true),
   });
+
+  // Accept a change made elsewhere (another tab, a sync) only while the draft is
+  // pristine, nothing is waiting to be saved, and the editor is not focused. A
+  // refetch that merely echoes our own save changes nothing; a stale refetch while
+  // a save is pending can no longer roll the draft back.
+  useEffect(() => {
+    if (editing || pendingRef.current !== null || desc !== confirmedRef.current) return;
+    if (code.description !== confirmedRef.current) {
+      confirmedRef.current = code.description;
+      setDesc(code.description);
+    }
+  }, [code.description, desc, editing]);
 
   const handleChange = (value: string) => {
     setDesc(value);
+    pendingRef.current = value;
     clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => {
-      updateMut.mutate(value);
-    }, 800);
+    saveTimer.current = setTimeout(() => updateMut.mutate(value), 800);
   };
 
   const handleSummarize = async () => {
@@ -364,7 +379,11 @@ function CodeDescriptionEditor({ code, projectId, codes, memos, onJumpToMention 
       )}
       <div className="flex items-center justify-between mt-1">
         <p className="text-xs text-gray-400">
-          {updateMut.isPending ? 'Saving...' : 'Auto-saves as you type'}
+          {updateMut.isPending
+            ? 'Saving...'
+            : saveFailed
+              ? 'Could not save; it will be retried with your next edit'
+              : 'Auto-saves as you type'}
         </p>
         <button
           onClick={handleSummarize}

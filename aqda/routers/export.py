@@ -1,5 +1,6 @@
 """Export routes — REFI-QDA (.qdpx), codebook (.qdc), CSV, JSON, standalone .aqda."""
 
+import asyncio
 import csv
 import io
 import json
@@ -25,9 +26,19 @@ def _uuid() -> str:
     return str(uuid.uuid4())
 
 
+def _is_xml_char(codepoint: int) -> bool:
+    """The XML 1.0 ``Char`` production."""
+    return (
+        codepoint in (0x9, 0xA, 0xD)
+        or 0x20 <= codepoint <= 0xD7FF
+        or 0xE000 <= codepoint <= 0xFFFD
+        or 0x10000 <= codepoint <= 0x10FFFF
+    )
+
+
 def _safe_xml_text(text: str) -> str:
-    """Remove XML-forbidden control characters; ElementTree performs escaping."""
-    return "".join(char for char in text if char in "\t\n\r" or ord(char) >= 0x20)
+    """Remove characters XML 1.0 forbids entirely; ElementTree performs escaping."""
+    return "".join(char for char in text if _is_xml_char(ord(char)))
 
 
 def _download_headers(filename: str) -> dict[str, str]:
@@ -117,6 +128,26 @@ async def _load_project_data(
             await db.close()
 
 
+async def _load_document_variables(project_id: int) -> dict[int, dict[str, str]]:
+    """Document variables keyed by document ID."""
+    db = await get_db()
+    try:
+        rows = await (
+            await db.execute(
+                "SELECT dv.document_id, dv.key, dv.value FROM document_variable dv "
+                "JOIN document d ON d.id=dv.document_id WHERE d.project_id=? "
+                "ORDER BY dv.document_id, dv.key",
+                (project_id,),
+            )
+        ).fetchall()
+    finally:
+        await db.close()
+    variables: dict[int, dict[str, str]] = {}
+    for row in rows:
+        variables.setdefault(row["document_id"], {})[row["key"]] = row["value"]
+    return variables
+
+
 async def _get_coder_name() -> str:
     """Configured coder identity for REFI-QDA <User>, falling back to a default."""
     db = await get_db()
@@ -131,39 +162,105 @@ async def _get_coder_name() -> str:
 
 # --- REFI-QDA Export ---
 
-def _build_code_tree(codes: list[dict], parent_id=None) -> list[dict]:
-    """Build hierarchical code tree."""
-    children = [c for c in codes if c["parent_id"] == parent_id]
-    for child in children:
-        child["children"] = _build_code_tree(codes, child["id"])
-    return children
+def _build_code_tree(codes: list[dict]) -> list[dict]:
+    """Build the hierarchical code tree.
+
+    A code whose parent is not in ``codes`` (for example a restored code whose
+    parent is still in the trash) becomes a top-level code, as in the sidebar,
+    instead of vanishing from the export along with its codings.
+    """
+    known = {code["id"] for code in codes}
+    by_parent: dict[int | None, list[dict]] = {}
+    for code in codes:
+        parent_id = code["parent_id"] if code["parent_id"] in known else None
+        by_parent.setdefault(parent_id, []).append(code)
+
+    visited: set[int] = set()
+
+    def attach(parent_id: int | None) -> list[dict]:
+        children = []
+        for child in by_parent.get(parent_id, []):
+            if child["id"] in visited:
+                continue
+            visited.add(child["id"])
+            child["children"] = attach(child["id"])
+            children.append(child)
+        return children
+
+    roots = attach(None)
+    # A parent cycle (only possible in imported data) is unreachable from the top.
+    # Promote one member of each cycle to a top-level code rather than dropping it.
+    for code in codes:
+        if code["id"] not in visited:
+            visited.add(code["id"])
+            code["children"] = attach(code["id"])
+            roots.append(code)
+    return roots
 
 
-def _add_codes_xml(parent_el, codes_tree: list[dict], guid_map: dict):
-    """Recursively add codes to XML."""
+def _add_codes_xml(
+    parent_el,
+    codes_tree: list[dict],
+    guid_map: dict,
+    notes_by_code: dict[int, list[str]] | None = None,
+):
+    """Recursively add codes to XML (CodeType order: Description, NoteRef, child Codes)."""
     for code in codes_tree:
         guid = _uuid()
         guid_map[("code", code["id"])] = guid
         code_el = SubElement(parent_el, "Code", {
             "guid": guid,
-            "name": code["name"],
+            "name": _safe_xml_text(code["name"]),
             "isCodable": "true",
             "color": code["color"],
         })
         if code.get("description"):
             desc = SubElement(code_el, "Description")
             desc.text = _safe_xml_text(code["description"])
+        for note_guid in (notes_by_code or {}).get(code["id"], []):
+            SubElement(code_el, "NoteRef", {"targetGUID": note_guid})
         if code.get("children"):
-            _add_codes_xml(code_el, code["children"], guid_map)
+            _add_codes_xml(code_el, code["children"], guid_map, notes_by_code)
 
 
 @router.get("/{project_id}/qdpx")
 async def export_qdpx(project_id: int):
     """Export project as REFI-QDA .qdpx file."""
     project, documents, codes, codings, memos = await _load_project_data(project_id)
+    variables = await _load_document_variables(project_id)
     default_coder = await _get_coder_name()
 
     guid_map = {}
+
+    # Memos become Notes; each is referenced from the code, the coded selection, the
+    # passage, and/or the document it belongs to, or from the project when none of
+    # those is exported (for example when its code is in the trash).
+    note_guids = {memo["id"]: _uuid() for memo in memos}
+    exported_codes = {code["id"] for code in codes}
+    exported_codings = {cg["id"] for cg in codings}
+    exported_docs = {doc["id"] for doc in documents}
+    notes_by_code: dict[int, list[str]] = {}
+    notes_by_coding: dict[int, list[str]] = {}
+    notes_by_passage: dict[int, list[tuple[dict, str]]] = {}
+    notes_by_doc: dict[int, list[str]] = {}
+    project_notes: list[str] = []
+    for memo in memos:
+        guid = note_guids[memo["id"]]
+        linked = False
+        if memo.get("code_id") in exported_codes:
+            notes_by_code.setdefault(memo["code_id"], []).append(guid)
+            linked = True
+        if memo.get("coding_id") in exported_codings:
+            notes_by_coding.setdefault(memo["coding_id"], []).append(guid)
+            linked = True
+        elif memo.get("document_id") in exported_docs:
+            if memo.get("start_pos") is not None and memo.get("end_pos") is not None:
+                notes_by_passage.setdefault(memo["document_id"], []).append((memo, guid))
+            else:
+                notes_by_doc.setdefault(memo["document_id"], []).append(guid)
+            linked = True
+        if not linked:
+            project_notes.append(guid)
 
     # Per-coding attribution: one <User> per distinct coder name. Codings with no
     # recorded coder fall back to the configured default.
@@ -180,7 +277,7 @@ async def export_qdpx(project_id: int):
     # Build XML. ProjectType sequence per REFI-QDA XSD: Users, CodeBook, ..., Sources, Notes, ..., Description (last).
     root = Element("Project", _attrs(
         xmlns="urn:QDA-XML:project:1.0",
-        name=project["name"],
+        name=_safe_xml_text(project["name"]),
         origin="AQDA",
         creatingUserGUID=default_guid,
         creationDateTime=_xs_datetime(project["created_at"]),
@@ -189,16 +286,33 @@ async def export_qdpx(project_id: int):
     # Users (sorted for stable output)
     users_el = SubElement(root, "Users")
     for name in sorted(coder_to_guid):
-        SubElement(users_el, "User", {"guid": coder_to_guid[name], "name": name})
+        SubElement(users_el, "User", {"guid": coder_to_guid[name], "name": _safe_xml_text(name)})
 
-    # CodeBook
-    codebook_el = SubElement(root, "CodeBook")
-    codes_el = SubElement(codebook_el, "Codes")
+    # CodeBook. The schema requires at least one Code inside Codes, while the
+    # CodeBook element itself is optional, so an empty codebook is omitted.
     code_tree = _build_code_tree(codes)
-    _add_codes_xml(codes_el, code_tree, guid_map)
+    if code_tree:
+        codebook_el = SubElement(root, "CodeBook")
+        codes_el = SubElement(codebook_el, "Codes")
+        _add_codes_xml(codes_el, code_tree, guid_map, notes_by_code)
 
-    # Sources (documents). Files go to "Sources/{guid}.txt"; XML references them as "internal://{guid}.txt".
-    sources_el = SubElement(root, "Sources")
+    # Variables: one Text variable per distinct document-variable key.
+    variable_guids = {
+        key: _uuid()
+        for key in sorted({key for values in variables.values() for key in values})
+    }
+    if variable_guids:
+        variables_el = SubElement(root, "Variables")
+        for key, guid in variable_guids.items():
+            SubElement(variables_el, "Variable", {
+                "guid": guid,
+                "name": _safe_xml_text(key),
+                "typeOfVariable": "Text",
+            })
+
+    # Sources (documents). Files go to "Sources/{guid}.txt"; XML references them as
+    # "internal://{guid}.txt". Like CodeBook, an empty Sources element is invalid.
+    sources_el = SubElement(root, "Sources") if documents else None
     codings_by_doc = {}
     for cg in codings:
         codings_by_doc.setdefault(cg["document_id"], []).append(cg)
@@ -208,13 +322,14 @@ async def export_qdpx(project_id: int):
         guid_map[("doc", doc["id"])] = doc_guid
         source_el = SubElement(sources_el, "TextSource", _attrs(
             guid=doc_guid,
-            name=doc["name"],
+            name=_safe_xml_text(doc["name"]),
             plainTextPath=f"internal://{doc_guid}.txt",
             creatingUser=default_guid,
             creationDateTime=_xs_datetime(doc["created_at"]),
         ))
 
-        # Add coded selections, attributed to the coder who made each one
+        # TextSourceType order: PlainTextSelection*, Coding*, NoteRef*, VariableValue*.
+        # Coded selections are attributed to the coder who made each one.
         for cg in codings_by_doc.get(doc["id"], []):
             sel_guid = _uuid()
             coder_guid = _coder_guid(cg)
@@ -230,27 +345,49 @@ async def export_qdpx(project_id: int):
                 creatingUser=coder_guid,
                 creationDateTime=_xs_datetime(cg["created_at"]),
             ))
-            code_guid = guid_map.get(("code", cg["code_id"]), _uuid())
-            SubElement(coding_el, "CodeRef", {"targetGUID": code_guid})
+            # Every exported coding belongs to an exported code; a missing entry
+            # would be a bug and must fail rather than emit a dangling reference.
+            SubElement(coding_el, "CodeRef", {"targetGUID": guid_map[("code", cg["code_id"])]})
+            for note_guid in notes_by_coding.get(cg["id"], []):
+                SubElement(sel_el, "NoteRef", {"targetGUID": note_guid})
+
+        # A memo anchored to a passage keeps its span as a selection without a Coding.
+        for memo, note_guid in notes_by_passage.get(doc["id"], []):
+            passage_el = SubElement(source_el, "PlainTextSelection", _attrs(
+                guid=_uuid(),
+                startPosition=str(memo["start_pos"]),
+                endPosition=str(memo["end_pos"]),
+                creatingUser=default_guid,
+                creationDateTime=_xs_datetime(memo["created_at"]),
+            ))
+            SubElement(passage_el, "NoteRef", {"targetGUID": note_guid})
+
+        for note_guid in notes_by_doc.get(doc["id"], []):
+            SubElement(source_el, "NoteRef", {"targetGUID": note_guid})
+        for key, value in variables.get(doc["id"], {}).items():
+            value_el = SubElement(source_el, "VariableValue")
+            SubElement(value_el, "VariableRef", {"targetGUID": variable_guids[key]})
+            SubElement(value_el, "TextValue").text = _safe_xml_text(value)
 
     # Notes (memos)
     if memos:
         notes_el = SubElement(root, "Notes")
         for memo in memos:
-            note_guid = _uuid()
             note_el = SubElement(notes_el, "Note", _attrs(
-                guid=note_guid,
-                name=memo["title"] or "Memo",
+                guid=note_guids[memo["id"]],
+                name=_safe_xml_text(memo["title"] or "Memo"),
                 creatingUser=default_guid,
                 creationDateTime=_xs_datetime(memo["created_at"]),
             ))
             content_el = SubElement(note_el, "PlainTextContent")
             content_el.text = _safe_xml_text(memo["content"])
 
-    # Description must come after Notes per the ProjectType sequence in the XSD.
+    # Description, then project-level NoteRefs, per the ProjectType sequence in the XSD.
     if project.get("description"):
         desc = SubElement(root, "Description")
         desc.text = _safe_xml_text(project["description"])
+    for note_guid in project_notes:
+        SubElement(root, "NoteRef", {"targetGUID": note_guid})
 
     # Build ZIP
     xml_bytes = b'<?xml version="1.0" encoding="UTF-8"?>\n' + tostring(root, encoding="unicode").encode("utf-8")
@@ -285,12 +422,14 @@ async def export_codebook(project_id: int):
     project, documents, codes, codings, memos = await _load_project_data(project_id)
 
     guid_map = {}
+    code_tree = _build_code_tree(codes)
+    if not code_tree:
+        raise HTTPException(400, "This project has no codes to export as a codebook")
     root = Element("CodeBook", {
         "xmlns": "urn:QDA-XML:codebook:1.0",
         "origin": "AQDA",
     })
     codes_el = SubElement(root, "Codes")
-    code_tree = _build_code_tree(codes)
     _add_codes_xml(codes_el, code_tree, guid_map)
 
     xml_bytes = b'<?xml version="1.0" encoding="UTF-8"?>\n' + tostring(root, encoding="unicode").encode("utf-8")
@@ -336,21 +475,7 @@ async def export_csv(project_id: int):
 async def export_json(project_id: int):
     """Export analysis-oriented project data as JSON (not an archive format)."""
     project, documents, codes, codings, memos = await _load_project_data(project_id)
-
-    db = await get_db()
-    try:
-        variables: dict[int, dict[str, str]] = {}
-        rows = await (
-            await db.execute(
-                "SELECT dv.document_id, dv.key, dv.value FROM document_variable dv "
-                "JOIN document d ON d.id=dv.document_id WHERE d.project_id=?",
-                (project_id,),
-            )
-        ).fetchall()
-        for row in rows:
-            variables.setdefault(row["document_id"], {})[row["key"]] = row["value"]
-    finally:
-        await db.close()
+    variables = await _load_document_variables(project_id)
 
     docs_meta = []
     for document in documents:
@@ -459,7 +584,28 @@ async def build_aqda_snapshot(project_id: int) -> tuple[bytes, dict, str]:
     finally:
         await db.close()
 
-    # Build a standalone SQLite database with just this project
+    # Building the standalone file is synchronous SQLite work that can take
+    # seconds for projects with audio; keep it off the event loop so the UI
+    # stays responsive while the background sync publishes a snapshot.
+    data = await asyncio.to_thread(
+        _write_standalone_snapshot,
+        project, documents, codes, codings, memos,
+        doc_vars, snapshot_history, deletion_batches,
+    )
+    return data, project, snapshot_id
+
+
+def _write_standalone_snapshot(
+    project: dict,
+    documents: list[dict],
+    codes: list[dict],
+    codings: list[dict],
+    memos: list[dict],
+    doc_vars: list[dict],
+    snapshot_history: list[dict],
+    deletion_batches: list[dict],
+) -> bytes:
+    """Write one project into a fresh single-project database and return its bytes."""
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
     tmp.close()
     con = None
@@ -585,7 +731,7 @@ async def build_aqda_snapshot(project_id: int) -> tuple[bytes, dict, str]:
             con.close()
         os.unlink(tmp.name)
 
-    return data, project, snapshot_id
+    return data
 
 
 @router.get("/{project_id}/aqda")

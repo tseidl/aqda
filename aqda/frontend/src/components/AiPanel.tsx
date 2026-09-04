@@ -66,6 +66,11 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
   const queryClient = useQueryClient();
   // Track which suggestion (by index) is being applied, to disable its buttons
   const [applyingIdx, setApplyingIdx] = useState<number | null>(null);
+  // The code a Code Suggest run was made for; Apply must use this even if the
+  // selector changed afterwards.
+  const [suggestionCodeId, setSuggestionCodeId] = useState<number | null>(null);
+  // Run stays disabled until the server has acknowledged a cancel.
+  const [cancelling, setCancelling] = useState(false);
 
   // Poll embedding progress while loading
   useEffect(() => {
@@ -127,14 +132,24 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
     }
   };
 
-  const handleCancel = () => {
+  const handleCancel = async () => {
+    setCancelling(true);
     abortRef.current?.abort();
     abortRef.current = null;
-    setLoading(false);
+    try {
+      // Also stop the server-side embedding after its current batch.
+      await ai.cancel();
+    } catch {
+      // the server may already be idle
+    } finally {
+      setCancelling(false);
+      setLoading(false);
+    }
   };
 
   const clearResults = () => {
     setSimilarResults([]);
+    setSuggestionCodeId(null);
     setConsistencyResults([]);
     setHierarchyResult(null);
     setDefinitionResult(null);
@@ -143,24 +158,51 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
 
   // Accept a Code Suggest result: apply the selected code to its span, then
   // remove it so the list cycles to the remaining suggestions.
+  // Drop a suggestion plus any other suggestion overlapping the same passage of the
+  // same document, so the list never offers a span that would overlap that coding.
+  const dropSuggestionsOverlapping = (r: SimilarResult, index: number) => {
+    setSimilarResults((prev) => prev.filter((s, i) =>
+      i !== index &&
+      !(s.document_id === r.document_id && s.start_pos < r.end_pos && s.end_pos > r.start_pos)
+    ));
+  };
+
   const acceptSuggestion = async (index: number) => {
     const r = similarResults[index];
-    if (!r || !selectedCodeId) return;
+    if (!r || !suggestionCodeId) return;
     setApplyingIdx(index);
     try {
+      // Suggestions were filtered when the run finished; a coding made since then
+      // (by hand, or in another tab) must not be overlapped by applying one now.
+      const current = await codingsApi.list({ code_id: suggestionCodeId, project_id: projectId });
+      const codedMeanwhile = current.some((c) =>
+        c.document_id === r.document_id && c.start_pos < r.end_pos && c.end_pos > r.start_pos
+      );
+      if (codedMeanwhile) {
+        dropSuggestionsOverlapping(r, index);
+        setError('That passage was coded in the meantime, so the suggestion was removed.');
+        return;
+      }
       await codingsApi.create({
         document_id: r.document_id,
-        code_id: selectedCodeId,
+        code_id: suggestionCodeId,
         start_pos: r.start_pos,
         end_pos: r.end_pos,
         selected_text: r.text,
       });
+      dropSuggestionsOverlapping(r, index);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : 'Failed to apply code';
+      if (/^409:/.test(message)) {
+        // Already applied exactly: treat like a coding made meanwhile.
+        dropSuggestionsOverlapping(r, index);
+        setError('That passage already carries this code, so the suggestion was removed.');
+      } else {
+        setError(message);
+      }
+    } finally {
       queryClient.invalidateQueries({ queryKey: ['codings'] });
       queryClient.invalidateQueries({ queryKey: ['codes', projectId] });
-      setSimilarResults((prev) => prev.filter((_, i) => i !== index));
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to apply code');
-    } finally {
       setApplyingIdx(null);
     }
   };
@@ -186,18 +228,20 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
       switch (mode) {
         case 'search': {
           const res = await ai.findSimilar(
-            { project_id: projectId, query: query.trim(), code_id: selectedCodeId ?? undefined, embedding_model: effectiveEmbed || undefined },
+            { project_id: projectId, query: query.trim(), embedding_model: effectiveEmbed || undefined },
             abortRef.current.signal,
           );
           setSimilarResults(res);
           break;
         }
         case 'autocode': {
+          const codeId = selectedCodeId!;
           const res = await ai.autoCode(
-            { project_id: projectId, code_id: selectedCodeId!, embedding_model: effectiveEmbed || undefined },
+            { project_id: projectId, code_id: codeId, embedding_model: effectiveEmbed || undefined },
             abortRef.current.signal,
           );
           setSimilarResults(res);
+          setSuggestionCodeId(codeId);
           break;
         }
         case 'consistency': {
@@ -374,8 +418,13 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
         <div className="mb-2">
           <select
             value={selectedCodeId ?? ''}
-            onChange={(e) => setSelectedCodeId(e.target.value ? Number(e.target.value) : null)}
-            className="w-full px-2 py-1.5 text-sm border border-gray-200 rounded-md focus:outline-none focus:ring-1 focus:ring-purple-500"
+            disabled={loading || applyingIdx !== null}
+            onChange={(e) => {
+              // Results belong to the code they were produced for; changing it clears them.
+              setSelectedCodeId(e.target.value ? Number(e.target.value) : null);
+              clearResults();
+            }}
+            className="w-full px-2 py-1.5 text-sm border border-gray-200 rounded-md focus:outline-none focus:ring-1 focus:ring-purple-500 disabled:opacity-60"
           >
             <option value="">{mode === 'consistency' ? 'All codes (or select one)' : 'Select a code...'}</option>
             {codes.map((c) => (
@@ -390,9 +439,10 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
         <div className="space-y-2">
           <button
             onClick={handleCancel}
-            className="w-full py-2 bg-red-500 text-white rounded-md text-sm font-medium hover:bg-red-600 flex items-center justify-center gap-1.5"
+            disabled={cancelling}
+            className="w-full py-2 bg-red-500 text-white rounded-md text-sm font-medium hover:bg-red-600 disabled:opacity-60 flex items-center justify-center gap-1.5"
           >
-            <X size={14} /> Cancel
+            <X size={14} /> {cancelling ? 'Cancelling…' : 'Cancel'}
           </button>
           {embeddingProgress && (
             <div className="px-1">
@@ -416,7 +466,7 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
       ) : (
         <button
           onClick={handleRun}
-          disabled={!canRun()}
+          disabled={!canRun() || cancelling}
           className="w-full py-2 bg-purple-600 text-white rounded-md text-sm font-medium hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-1.5 transition-colors"
         >
           {currentMode.icon}
@@ -458,7 +508,7 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
                     {r.text.length > 150 ? r.text.slice(0, 150) + '...' : r.text}
                   </p>
                 </button>
-                {mode === 'autocode' && selectedCodeId && (
+                {mode === 'autocode' && suggestionCodeId && (
                   <div className="flex gap-1 mt-1.5">
                     <button
                       type="button"
@@ -506,7 +556,9 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
                     {(cr.avg_similarity * 100).toFixed(0)}%
                   </span>
                 </div>
-                {cr.outliers.length > 0 ? (
+                {cr.outlier_cutoff === null ? (
+                  <p className="text-[10px] text-gray-400">Needs at least four segments to judge consistency</p>
+                ) : cr.outliers.length > 0 ? (
                   <div className="space-y-1">
                     <p className="text-[10px] text-orange-600 font-medium">
                       {cr.outliers.length} outlier{cr.outliers.length !== 1 ? 's' : ''} found

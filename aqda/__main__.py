@@ -21,9 +21,6 @@ def build_parser():
     )
     parser.add_argument("--version", action="version", version=f"aqda {__version__}")
     parser.add_argument(
-        "--host", default=DEFAULT_HOST, help=f"Interface to bind (default: {DEFAULT_HOST})"
-    )
-    parser.add_argument(
         "--port", type=int, default=DEFAULT_PORT, help=f"Port to bind (default: {DEFAULT_PORT})"
     )
     parser.add_argument(
@@ -40,15 +37,17 @@ def main():
         import time
 
         time.sleep(1.5)
-        webbrowser.open(f"http://{args.host}:{args.port}")
+        webbrowser.open(f"http://{DEFAULT_HOST}:{args.port}")
 
     if not args.no_browser:
         threading.Thread(target=open_browser, daemon=True).start()
 
-    print(f"\n  AQDA is running at http://{args.host}:{args.port}\n")
+    print(f"\n  AQDA is running at http://{DEFAULT_HOST}:{args.port}\n")
     from aqda.app import app
 
-    config = uvicorn.Config(app, host=args.host, port=args.port, log_level="warning")
+    # Always bound to the loopback interface: the database has no login, and the
+    # request middleware only accepts localhost Host headers anyway.
+    config = uvicorn.Config(app, host=DEFAULT_HOST, port=args.port, log_level="warning")
     server = uvicorn.Server(config)
     app.state.uvicorn_server = server
     # uvicorn exits with status 3 itself if the port is already in use.

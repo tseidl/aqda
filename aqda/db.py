@@ -9,7 +9,7 @@ from pathlib import Path
 
 DATA_DIR = Path(os.environ.get("AQDA_DATA_DIR", Path.home() / ".aqda"))
 
-SCHEMA = """
+_SCHEMA_TEMPLATE = """
 CREATE TABLE IF NOT EXISTS project (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -112,7 +112,9 @@ INSERT OR IGNORE INTO setting (key, value) VALUES
     ('shared_folder', ''),
     ('shared_folders', '[]'),
     ('device_id', ''),
-    ('schema_version', '11');
+    ('shared_update_backups', '10'),
+    ('chunk_mode', 'fixed'),
+    ('schema_version', '__SCHEMA_VERSION__');
 
 CREATE TABLE IF NOT EXISTS project_snapshot (
     snapshot_id TEXT PRIMARY KEY,
@@ -267,6 +269,9 @@ MIGRATIONS = {
 }
 
 LATEST_SCHEMA_VERSION = max(MIGRATIONS)
+# A fresh database is created at the latest version; deriving it here keeps the
+# migration table the single source of truth.
+SCHEMA = _SCHEMA_TEMPLATE.replace("__SCHEMA_VERSION__", str(LATEST_SCHEMA_VERSION))
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 
@@ -408,6 +413,17 @@ def _prune_backups(prefix: str, keep: int) -> None:
     matches = sorted(backup_dir.glob(f"aqda-{prefix}-*.db"), reverse=True)
     for stale in matches[keep:]:
         stale.unlink(missing_ok=True)
+
+
+def create_shared_update_backup(keep: int) -> Path:
+    """Back up before a collaborator snapshot replaces local data, keeping the newest ``keep``.
+
+    Active collaboration can fast-forward the local project many times a day, and
+    each backup is a full copy of the database, so these are pruned like the daily ones.
+    """
+    path = create_backup("before-shared-update")
+    _prune_backups("before-shared-update", keep=max(1, keep))
+    return path
 
 
 def create_daily_backup() -> Path | None:

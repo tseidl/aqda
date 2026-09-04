@@ -15,7 +15,7 @@ router = APIRouter()
 ALLOWED_SETTINGS = {
     "ollama_url", "llm_model", "embedding_model", "chunk_size", "chunk_overlap",
     "filename_pattern", "filename_variables", "whisper_model", "color_scheme",
-    "coder_name", "think_mode",
+    "coder_name", "think_mode", "shared_update_backups", "chunk_mode",
 }
 
 
@@ -47,6 +47,15 @@ def _validate_setting(key: str, value: str) -> str | None:
                 return "Chunk overlap must be between 0 and 500"
         except ValueError:
             return "Chunk overlap must be a number"
+    if key == "chunk_mode" and value not in {"fixed", "paragraph"}:
+        return "Chunking must be 'fixed' or 'paragraph'"
+    if key == "shared_update_backups":
+        try:
+            v = int(value)
+            if v < 1 or v > 100:
+                return "Keep between 1 and 100 collaboration backups"
+        except ValueError:
+            return "Collaboration backups must be a number"
     return None
 
 

@@ -77,16 +77,17 @@ export function SettingsPage() {
       setTimeout(() => setSaved(false), 2000);
     },
     onError: (err) => {
+      const msg = err instanceof Error ? err.message : String(err);
       try {
-        const msg = err instanceof Error ? err.message : String(err);
-        const jsonStr = msg.replace(/^\d+:\s*/, '');
-        const parsed = JSON.parse(jsonStr);
+        const parsed = JSON.parse(msg.replace(/^\d+:\s*/, ''));
         if (parsed.detail && typeof parsed.detail === 'object') {
           setSaveError(parsed.detail);
+          return;
         }
       } catch {
-        setSaveError(null);
+        // not a per-field validation response
       }
+      setSaveError({ error: msg });
     },
   });
 
@@ -283,6 +284,22 @@ export function SettingsPage() {
                 <p className="text-gray-500 mt-1">{sharedStatus?.backup_count ?? 0} in {sharedStatus?.backup_folder ?? 'the AQDA data folder'}</p>
               </div>
             </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Backups kept before collaborator updates
+              </label>
+              <input
+                type="number"
+                min={1}
+                max={100}
+                value={form.shared_update_backups ?? '10'}
+                onChange={(e) => update('shared_update_backups', e.target.value)}
+                className="w-32 px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+              <p className="text-xs text-gray-400 mt-1">
+                Each time a collaborator's version replaces your local data, AQDA first saves a full copy of the database. Only the newest copies are kept; each is as large as the whole database. Saved with the settings below.
+              </p>
+            </div>
             <p className="text-xs text-gray-500">
               You do not need a Save button. Closing AQDA with the Close AQDA button or pressing Ctrl+C once performs a final sync. If the computer stops unexpectedly, the hidden local copy is recovered and synced next time.
             </p>
@@ -449,6 +466,22 @@ export function SettingsPage() {
             <p className="text-xs text-gray-400">
               Documents are split into overlapping chunks for embedding search. 500 characters ≈ 100 words. Smaller chunks are more precise, larger chunks capture more context.
             </p>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Chunk boundaries</label>
+              <select
+                value={form.chunk_mode ?? 'fixed'}
+                onChange={(e) => update('chunk_mode', e.target.value)}
+                className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              >
+                <option value="fixed">Fixed-size windows (default)</option>
+                <option value="paragraph">One paragraph or speaker turn per line</option>
+              </select>
+              {(form.chunk_mode ?? 'fixed') === 'paragraph' && (
+                <p className="text-xs text-amber-700 mt-1">
+                  Works for transcripts with one speaker turn or paragraph per line. Files with a line break after every line, such as many PDFs, will produce many tiny chunks and poor search results. Lines longer than the chunk size are still split into windows. Documents are re-embedded on the next AI run.
+                </p>
+              )}
+            </div>
           </div>
         </section>
 
@@ -529,6 +562,16 @@ export function SettingsPage() {
         </section>
 
         {/* Save */}
+        {saveError && (
+          <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+            <p className="font-medium">Settings were not saved</p>
+            <ul className="mt-1 ml-4 list-disc text-xs">
+              {Object.entries(saveError).map(([key, message]) => (
+                <li key={key}>{key === 'error' ? message : `${key.replace(/_/g, ' ')}: ${message}`}</li>
+              ))}
+            </ul>
+          </div>
+        )}
         <button
           onClick={() => saveMut.mutate()}
           className="flex items-center gap-2 px-6 py-2.5 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 text-sm font-medium"

@@ -10,7 +10,7 @@ import aiosqlite
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 
-from aqda.db import create_backup, get_db
+from aqda.db import create_shared_update_backup, get_db
 
 router = APIRouter()
 
@@ -570,7 +570,13 @@ async def import_package_bytes(
                     plans.append(("copy" if mode == "copy" else "create", source_project, None, snapshots))
 
             if any(action == "update" for action, *_ in plans):
-                backup_path = str(await asyncio.to_thread(create_backup, "before-shared-update"))
+                keep_row = await (
+                    await dst.execute(
+                        "SELECT value FROM setting WHERE key='shared_update_backups'"
+                    )
+                ).fetchone()
+                keep = int(keep_row["value"]) if keep_row and keep_row["value"].isdigit() else 10
+                backup_path = str(await asyncio.to_thread(create_shared_update_backup, keep))
 
             for action, source_project, local_project, snapshots in plans:
                 incoming_lineage = _value(source_project, "lineage_id")

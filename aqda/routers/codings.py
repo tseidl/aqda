@@ -55,6 +55,9 @@ async def list_codings(document_id: int | None = None, code_id: int | None = Non
 async def create_coding(data: CodingCreate):
     db = await get_db()
     try:
+        # Take the write lock first so the duplicate check and the insert are one
+        # atomic step even when two tabs submit the same coding at the same time.
+        await db.execute("BEGIN IMMEDIATE")
         document = await (
             await db.execute(
                 "SELECT id, project_id, content, transcript, source_type FROM document WHERE id=?",
@@ -85,6 +88,18 @@ async def create_coding(data: CodingCreate):
                 "Selected text does not match the document at those boundaries. Reload and try again.",
             )
 
+        # Two different codes on one passage are normal; the same code twice on the
+        # exact same span is only ever an accidental double application.
+        duplicate = await (
+            await db.execute(
+                "SELECT id FROM coding WHERE document_id=? AND code_id=? AND start_pos=? "
+                "AND end_pos=? AND deleted_at IS NULL",
+                (data.document_id, data.code_id, data.start_pos, data.end_pos),
+            )
+        ).fetchone()
+        if duplicate:
+            raise HTTPException(409, "This code is already applied to exactly this passage.")
+
         # Stamp the coding with the current coder identity (per-coding attribution).
         cursor = await db.execute("SELECT value FROM setting WHERE key='coder_name'")
         row = await cursor.fetchone()
@@ -107,6 +122,10 @@ async def create_coding(data: CodingCreate):
             (coding_id,),
         )
         return dict(await cursor.fetchone())
+    except Exception:
+        if db.in_transaction:
+            await db.rollback()
+        raise
     finally:
         await db.close()
 

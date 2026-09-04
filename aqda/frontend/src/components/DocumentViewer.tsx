@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { X, Tag, Sparkles, ChevronDown, ChevronRight, ChevronUp, Plus, Trash2, Loader2, StickyNote, BookMarked, Search, Minus as MinusIcon, Plus as PlusIcon } from 'lucide-react';
-import { ai, codes as codesApi, documents as docsApi, type Document, type Coding, type Code, type Memo } from '../api';
+import { codes as codesApi, documents as docsApi, type Document, type Coding, type Code, type Memo } from '../api';
 import { MentionTextarea } from './MentionTextarea';
 import { buildMentionCandidates } from './mentions';
 
@@ -26,12 +26,58 @@ interface TextSelection {
   rect: { top: number; bottom: number; left: number };
 }
 
-function utf16ToCodePointOffset(text: string, offset: number): number {
-  return Array.from(text.slice(0, Math.max(0, offset))).length;
+/** Codings store Unicode code-point offsets while the DOM and JS strings count UTF-16
+ *  units. Only astral characters (emoji, some CJK) take two units, so recording where
+ *  they sit lets both conversions run in O(log n) instead of re-scanning the whole
+ *  text for every coding boundary, find match, and selection. */
+interface OffsetIndex {
+  /** Code-point index of each astral character, ascending. */
+  astralCodePoints: number[];
+  /** UTF-16 offset at which each astral character starts, ascending. */
+  astralUtf16: number[];
+  codePointLength: number;
+  utf16Length: number;
 }
 
-function codePointToUtf16Offset(text: string, offset: number): number {
-  return Array.from(text).slice(0, Math.max(0, offset)).join('').length;
+function buildOffsetIndex(text: string): OffsetIndex {
+  const astralCodePoints: number[] = [];
+  const astralUtf16: number[] = [];
+  let cp = 0;
+  for (let i = 0; i < text.length; i++, cp++) {
+    const unit = text.charCodeAt(i);
+    if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < text.length) {
+      const next = text.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        astralCodePoints.push(cp);
+        astralUtf16.push(i);
+        i++;
+      }
+    }
+  }
+  return { astralCodePoints, astralUtf16, codePointLength: cp, utf16Length: text.length };
+}
+
+/** Number of entries in an ascending array that are strictly less than `value`. */
+function countBelow(sorted: number[], value: number): number {
+  let lo = 0;
+  let hi = sorted.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (sorted[mid] < value) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function utf16ToCodePoint(index: OffsetIndex, offset: number): number {
+  const o = Math.max(0, Math.min(offset, index.utf16Length));
+  // A pair only collapses into one code point once both of its units lie before `o`.
+  return o - countBelow(index.astralUtf16, o - 1);
+}
+
+function codePointToUtf16(index: OffsetIndex, offset: number): number {
+  const cp = Math.max(0, Math.min(offset, index.codePointLength));
+  return cp + countBelow(index.astralCodePoints, cp);
 }
 
 export function DocumentViewer({ document: doc, codings, codes, memos, selectedCodeId, onApplyCode, onDeleteCoding, onAddMemo, highlightRange, onHighlightClear }: Props) {
@@ -46,8 +92,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
   const [showNewCodeInput, setShowNewCodeInput] = useState(false);
   const [newCodeName, setNewCodeName] = useState('');
   const [newCodeDesc, setNewCodeDesc] = useState('');
-  const [analysisText, setAnalysisText] = useState<string | null>(null);
-  const [analysisLoading, setAnalysisLoading] = useState(false);
+  const [codeFilter, setCodeFilter] = useState('');
   const [showVariables, setShowVariables] = useState(false);
   const [newVarKey, setNewVarKey] = useState('');
   const [newVarValue, setNewVarValue] = useState('');
@@ -147,6 +192,12 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     doc.source_type === 'text' || doc.source_type === 'pdf' ||
     (doc.source_type === 'audio' && !!doc.transcript);
 
+  // One offset index per document; image/base64 content never needs one.
+  const offsetIndex = useMemo(
+    () => buildOffsetIndex(hasSearchableText ? codeableText : ''),
+    [codeableText, hasSearchableText],
+  );
+
   // In-document find: positions of every case-insensitive match of the query.
   const findMatches = useMemo(() => {
     if (!findOpen || !findQuery) return [] as { start: number; end: number }[];
@@ -156,13 +207,13 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     let idx = hay.indexOf(needle);
     while (idx !== -1 && out.length < 5000) {
       out.push({
-        start: utf16ToCodePointOffset(codeableText, idx),
-        end: utf16ToCodePointOffset(codeableText, idx + needle.length),
+        start: utf16ToCodePoint(offsetIndex, idx),
+        end: utf16ToCodePoint(offsetIndex, idx + needle.length),
       });
       idx = hay.indexOf(needle, idx + Math.max(1, needle.length));
     }
     return out;
-  }, [findOpen, findQuery, codeableText]);
+  }, [findOpen, findQuery, codeableText, offsetIndex]);
 
   const safeFindIdx = findMatches.length ? Math.min(findIdx, findMatches.length - 1) : 0;
 
@@ -244,7 +295,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     let lastPos = 0;
 
     for (const ev of events) {
-      const jsPos = codePointToUtf16Offset(text, ev.pos);
+      const jsPos = codePointToUtf16(offsetIndex, ev.pos);
       if (jsPos > lastPos) {
         segments.push({ text: text.slice(lastPos, jsPos), codings: [...active], highlighted: isHighlighted });
       }
@@ -261,7 +312,12 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     }
 
     return segments;
-  }, [codeableText, codings, activeHighlight]);
+  }, [codeableText, codings, activeHighlight, offsetIndex]);
+
+  const firstHighlightIdx = useMemo(
+    () => renderedContent.findIndex((seg) => seg.highlighted),
+    [renderedContent],
+  );
 
   // Handle text selection or click on coded passage
   const handleMouseUp = useCallback(() => {
@@ -294,8 +350,8 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
       if (rawStart >= 0 && rawEnd > rawStart) {
         const text = codeableText.slice(rawStart, rawEnd);
         if (!text.trim()) { setSelection(null); return; }
-        const startPos = utf16ToCodePointOffset(codeableText, rawStart);
-        const endPos = utf16ToCodePointOffset(codeableText, rawEnd);
+        const startPos = utf16ToCodePoint(offsetIndex, rawStart);
+        const endPos = utf16ToCodePoint(offsetIndex, rawEnd);
         const rect = range.getBoundingClientRect();
         const containerRect = contentRef.current.getBoundingClientRect();
         setSelection({
@@ -322,7 +378,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
       }
 
       if (rawClickPos >= 0) {
-        const clickPos = utf16ToCodePointOffset(codeableText, rawClickPos);
+        const clickPos = utf16ToCodePoint(offsetIndex, rawClickPos);
         const overlapping = codings.filter(c => c.start_pos <= clickPos && c.end_pos > clickPos);
         if (overlapping.length > 0) {
           const range = document.createRange();
@@ -347,9 +403,11 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     setClickedCoding(null);
     setSelection(null);
     setShowNewCodeInput(false);
-    setAnalysisText(null);
     setMemoDraft(null);
-  }, [codings, codeableText]);
+  }, [codings, codeableText, offsetIndex]);
+
+  // The popup's code filter starts empty for every new selection.
+  useEffect(() => { setCodeFilter(''); }, [selection]);
 
   // Apply code to selection
   const applyCode = useCallback(
@@ -361,20 +419,6 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     },
     [selection, onApplyCode]
   );
-
-  // AI analyze selection
-  const analyzeSelection = useCallback(async () => {
-    if (!selection) return;
-    setAnalysisLoading(true);
-    try {
-      const result = await ai.analyze({ text: selection.text });
-      setAnalysisText(result.analysis);
-    } catch {
-      setAnalysisText('AI analysis unavailable. Make sure Ollama is running.');
-    } finally {
-      setAnalysisLoading(false);
-    }
-  }, [selection]);
 
   // Save the memo drafted in the selection popup
   const saveMemo = useCallback(() => {
@@ -672,7 +716,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
             {doc.transcript && (
               <div ref={textContentRef} className="p-6 max-w-4xl mx-auto text-gray-800 whitespace-pre-wrap select-text" style={{ fontSize: `${docFontSize}px`, lineHeight: 1.8 }}>
                 {renderedContent.map((seg, i) => {
-                  const isFirstHighlight = seg.highlighted && !renderedContent.slice(0, i).some((s) => s.highlighted);
+                  const isFirstHighlight = i === firstHighlightIdx;
                   if (seg.codings.length === 0 && !seg.highlighted) {
                     return <span key={i}>{seg.text}</span>;
                   }
@@ -709,7 +753,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
         ) : (<>
         <div ref={textContentRef} className="p-6 max-w-4xl mx-auto text-gray-800 whitespace-pre-wrap select-text" style={{ fontSize: `${docFontSize}px`, lineHeight: 1.8 }}>
           {renderedContent.map((seg, i) => {
-            const isFirstHighlight = seg.highlighted && !renderedContent.slice(0, i).some((s) => s.highlighted);
+            const isFirstHighlight = i === firstHighlightIdx;
             if (seg.codings.length === 0 && !seg.highlighted) {
               return <span key={i}>{seg.text}</span>;
             }
@@ -753,6 +797,10 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
           // Find codings that overlap the selection
           const overlapping = codings.filter(
             (c) => c.start_pos < selection.end && c.end_pos > selection.start
+          );
+          const needle = codeFilter.trim().toLowerCase();
+          const filteredCodes = codes.filter(
+            (c) => c.id !== selectedCodeId && (!needle || c.name.toLowerCase().includes(needle))
           );
           // If the selection is near the top of the visible area, show popup below
           const scrollTop = contentRef.current?.scrollTop ?? 0;
@@ -824,7 +872,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
 
             <div className="text-xs text-gray-500 mb-2 flex items-center justify-between">
               <span className="flex items-center gap-1"><Tag size={12} /> Apply code</span>
-              <button onClick={() => { setSelection(null); setShowNewCodeInput(false); setAnalysisText(null); }} className="text-gray-400 hover:text-gray-600">
+              <button onClick={() => { setSelection(null); setShowNewCodeInput(false); }} className="text-gray-400 hover:text-gray-600">
                 <X size={14} />
               </button>
             </div>
@@ -843,10 +891,27 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
               </button>
             )}
 
-            {/* Code list */}
+            {/* Code list, narrowed by the filter box; Enter applies the first match */}
+            {codes.length > 8 && (
+              <input
+                autoFocus
+                value={codeFilter}
+                placeholder="Type to filter codes…"
+                onChange={(e) => setCodeFilter(e.target.value)}
+                onMouseDown={(e) => { e.stopPropagation(); popupClickRef.current = true; }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    const first = filteredCodes[0];
+                    if (first) applyCode(first.id);
+                  } else if (e.key === 'Escape') {
+                    setSelection(null);
+                  }
+                }}
+                className="w-full px-2 py-1 mb-1 border border-gray-200 rounded text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              />
+            )}
             <div className="max-h-40 overflow-auto space-y-0.5">
-              {codes
-                .filter((c) => c.id !== selectedCodeId)
+              {filteredCodes
                 .map((code) => (
                   <button
                     key={code.id}
@@ -907,16 +972,6 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
               </button>
             )}
 
-            {/* AI analyze */}
-            <button
-              onClick={analyzeSelection}
-              disabled={analysisLoading}
-              className="w-full text-left px-2 py-1.5 mt-1 rounded text-sm text-purple-600 hover:bg-purple-50 flex items-center gap-1.5"
-            >
-              <Sparkles size={13} />
-              {analysisLoading ? 'Analyzing...' : 'AI Analyze'}
-            </button>
-
             {/* Add a memo anchored to this passage */}
             {onAddMemo && (
               <button
@@ -928,11 +983,6 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
               </button>
             )}
 
-            {analysisText && (
-              <div className="mt-2 p-2.5 bg-purple-50 rounded text-sm text-purple-900 leading-relaxed whitespace-pre-wrap max-h-72 overflow-auto">
-                {analysisText}
-              </div>
-            )}
             </>)}
           </div>
           );

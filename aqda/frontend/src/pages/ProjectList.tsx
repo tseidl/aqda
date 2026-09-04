@@ -5,6 +5,15 @@ import { Plus, FolderOpen, Trash2, Settings, FileText, Tags, Upload, RotateCcw, 
 import { projects, shared, type Project, type ProjectImportConflict } from '../api';
 import { CloseAqdaButton } from '../components/CloseAqdaButton';
 
+/** SQLite stores UTC timestamps as "YYYY-MM-DD HH:MM:SS"; Safari rejects that form
+ *  and Chrome reads it as local time, so make the UTC marker explicit. Imported rows
+ *  may carry no timestamp at all, so an unusable value yields null. */
+function parseUtcTimestamp(ts: string | null | undefined): Date | null {
+  if (!ts) return null;
+  const date = new Date(/[TZ]/.test(ts) ? ts : `${ts.replace(' ', 'T')}Z`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
 export function ProjectList() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -503,7 +512,7 @@ export function ProjectList() {
                   <div className="flex gap-4 mt-2 text-xs text-gray-400">
                     <span className="flex items-center gap-1"><FileText size={12} /> {p.doc_count ?? 0} docs</span>
                     <span className="flex items-center gap-1"><Tags size={12} /> {p.code_count ?? 0} codes</span>
-                    <span>Modified {new Date(p.modified_at).toLocaleDateString()}</span>
+                    <span>Modified {parseUtcTimestamp(p.modified_at)?.toLocaleDateString() ?? 'unknown'}</span>
                   </div>
                 </div>
                 <button
