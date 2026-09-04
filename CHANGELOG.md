@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 ### New features
 - **Word documents** — `.docx` files import as plain text (paragraphs preserved, formatting
