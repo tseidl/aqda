@@ -98,6 +98,9 @@ async def _ollama_embed(
     )
     resp.raise_for_status()
     data = resp.json()
+    expected = 1 if isinstance(text, str) else len(text)
+    if len(data["embeddings"]) != expected:
+        raise ValueError("Ollama returned an incomplete embedding batch")
     if isinstance(text, str):
         return data["embeddings"][0]
     return data["embeddings"]
@@ -342,8 +345,11 @@ async def _ensure_doc_embedded(
             for (cid, chunk), emb in zip(batch, embeddings):
                 # Pack immediately to free the float list
                 embedded.append((cid, chunk, _pack_embedding(emb)))
-        except Exception:
-            continue
+        except httpx.ConnectError:
+            raise HTTPException(503, "Cannot connect to Ollama. Make sure it is running.")
+        except Exception as exc:
+            # Never report a search over only the batches that happened to succeed.
+            raise HTTPException(502, f"Ollama embedding failed: {exc}")
 
     # A cancel that arrived during the last Ollama call must not be followed by writes.
     _check_cancelled(task)
@@ -526,7 +532,7 @@ async def find_similar(req: SimilarSearchRequest):
     except httpx.ConnectError:
         raise HTTPException(503, "Cannot connect to Ollama. Make sure it is running.")
     except Exception as e:
-        raise HTTPException(503, f"Ollama embedding failed: {e}")
+        raise HTTPException(502, f"Ollama embedding failed: {e}")
 
     # Scope the search to the resolved (non-excluded, still-existing) documents so
     # cached chunks from reference/deleted docs never surface in results.
@@ -781,7 +787,6 @@ async def consistency_check(req: ConsistencyCheckRequest):
 
             # Embed segments in batches (one Ollama call per batch, not per segment)
             embeddings = []
-            valid_segments = []
             for batch_start in range(0, len(segments), EMBED_BATCH_SIZE):
                 _check_cancelled(task)
                 batch = segments[batch_start:batch_start + EMBED_BATCH_SIZE]
@@ -790,17 +795,15 @@ async def consistency_check(req: ConsistencyCheckRequest):
                         [s["selected_text"] for s in batch], embed_model, ollama_url
                     )
                     embeddings.extend(batch_embs)
-                    valid_segments.extend(batch)
                 except httpx.ConnectError:
                     raise HTTPException(
                         503, "Cannot connect to Ollama. Make sure it is running."
                     )
-                except Exception:
-                    continue
+                except Exception as exc:
+                    # Missing segments would change the centroid and outlier scores.
+                    raise HTTPException(502, f"Ollama embedding failed: {exc}")
 
             _check_cancelled(task)
-            if len(valid_segments) < 2:
-                continue
 
             # Compute centroid
             dim = len(embeddings[0])
@@ -822,7 +825,7 @@ async def consistency_check(req: ConsistencyCheckRequest):
             outliers = []
             for i, sim in enumerate(similarities):
                 if cutoff is not None and sim < cutoff:
-                    seg = valid_segments[i]
+                    seg = segments[i]
                     outliers.append({
                         "coding_id": seg["coding_id"],
                         "document_id": seg["document_id"],
@@ -836,7 +839,7 @@ async def consistency_check(req: ConsistencyCheckRequest):
             results.append({
                 "code_id": code["id"],
                 "code_name": code["name"],
-                "segment_count": len(valid_segments),
+                "segment_count": len(segments),
                 "avg_similarity": round(avg_similarity, 4),
                 "outlier_cutoff": round(cutoff, 4) if cutoff is not None else None,
                 "outliers": outliers,

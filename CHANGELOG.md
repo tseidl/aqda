@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1
+
+### Bug fixes
+
+- Word import reads one text-bearing alternative per `AlternateContent` block, avoiding
+  duplicated text, and retains fallback text when the preferred choice contains only graphics.
+- AI searches and consistency checks report failed or incomplete embedding batches instead
+  of silently returning partial results. Successful checks use all requested segments.
+
 ## 0.4.0
 
 ### New features

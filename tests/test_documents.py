@@ -57,6 +57,33 @@ def test_docx_parser_handles_strict_namespace_text_boxes_and_size_limits(monkeyp
         documents._extract_docx_text_sync(make_docx(["y" * 200]))
 
 
+# Alternative representations of the same Word content must be imported only once.
+@pytest.mark.parametrize("nested", [False, True])
+def test_docx_alternative_choices_do_not_duplicate_text(nested):
+    text = "<w:r><w:t>Inside</w:t></w:r>"
+    if nested:
+        text = f"<w:txbxContent><w:p>{text}</w:p></w:txbxContent>"
+    body = (
+        "<w:p><mc:AlternateContent>"
+        f'<mc:Choice Requires="w">{text}</mc:Choice>'
+        f'<mc:Choice Requires="w">{text}</mc:Choice>'
+        f"<mc:Fallback>{text}</mc:Fallback>"
+        "</mc:AlternateContent></w:p>"
+    )
+    assert documents._extract_docx_text_sync(make_docx([], body=body)).strip() == "Inside"
+
+
+# Keep fallback text when the preferred representation has no extractable Word text.
+def test_docx_uses_text_fallback_for_nontext_choice():
+    body = (
+        "<w:p><mc:AlternateContent>"
+        '<mc:Choice Requires="w"><w:drawing/></mc:Choice>'
+        "<mc:Fallback><w:r><w:t>Fallback text</w:t></w:r></mc:Fallback>"
+        "</mc:AlternateContent></w:p>"
+    )
+    assert documents._extract_docx_text_sync(make_docx([], body=body)) == "Fallback text"
+
+
 @pytest.mark.asyncio
 async def test_docx_imports_as_text_and_other_office_formats_are_refused(tmp_path, use_data_dir):
     use_data_dir(tmp_path / "docx")

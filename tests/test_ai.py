@@ -1,4 +1,12 @@
+import io
+
+import httpx
 import pytest
+from fastapi import HTTPException
+from starlette.datastructures import UploadFile
+
+import aqda.db as db_module
+from aqda.routers import ai, codes, codings, documents, projects
 
 from aqda.routers.ai import MIN_OUTLIER_SEGMENTS, _finalize_suggestions, _outlier_cutoff
 
@@ -71,3 +79,80 @@ async def test_cancel_flag_stops_the_next_embedding_batch():
     _check_cancelled(second)  # a task started after the cancel is unaffected
     with pytest.raises(HTTPException):
         _check_cancelled(first)  # ... and the cancelled one stays cancelled
+
+
+# A failed batch must not turn a partial search or consistency check into success.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["search", "consistency"])
+@pytest.mark.parametrize("failed_batch", [1, 2, None])
+async def test_embedding_failure_is_reported(
+    tmp_path, use_data_dir, monkeypatch, operation, failed_batch,
+):
+    use_data_dir(tmp_path / "embedding-failure")
+    await db_module.init_db()
+    project = await projects.create_project(projects.ProjectCreate(name="Embeddings"))
+    code = await codes.create_code(codes.CodeCreate(project_id=project["id"], name="Theme"))
+    document = await documents.upload_document(
+        project_id=project["id"],
+        file=UploadFile(filename="interview.txt", file=io.BytesIO(b"x" * 6000)),
+    )
+    for start in range(11):
+        await codings.create_coding(codings.CodingCreate(
+            document_id=document["id"], code_id=code["id"],
+            start_pos=start, end_pos=start + 1, selected_text="x",
+        ))
+
+    calls = 0
+
+    # Simulate a model failure after zero or one successful embedding batches.
+    async def embed(text, model, ollama_url):
+        nonlocal calls
+        if isinstance(text, str):
+            return [1.0, 0.0]
+        calls += 1
+        if calls == failed_batch:
+            raise httpx.ReadTimeout("Model timed out")
+        return [[1.0, 0.0] for _ in text]
+
+    monkeypatch.setattr(ai, "_ollama_embed", embed)
+
+    # Exercise both public handlers with the same corpus and simulated model.
+    async def run():
+        if operation == "search":
+            return await ai.find_similar(ai.SimilarSearchRequest(
+                project_id=project["id"], query="theme", embedding_model="test-model",
+            ))
+        return await ai.consistency_check(ai.ConsistencyCheckRequest(
+            project_id=project["id"], embedding_model="test-model",
+        ))
+
+    if failed_batch is None:
+        result = await run()
+        if operation == "search":
+            assert len(result) == 10
+            assert {row["document_id"] for row in result} == {document["id"]}
+        else:
+            assert result["results"][0]["segment_count"] == 11
+            assert result["results"][0]["outliers"] == []
+        assert calls == 2
+        return
+
+    with pytest.raises(HTTPException) as failure:
+        await run()
+    assert failure.value.status_code == 502
+    assert "embedding failed" in failure.value.detail
+    assert calls == failed_batch
+    assert not ai._embedding_progress["active"]
+
+
+# A successful HTTP response must still contain one embedding per requested input.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returned", [0, 1])
+async def test_incomplete_embedding_response_is_rejected(monkeypatch, returned):
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"embeddings": [[1.0, 0.0]] * returned})
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        monkeypatch.setattr(ai, "_get_http_client", lambda: client)
+        with pytest.raises(ValueError, match="incomplete embedding batch"):
+            await ai._ollama_embed(["first", "second"], "test-model", "http://ollama.test")

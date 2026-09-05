@@ -536,8 +536,8 @@ _WORD_NAMESPACES = {
     "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
     "http://purl.oclc.org/ooxml/wordprocessingml/main",
 }
-# Markup-compatibility fallbacks repeat the content of the preferred choice (text boxes).
-_MC_FALLBACK = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
+# Markup-compatibility branches are alternative representations of the same content.
+_MC_NAMESPACE = "{http://schemas.openxmlformats.org/markup-compatibility/2006}"
 # The upload limit applies to the compressed file; the XML inside may be much larger.
 MAX_DOCX_XML_BYTES = 100 * 1024 * 1024
 
@@ -570,19 +570,30 @@ def _extract_docx_text_sync(content_bytes: bytes) -> str:
         raise ValueError("Not a Word document")
     tag = {kind: f"{{{namespace}}}{kind}" for kind in ("p", "t", "tab", "br", "cr")}
 
+    # Use one text-bearing alternative; this extractor does not render drawing formats.
+    def content_children(node):
+        if node.tag == _MC_NAMESPACE + "AlternateContent":
+            for choice in node.findall(_MC_NAMESPACE + "Choice"):
+                if any(text.text for text in choice.iter(tag["t"])):
+                    yield choice
+                    return
+            fallback = node.find(_MC_NAMESPACE + "Fallback")
+            if fallback is not None:
+                yield fallback
+        else:
+            yield from node
+
     def paragraphs(node):
         """Yield paragraphs in document order, skipping duplicated fallback markup."""
-        for child in node:
-            if child.tag == _MC_FALLBACK:
-                continue
+        for child in content_children(node):
             if child.tag == tag["p"]:
                 yield child
             yield from paragraphs(child)
 
     def collect(node, parts: list[str]) -> None:
         """Gather one paragraph's own text; nested paragraphs are yielded separately."""
-        for child in node:
-            if child.tag in (tag["p"], _MC_FALLBACK):
+        for child in content_children(node):
+            if child.tag == tag["p"]:
                 continue
             if child.tag == tag["t"]:
                 parts.append(child.text or "")
