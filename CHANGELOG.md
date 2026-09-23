@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.5.0
+
+### New features
+- **Restore deleted codes** — *Deleted codes* at the bottom of the code list shows each
+  deletion with its child codes and coded segments; **Restore** brings back exactly what that
+  deletion removed. The server side already existed but had no place in the interface.
+- **Exclude documents from AI features** — *Exclude documents…* in the AI panel replaces the
+  per-document "Reference" flag. Excluded documents, such as interview guides, instructions,
+  or files collecting example quotes, are ignored by every AI feature: they are not searched,
+  and their coded segments no longer feed Code Suggest examples, summaries, definitions,
+  Hierarchy Suggest, or the Consistency Check. Existing "Reference" marks carry over.
+
+### Bug fixes
+- **Audio transcripts can be coded by hand** — selecting transcript text never opened the
+  coding popup, and clicking a coded transcript passage showed nothing.
+- **Collaborator updates no longer strand the open document** — when a collaborator's
+  version arrived, the open document kept showing but lost its highlights, and new codings on
+  it failed. The open document, code, and memo now follow the update or close if removed.
+- **Summaries and definitions report the passages they send** — AQDA now sets the model's
+  context window and answer length explicitly, and sends only as many passages as fit by a
+  deliberately generous length estimate. When a code has more, a selection spread over all its
+  passages is sent and the result says, for example, "Based on 34 of 120 coded segments".
+  Previously Ollama could silently drop passages, and definitions used an arbitrary 50.
+  Hierarchy Suggest says when it left out example passages or codes of a long codebook. An
+  answer that stops at the length limit is marked as possibly incomplete.
+- **Deleting a document keeps its memos** — memos linked to the document are no longer
+  deleted with it. Each kept memo starts with a note naming the deleted document and the date,
+  and quoting the passage for memos about a passage; a memo also linked to a code stays linked
+  to that code. The confirmation states how many coded segments will be lost and that
+  documents cannot be restored.
+- **Selecting whole lines works** — triple-click and selections that start or end outside
+  the text now open the coding popup; surrounding spaces and line breaks are left out of the
+  coded passage.
+- **Find in document** highlights the right text in documents containing a capital "İ".
+- **AI errors show the actual reason** — any message containing "400" used to appear as
+  "No model configured".
+- **Memo edits are not lost silently** — memo saves and deletions happen strictly in order,
+  an edit still waiting is sent when you leave the memo, and an edit the server rejects (for
+  example, after a collaborator's version replaced the memo) is kept in this browser, also
+  across a reload: the memo offers to restore it (showing what would be restored), and the
+  memo list offers it for copying until it is saved or discarded.
+- Creating a code from the selection popup reports failures instead of doing nothing.
+
+### Improvements
+- Topic Search and Code Suggest compute similarities off the server's main loop, so the rest
+  of AQDA stays responsive during searches on large projects.
+- Settings explains that an Ollama address on another machine sends passages to it.
+- Removed the unused `/api/codings/audit` endpoint; the Segments panel already flags
+  segments whose position was repaired.
+
 ## 0.4.1
 
 ### Bug fixes
