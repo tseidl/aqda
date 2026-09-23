@@ -145,6 +145,13 @@ export interface Code {
   children?: Code[];
 }
 
+/** A code deletion in the trash: its root code plus what restoring brings back. */
+export interface DeletedCode extends Code {
+  deleted_at: string;
+  parent_name: string | null;
+  child_count: number;
+}
+
 export interface Coding {
   id: number;
   document_id: number;
@@ -231,6 +238,13 @@ export interface HierarchySuggestion {
   standalone?: string[];
   error?: string;
   raw_response?: string;
+  /** How many codes the model saw; fewer than code_count when the codebook was too long. */
+  codes_included?: number;
+  code_count?: number;
+  /** False when example passages were dropped to fit the codebook into the window. */
+  examples_included?: boolean;
+  /** True when the model's answer stopped at the length limit. */
+  answer_truncated?: boolean;
 }
 
 // --- API functions ---
@@ -348,12 +362,23 @@ export const documents = {
     }
     return { documents, skipped };
   },
-  update: (id: number, data: { name?: string; label?: string; exclude_from_ai?: boolean }) =>
+  update: (id: number, data: { name?: string; label?: string }) =>
     request<Document>(`/documents/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   delete: (id: number) =>
     request<void>(`/documents/${id}`, { method: 'DELETE' }),
   deleteBulk: (ids: number[]) =>
     request<void>('/documents/bulk-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
+  deleteImpact: (ids: number[]) =>
+    request<{ document_count: number; coding_count: number; memo_count: number }>(
+      '/documents/delete-impact', { method: 'POST', body: JSON.stringify({ ids }) }
+    ),
+  setAiExclusions: (projectId: number, excludedIds: number[], listedIds: number[]) =>
+    request<{ excluded_ids: number[] }>('/documents/ai-exclusions', {
+      method: 'PUT',
+      body: JSON.stringify({
+        project_id: projectId, excluded_ids: excludedIds, listed_ids: listedIds,
+      }),
+    }),
   parseVariables: (projectId: number) =>
     request<{ updated: number; total: number }>(`/documents/parse-variables?project_id=${projectId}`, { method: 'POST' }),
   getVariables: (id: number) =>
@@ -383,6 +408,8 @@ export const codes = {
     request<{ name: string; code_count: number; child_count: number; coding_count: number }>(
       `/codes/${id}/delete-impact`
     ),
+  trash: (projectId: number) => request<DeletedCode[]>(`/codes/trash?project_id=${projectId}`),
+  restore: (id: number) => request<Code>(`/codes/${id}/restore`, { method: 'POST' }),
 };
 
 export const codings = {
@@ -431,13 +458,13 @@ export const ai = {
   autoCode: (data: { project_id: number; code_id: number; top_k?: number; embedding_model?: string }, signal?: AbortSignal) =>
     request<SimilarResult[]>('/ai/autocode', { method: 'POST', body: JSON.stringify(data), signal }),
   summarizeCode: (data: { project_id: number; code_id: number; llm_model?: string }, signal?: AbortSignal) =>
-    request<{ summary: string; segment_count: number }>('/ai/summarize-code', { method: 'POST', body: JSON.stringify(data), signal }),
+    request<{ summary: string; segment_count: number; total_segments: number }>('/ai/summarize-code', { method: 'POST', body: JSON.stringify(data), signal }),
   consistencyCheck: (data: { project_id: number; code_id?: number; similarity_threshold?: number; embedding_model?: string }, signal?: AbortSignal) =>
     request<{ results: ConsistencyResult[] }>('/ai/consistency-check', { method: 'POST', body: JSON.stringify(data), signal }),
   suggestHierarchy: (data: { project_id: number; llm_model?: string }, signal?: AbortSignal) =>
     request<HierarchySuggestion>('/ai/suggest-hierarchy', { method: 'POST', body: JSON.stringify(data), signal }),
   generateDefinition: (data: { project_id: number; code_id: number; llm_model?: string }, signal?: AbortSignal) =>
-    request<{ definition: string; segment_count: number }>('/ai/generate-definition', { method: 'POST', body: JSON.stringify(data), signal }),
+    request<{ definition: string; segment_count: number; total_segments: number }>('/ai/generate-definition', { method: 'POST', body: JSON.stringify(data), signal }),
   embeddingProgress: () =>
     request<{ active: boolean; current: number; total: number; doc_name: string }>('/ai/embedding-progress'),
   cancel: () => request<{ cancelled: boolean }>('/ai/cancel', { method: 'POST' }),

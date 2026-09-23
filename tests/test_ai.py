@@ -156,3 +156,180 @@ async def test_incomplete_embedding_response_is_rejected(monkeypatch, returned):
         monkeypatch.setattr(ai, "_get_http_client", lambda: client)
         with pytest.raises(ValueError, match="incomplete embedding batch"):
             await ai._ollama_embed(["first", "second"], "test-model", "http://ollama.test")
+
+
+def test_fit_passages_spreads_a_deterministic_subset():
+    from aqda.routers.ai import _estimate_tokens, _fit_passages
+
+    passages = ["passage " + "word " * 30 for _ in range(40)]
+    assert _fit_passages(passages[:3], 10_000) == [0, 1, 2]
+
+    each = _estimate_tokens(passages[0])
+    chosen = _fit_passages(passages, budget_tokens=each * 10)
+    assert len(chosen) == 10
+    assert chosen[0] < 5 and chosen[-1] > 34  # spread over the whole list, not its start
+    assert _fit_passages(passages, budget_tokens=each * 10) == chosen
+
+    # A long passage in the middle is skipped instead of blocking the short ones around it.
+    short, long = "tiny", "long " * 100
+    cost = _estimate_tokens(short)
+    assert _fit_passages([short, short, long, short, short], budget_tokens=2 * cost) == [1, 4]
+
+    with pytest.raises(HTTPException) as too_long:
+        _fit_passages(["x" * 3000], budget_tokens=10)
+    assert too_long.value.status_code == 422
+
+
+def test_token_estimate_is_generous_for_digits_and_other_scripts():
+    from aqda.routers.ai import _estimate_tokens
+
+    assert _estimate_tokens("interview") == 9 // 3 + 1
+    assert _estimate_tokens("2024-09-22") == 10 + 1
+    assert _estimate_tokens("访谈记录") == 8 + 1
+
+
+# Ollama cuts prompts beyond its window silently, so the window must be set explicitly.
+@pytest.mark.asyncio
+async def test_generation_sets_the_context_window(monkeypatch):
+    import json
+
+    seen = {}
+
+    def handler(request):
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={"response": "ok"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        monkeypatch.setattr(ai, "_get_http_client", lambda: client)
+        assert await ai._ollama_generate("prompt", "model", "http://ollama.test") == "ok"
+    assert seen["options"] == {
+        "num_ctx": ai.LLM_CONTEXT_TOKENS, "num_predict": ai.LLM_RESPONSE_TOKENS,
+    }
+
+
+# An answer cut off at the length limit says so instead of looking complete.
+@pytest.mark.asyncio
+async def test_answer_at_the_length_limit_is_marked(monkeypatch):
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"response": "Partial", "done_reason": "length"})
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        monkeypatch.setattr(ai, "_get_http_client", lambda: client)
+        answer = await ai._ollama_generate("prompt", "model", "http://ollama.test", think=True)
+    assert answer == "Partial" + ai.LENGTH_LIMIT_NOTE
+
+
+async def _project_with_excluded_guide(tmp_path, use_data_dir):
+    """A code applied in an interview and in an excluded document of example quotes."""
+    use_data_dir(tmp_path / "exclusion")
+    await db_module.init_db()
+    project = await projects.create_project(projects.ProjectCreate(name="Exclusion"))
+    code = await codes.create_code(codes.CodeCreate(project_id=project["id"], name="Trust"))
+    interview = await documents.upload_document(
+        project_id=project["id"],
+        file=UploadFile(filename="interview.txt", file=io.BytesIO(
+            b"Interview passage one. Interview passage two. Uncoded remainder here."
+        )),
+    )
+    guide = await documents.upload_document(
+        project_id=project["id"],
+        file=UploadFile(filename="examples.txt", file=io.BytesIO(b"Guide example quote.")),
+    )
+    for start, text in [(0, "Interview passage one."), (23, "Interview passage two.")]:
+        await codings.create_coding(codings.CodingCreate(
+            document_id=interview["id"], code_id=code["id"],
+            start_pos=start, end_pos=start + len(text), selected_text=text,
+        ))
+    await codings.create_coding(codings.CodingCreate(
+        document_id=guide["id"], code_id=code["id"],
+        start_pos=0, end_pos=20, selected_text="Guide example quote.",
+    ))
+    await documents.set_ai_exclusions(documents.AiExclusionUpdate(
+        project_id=project["id"], excluded_ids=[guide["id"]],
+        listed_ids=[interview["id"], guide["id"]],
+    ))
+    return project, code
+
+
+# Excluded documents are ignored by every AI feature, including as coded examples.
+@pytest.mark.asyncio
+async def test_excluded_documents_are_ignored_by_every_ai_feature(
+    tmp_path, use_data_dir, monkeypatch,
+):
+    project, code = await _project_with_excluded_guide(tmp_path, use_data_dir)
+    prompts = []
+
+    async def generate(prompt, model, ollama_url, system="", think=False):
+        prompts.append(system + prompt)
+        return '{"groups": [], "standalone": ["Trust"]}'
+
+    embedded = []
+
+    async def embed(text, model, ollama_url):
+        embedded.extend([text] if isinstance(text, str) else text)
+        return [1.0, 0.0] if isinstance(text, str) else [[1.0, 0.0] for _ in text]
+
+    monkeypatch.setattr(ai, "_ollama_generate", generate)
+    monkeypatch.setattr(ai, "_ollama_embed", embed)
+    ids = {"project_id": project["id"], "code_id": code["id"]}
+
+    summary = await ai.summarize_code(ai.SummarizeCodeRequest(**ids, llm_model="m"))
+    definition = await ai.generate_definition(ai.GenerateDefinitionRequest(**ids, llm_model="m"))
+    hierarchy = await ai.suggest_hierarchy(
+        ai.HierarchySuggestRequest(project_id=project["id"], llm_model="m")
+    )
+    consistency = await ai.consistency_check(
+        ai.ConsistencyCheckRequest(**ids, embedding_model="m")
+    )
+    suggestions = await ai.suggest_codings(ai.AutoCodeRequest(**ids, embedding_model="m"))
+
+    assert len(prompts) == 3
+    for prompt in prompts:
+        assert "Interview passage one." in prompt
+        assert "Guide example" not in prompt
+    assert '"Trust" (2 segments)' in prompts[2]
+    assert all("Guide example" not in text for text in embedded)
+    assert any("Interview passage one." in text for text in embedded)
+    assert (summary["segment_count"], summary["total_segments"]) == (2, 2)
+    assert (definition["segment_count"], definition["total_segments"]) == (2, 2)
+    assert (hierarchy["codes_included"], hierarchy["code_count"]) == (1, 1)
+    assert hierarchy["examples_included"] is True
+    assert hierarchy["answer_truncated"] is False
+    assert hierarchy["standalone"] == ["Trust"]
+    assert consistency["results"][0]["segment_count"] == 2
+    assert all("Guide" not in s["text"] for s in suggestions)
+
+
+# A summary over more passages than fit reports how many the model actually read.
+@pytest.mark.asyncio
+async def test_summary_reports_the_passages_it_used(tmp_path, use_data_dir, monkeypatch):
+    use_data_dir(tmp_path / "coverage")
+    await db_module.init_db()
+    project = await projects.create_project(projects.ProjectCreate(name="Coverage"))
+    code = await codes.create_code(codes.CodeCreate(project_id=project["id"], name="Theme"))
+    sentence = "This participant talks at length about the theme in question. " * 8
+    document = await documents.upload_document(
+        project_id=project["id"],
+        file=UploadFile(filename="long.txt", file=io.BytesIO((sentence * 60).encode())),
+    )
+    for index in range(60):
+        start = index * len(sentence)
+        await codings.create_coding(codings.CodingCreate(
+            document_id=document["id"], code_id=code["id"],
+            start_pos=start, end_pos=start + len(sentence), selected_text=sentence,
+        ))
+    prompts = []
+
+    async def generate(prompt, model, ollama_url, system="", think=False):
+        prompts.append(system + prompt)
+        return "summary"
+
+    monkeypatch.setattr(ai, "_ollama_generate", generate)
+    result = await ai.summarize_code(ai.SummarizeCodeRequest(
+        project_id=project["id"], code_id=code["id"], llm_model="m",
+    ))
+    used = result["segment_count"]
+    assert result["total_segments"] == 60
+    assert 0 < used < 60
+    assert f"Here are {used} of 60 coded passages" in prompts[0]
+    assert ai._estimate_tokens(prompts[0]) <= ai.LLM_CONTEXT_TOKENS - ai.LLM_RESPONSE_TOKENS

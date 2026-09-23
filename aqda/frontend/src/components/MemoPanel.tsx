@@ -1,9 +1,10 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Plus, Trash2, StickyNote, FileText, Pencil } from 'lucide-react';
+import { Plus, Trash2, StickyNote, FileText, Pencil, AlertTriangle } from 'lucide-react';
 import { memos as memosApi, type Memo, type Code } from '../api';
 import { MentionTextarea, MentionView } from './MentionTextarea';
 import { buildMentionCandidates, type MentionCandidate } from './mentions';
+import { dropMemoDraft, keepMemoDraft, memoDraftKey, queueMemoRequest, useMemoDrafts } from './memoDrafts';
 
 interface Props {
   projectId: number;
@@ -30,22 +31,96 @@ function MemoDetail({ memo, codes, memos, projectId, onBack, onNavigate, onJumpT
   const [title, setTitle] = useState(memo.title);
   const [content, setContent] = useState(memo.content);
   const [editing, setEditing] = useState(() => !(memo.content ?? '').trim());
+  const [saveFailed, setSaveFailed] = useState(false);
+  // Whether a kept edit for this memo came from this editor (then the editor already shows it).
+  const [ownsDraft, setOwnsDraft] = useState(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  // The edit waiting for its debounced save, if any.
+  const pendingSave = useRef<{ title: string; content: string } | null>(null);
+  const mounted = useRef(true);
+  // The memo as last loaded from the server, for naming a kept edit.
+  const latestMemo = useRef(memo);
   // State is seeded from the memo on mount; MemoPanel remounts this via key on memo switch.
 
-  const updateMut = useMutation({
-    mutationFn: (data: { title?: string; content?: string }) => memosApi.update(memo.id, data),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['memos', projectId] }),
-  });
+  useEffect(() => { latestMemo.current = memo; }, [memo]);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+
+  // An edit rejected before this editor opened (e.g. before a collaborator's version replaced
+  // this memo). Edits rejected while this editor is open are still on screen.
+  const keptDraft = useMemoDrafts(projectId).find((draft) => draft.key === memoDraftKey(memo));
+  const draftDiffers = Boolean(
+    keptDraft && !ownsDraft && (keptDraft.title !== title || keptDraft.content !== content)
+  );
+
+  // Queue one save behind every earlier memo request; a rejected save is kept as a draft.
+  const save = useCallback((edit: { title: string; content: string }) => {
+    queueMemoRequest(() => memosApi.update(memo.id, edit))
+      .then(
+        () => {
+          dropMemoDraft(memoDraftKey(latestMemo.current));
+          if (mounted.current) setSaveFailed(false);
+          queryClient.invalidateQueries({ queryKey: ['memos', projectId] });
+        },
+        () => {
+          keepMemoDraft({ key: memoDraftKey(latestMemo.current), projectId, ...edit });
+          if (mounted.current) {
+            setSaveFailed(true);
+            setOwnsDraft(true);
+          }
+        },
+      );
+  }, [memo.id, projectId, queryClient]);
+
   const deleteMut = useMutation({
-    mutationFn: () => memosApi.delete(memo.id),
-    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['memos', projectId] }); onBack(); },
+    mutationFn: () => {
+      clearTimeout(saveTimer.current);
+      return queueMemoRequest(() => memosApi.delete(memo.id));
+    },
+    onSuccess: () => {
+      pendingSave.current = null;
+      dropMemoDraft(memoDraftKey(latestMemo.current));
+      queryClient.invalidateQueries({ queryKey: ['memos', projectId] });
+      onBack();
+    },
+    onError: (error: Error) => {
+      alert(`The memo could not be deleted. ${error.message.replace(/^\d{3}:\s*/, '')}`);
+      const pending = pendingSave.current;
+      pendingSave.current = null;
+      if (pending) save(pending);
+    },
   });
 
   const scheduleSave = (t: string, c: string) => {
     clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => updateMut.mutate({ title: t, content: c }), 500);
+    pendingSave.current = { title: t, content: c };
+    saveTimer.current = setTimeout(() => {
+      const edit = pendingSave.current;
+      pendingSave.current = null;
+      if (edit) save(edit);
+    }, 500);
   };
+
+  // Put a kept edit back into the editor and save it.
+  const restoreDraft = () => {
+    if (!keptDraft) return;
+    setOwnsDraft(true);
+    setTitle(keptDraft.title);
+    setContent(keptDraft.content);
+    clearTimeout(saveTimer.current);
+    pendingSave.current = null;
+    save({ title: keptDraft.title, content: keptDraft.content });
+  };
+
+  // Leaving the memo (Back, another memo) sends a save that is still waiting instead of dropping it.
+  useEffect(() => () => {
+    clearTimeout(saveTimer.current);
+    const pending = pendingSave.current;
+    pendingSave.current = null;
+    if (pending) save(pending);
+  }, [save]);
 
   const candidates = buildMentionCandidates(codes, memos, memo.id);
 
@@ -69,6 +144,30 @@ function MemoDetail({ memo, codes, memos, projectId, onBack, onNavigate, onJumpT
           <FileText size={12} className="shrink-0" />
           <span className="truncate">Go to {memo.document_name}</span>
         </button>
+      )}
+      {saveFailed && !draftDiffers && (
+        <p className="mx-3 mt-2 text-xs text-red-600">
+          This memo could not be saved. AQDA keeps your edit and lists it under Memos until it
+          is saved or you discard it.
+        </p>
+      )}
+      {draftDiffers && (
+        <div className="mx-3 mt-2 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
+          <p>An edit you made could not be saved, probably because the memo was updated from the shared folder.</p>
+          <p className="mt-1 italic text-amber-800">
+            {keptDraft && (keptDraft.title !== title ? `“${keptDraft.title}”: ` : '')}
+            {keptDraft && (keptDraft.content.length > 160 ? `${keptDraft.content.slice(0, 160)}…` : keptDraft.content)}
+          </p>
+          <p className="mt-1">Restoring replaces the text shown below with your edit.</p>
+          <div className="mt-1.5 flex gap-2">
+            <button onClick={restoreDraft} className="font-medium underline hover:text-amber-950">
+              Restore my edit
+            </button>
+            <button onClick={() => keptDraft && dropMemoDraft(keptDraft.key)} className="underline hover:text-amber-950">
+              Discard it
+            </button>
+          </div>
+        </div>
       )}
       <input
         value={title}
@@ -132,15 +231,19 @@ export function MemoPanel({
     },
   });
 
+  // Deleting from the list waits for earlier memo saves and forgets the memo's kept edit.
   const deleteMut = useMutation({
-    mutationFn: memosApi.delete,
-    onSuccess: () => {
+    mutationFn: (memo: Memo) => queueMemoRequest(() => memosApi.delete(memo.id)),
+    onSuccess: (_, memo) => {
+      dropMemoDraft(memoDraftKey(memo));
       queryClient.invalidateQueries({ queryKey: ['memos', projectId] });
       onSelectMemo(null);
     },
+    onError: (error: Error) => alert(`The memo could not be deleted. ${error.message.replace(/^\d{3}:\s*/, '')}`),
   });
 
   const selectedMemo = memoList.find((m: Memo) => m.id === selectedMemoId);
+  const keptDrafts = useMemoDrafts(projectId);
 
   const submitNew = () => {
     if (!newTitle.trim()) return;
@@ -204,6 +307,33 @@ export function MemoPanel({
         </div>
       )}
 
+      {keptDrafts.map((draft) => {
+        const memo = memoList.find((m: Memo) => memoDraftKey(m) === draft.key);
+        return (
+          <div key={draft.key} className="mb-2 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
+            <p className="flex items-start gap-1.5">
+              <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+              <span>An edit to “{draft.title || 'Untitled memo'}” could not be saved.</span>
+            </p>
+            <div className="mt-1.5 flex gap-2 pl-5">
+              {memo ? (
+                <button onClick={() => onSelectMemo(memo.id)} className="font-medium underline">
+                  Open the memo
+                </button>
+              ) : (
+                <button
+                  onClick={() => navigator.clipboard.writeText(`${draft.title}\n\n${draft.content}`)}
+                  className="font-medium underline"
+                >
+                  Copy the text
+                </button>
+              )}
+              <button onClick={() => dropMemoDraft(draft.key)} className="underline">Discard it</button>
+            </div>
+          </div>
+        );
+      })}
+
       {memoList.length === 0 && !showNew ? (
         <p className="text-sm text-gray-400 text-center py-8">No memos yet</p>
       ) : (
@@ -241,7 +371,7 @@ export function MemoPanel({
                   <Pencil size={12} />
                 </button>
                 <button
-                  onClick={() => { if (confirm('Delete this memo?')) deleteMut.mutate(memo.id); }}
+                  onClick={() => { if (confirm('Delete this memo?')) deleteMut.mutate(memo); }}
                   className="p-0.5 text-gray-400 hover:text-red-500"
                   title="Delete memo"
                 >

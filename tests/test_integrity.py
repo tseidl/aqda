@@ -506,3 +506,47 @@ async def test_empty_project_exports_omit_invalid_empty_containers(tmp_path, use
     with pytest.raises(HTTPException) as refused:
         await export.export_codebook(project["id"])
     assert refused.value.status_code == 400
+
+
+# The trash lists one entry per deletion with what restoring it brings back.
+@pytest.mark.asyncio
+async def test_code_trash_lists_each_deletion_with_its_contents(tmp_path, use_data_dir):
+    use_data_dir(tmp_path / "code-trash")
+    await db_module.init_db()
+    project = await projects.create_project(projects.ProjectCreate(name="Code trash"))
+    parent = await codes.create_code(codes.CodeCreate(project_id=project["id"], name="Parent"))
+    child = await codes.create_code(
+        codes.CodeCreate(project_id=project["id"], parent_id=parent["id"], name="Child")
+    )
+    db = await db_module.get_db()
+    try:
+        doc = await db.execute(
+            "INSERT INTO document (project_id, name, content) VALUES (?, 'doc', 'abcdefghij')",
+            (project["id"],),
+        )
+        for code_id, start in [(parent["id"], 0), (child["id"], 2), (child["id"], 4)]:
+            await db.execute(
+                "INSERT INTO coding (document_id, code_id, start_pos, end_pos, selected_text) "
+                "VALUES (?, ?, ?, ?, 'xy')",
+                (doc.lastrowid, code_id, start, start + 2),
+            )
+        await db.commit()
+    finally:
+        await db.close()
+
+    await codes.delete_code(parent["id"])
+    trash = await codes.list_deleted_codes(project["id"])
+    assert [(c["name"], c["child_count"], c["coding_count"]) for c in trash] == [
+        ("Parent", 1, 3),
+    ]
+
+    revision = (await projects.get_project(project["id"]))["revision"]
+    await codes.restore_code(parent["id"])
+    assert await codes.list_deleted_codes(project["id"]) == []
+    assert {c["name"] for c in await codes.list_codes(project["id"])} == {"Parent", "Child"}
+    restored_revision = (await projects.get_project(project["id"]))["revision"]
+    assert restored_revision > revision
+
+    # Restoring a code that is not deleted changes nothing.
+    await codes.restore_code(child["id"])
+    assert (await projects.get_project(project["id"]))["revision"] == restored_revision

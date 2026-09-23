@@ -1,6 +1,7 @@
 """AI integration routes — embedding, similarity search, and LLM analysis."""
 
 import asyncio
+from collections import deque
 import hashlib
 import json
 import math
@@ -106,10 +107,26 @@ async def _ollama_embed(
     return data["embeddings"]
 
 
+# Ollama silently cuts prompts that exceed its context window, so AQDA sets the window
+# explicitly and fits the passages it sends into it (see _fit_passages).
+LLM_CONTEXT_TOKENS = 8192
+# The answer's length limit, kept free in the window. The model's reasoning in think mode
+# counts towards it, so that mode reserves more.
+LLM_RESPONSE_TOKENS = 2048
+LLM_THINKING_RESPONSE_TOKENS = 4096
+# Appended when the model stops at the length limit, so a cut-off answer is never silent.
+LENGTH_LIMIT_NOTE = "\n\n[The answer reached AQDA's length limit and may be incomplete.]"
+
+
+def _response_tokens(think: bool) -> int:
+    """Tokens reserved for the answer (and reasoning) in the context window."""
+    return LLM_THINKING_RESPONSE_TOKENS if think else LLM_RESPONSE_TOKENS
+
+
 async def _ollama_generate(
     prompt: str, model: str, ollama_url: str, system: str = "", think: bool = False
 ) -> str:
-    """Generate text from Ollama."""
+    """Generate text from Ollama within a known context window and answer length."""
     client = _get_http_client()
     payload: dict = {
         "model": model,
@@ -117,10 +134,86 @@ async def _ollama_generate(
         "system": system,
         "stream": False,
         "think": think,
+        "options": {"num_ctx": LLM_CONTEXT_TOKENS, "num_predict": _response_tokens(think)},
     }
     resp = await client.post(f"{ollama_url}/api/generate", json=payload)
     resp.raise_for_status()
-    return resp.json()["response"]
+    data = resp.json()
+    if data.get("done_reason") == "length":
+        return data["response"] + LENGTH_LIMIT_NOTE
+    return data["response"]
+
+
+def _estimate_tokens(text: str) -> int:
+    """Deliberately high token estimate for fitting passages into the model's window.
+
+    Common tokenizers need about four characters of English prose per token; this counts
+    three ASCII letters per token, every digit, punctuation mark, and line break as one,
+    and every non-ASCII character (accented letters, other scripts, emoji) as two. It is
+    a heuristic with a wide margin, not a guarantee for every model's tokenizer.
+    """
+    letters = digits_and_marks = other = 0
+    for char in text:
+        if not char.isascii():
+            other += 1
+        elif char.isalpha():
+            letters += 1
+        elif char != " ":
+            digits_and_marks += 1
+    return letters // 3 + digits_and_marks + 2 * other + 1
+
+
+def _prompt_budget(think: bool, *fixed_parts: str) -> int:
+    """Tokens left for passages once the fixed prompt text and the answer are accounted for."""
+    fixed = sum(_estimate_tokens(part) for part in fixed_parts)
+    return LLM_CONTEXT_TOKENS - _response_tokens(think) - fixed
+
+
+def _spread_order(count: int) -> list[int]:
+    """Indices 0..count-1 ordered so that every prefix spreads over the whole range.
+
+    Midpoints come first (the middle, then the middles of both halves, and so on).
+    """
+    order: list[int] = []
+    intervals = deque([(0, count)])
+    while intervals:
+        low, high = intervals.popleft()
+        if low >= high:
+            continue
+        middle = (low + high) // 2
+        order.append(middle)
+        intervals.append((low, middle))
+        intervals.append((middle + 1, high))
+    return order
+
+
+def _fit_passages(passages: list[str], budget_tokens: int, wrapper: str = "") -> list[int]:
+    """Indices of the passages to send: all when they fit, else a subset spread over the list.
+
+    ``wrapper`` is the text added around each passage (numbering, separators). Passages are
+    taken in spread order (see _spread_order) and any passage that no longer fits the
+    remaining budget is skipped, so the subset covers the whole (document-ordered) list
+    rather than its beginning, and the same codings always give the same selection.
+    """
+    extra = _estimate_tokens(wrapper) if wrapper else 0
+    costs = [_estimate_tokens(passage) + extra for passage in passages]
+    if sum(costs) <= budget_tokens:
+        return list(range(len(passages)))
+    chosen = []
+    remaining = budget_tokens
+    for index in _spread_order(len(passages)):
+        if costs[index] <= remaining:
+            chosen.append(index)
+            remaining -= costs[index]
+    if not chosen:
+        raise HTTPException(
+            422, "The coded passages are too long to fit into the model's context window."
+        )
+    return sorted(chosen)
+
+
+# Documents the researcher excluded from AI features in the AI panel.
+_INCLUDED_DOCUMENT_SQL = "COALESCE(d.exclude_from_ai, 0)=0"
 
 
 def _pack_embedding(embedding: list[float]) -> bytes:
@@ -373,11 +466,11 @@ async def _ensure_doc_embedded(
     embedded.clear()
 
 
-async def _search_embeddings(
+def _search_embeddings(
     query_embedding: list[float], project_id: int, embed_model: str,
     top_k: int = 10, document_ids: list[int] | None = None,
 ) -> list[dict]:
-    """Search the embedding cache by cosine similarity."""
+    """Search the embedding cache by cosine similarity (CPU-bound; run in a worker thread)."""
     conn = _sync_db()
     try:
         if document_ids:
@@ -538,9 +631,10 @@ async def find_similar(req: SimilarSearchRequest):
     # cached chunks from reference/deleted docs never surface in results.
     _check_cancelled(task)
     search_doc_ids = [doc["id"] for doc in docs]
-    results = await _search_embeddings(
+    results = await asyncio.to_thread(
+        _search_embeddings,
         query_embedding, req.project_id, embed_model,
-        top_k=req.top_k, document_ids=search_doc_ids,
+        req.top_k, search_doc_ids,
     )
 
     # Add document names
@@ -565,15 +659,18 @@ async def suggest_codings(req: AutoCodeRequest):
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT name, description FROM code WHERE id=?", (req.code_id,)
+            "SELECT name, description FROM code "
+            "WHERE id=? AND project_id=? AND deleted_at IS NULL",
+            (req.code_id, req.project_id),
         )
         code = await cursor.fetchone()
         if not code:
             raise HTTPException(404, "Code not found")
 
         cursor = await db.execute(
-            "SELECT selected_text, document_id, start_pos, end_pos "
-            "FROM coding WHERE code_id=? AND deleted_at IS NULL LIMIT 5",
+            "SELECT c.selected_text FROM coding c JOIN document d ON d.id=c.document_id "
+            f"WHERE c.code_id=? AND c.deleted_at IS NULL AND {_INCLUDED_DOCUMENT_SQL} "
+            "ORDER BY c.id LIMIT 5",
             (req.code_id,),
         )
         examples = await cursor.fetchall()
@@ -664,7 +761,8 @@ async def summarize_code(req: SummarizeCodeRequest):
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT name, description FROM code WHERE id=? AND project_id=?",
+            "SELECT name, description FROM code "
+            "WHERE id=? AND project_id=? AND deleted_at IS NULL",
             (req.code_id, req.project_id),
         )
         code = await cursor.fetchone()
@@ -674,7 +772,8 @@ async def summarize_code(req: SummarizeCodeRequest):
         cursor = await db.execute(
             "SELECT c.selected_text FROM coding c "
             "JOIN document d ON c.document_id = d.id "
-            "WHERE c.code_id=? AND d.project_id=? AND c.deleted_at IS NULL",
+            "WHERE c.code_id=? AND d.project_id=? AND c.deleted_at IS NULL "
+            f"AND {_INCLUDED_DOCUMENT_SQL} ORDER BY d.name, d.id, c.start_pos",
             (req.code_id, req.project_id),
         )
         segments = await cursor.fetchall()
@@ -682,26 +781,37 @@ async def summarize_code(req: SummarizeCodeRequest):
         await db.close()
 
     if not segments:
-        return {"summary": "No coded segments found for this code.", "segment_count": 0}
+        return {
+            "summary": "No coded segments found for this code.",
+            "segment_count": 0,
+            "total_segments": 0,
+        }
 
     code_name = code["name"]
     code_description = code["description"] or "No description provided"
-    segment_texts = "\n\n---\n\n".join(
-        f'Passage {i+1}: "{seg["selected_text"]}"' for i, seg in enumerate(segments)
-    )
-
     system = (
-        "You are a qualitative research assistant. Below are all text passages that have been "
+        "You are a qualitative research assistant. Below are text passages that have been "
         f"coded under the code '{code_name}'. The code is defined as: '{code_description}'. "
         "Synthesize these passages into a thematic summary. Identify key patterns, variations, "
         "and notable aspects across all the passages. Be analytical, not just descriptive."
     )
-    prompt = f"Here are {len(segments)} coded passages:\n\n{segment_texts}"
+    think = settings.get("think_mode", "off") == "on"
+    passages = [seg["selected_text"] for seg in segments]
+    header = f"Here are {len(segments)} of {len(segments)} coded passages:\n\n"
+    wrapper = f'Passage {len(segments)}: ""\n\n---\n\n'
+    chosen = _fit_passages(passages, _prompt_budget(think, system, header), wrapper)
+    segment_texts = "\n\n---\n\n".join(
+        f'Passage {number}: "{passages[index]}"' for number, index in enumerate(chosen, 1)
+    )
+    prompt = f"Here are {len(chosen)} of {len(segments)} coded passages:\n\n{segment_texts}"
 
     try:
-        think = settings.get("think_mode", "off") == "on"
         response = await _ollama_generate(prompt, llm_model, ollama_url, system, think=think)
-        return {"summary": response, "segment_count": len(segments)}
+        return {
+            "summary": response,
+            "segment_count": len(chosen),
+            "total_segments": len(segments),
+        }
     except httpx.ConnectError:
         raise HTTPException(503, "Cannot connect to Ollama. Make sure it is running.")
     except Exception as e:
@@ -777,7 +887,8 @@ async def consistency_check(req: ConsistencyCheckRequest):
                 "c.start_pos, c.end_pos, d.name AS document_name "
                 "FROM coding c "
                 "JOIN document d ON c.document_id = d.id "
-                "WHERE c.code_id=? AND d.project_id=? AND c.deleted_at IS NULL",
+                "WHERE c.code_id=? AND d.project_id=? AND c.deleted_at IS NULL "
+                f"AND {_INCLUDED_DOCUMENT_SQL}",
                 (code["id"], req.project_id),
             )
             segments = await cursor.fetchall()
@@ -876,8 +987,9 @@ async def suggest_hierarchy(req: HierarchySuggestRequest):
     try:
         cursor = await db.execute(
             "SELECT c.id, c.name, c.description, "
-            "(SELECT COUNT(*) FROM coding cg "
-            " WHERE cg.code_id = c.id AND cg.deleted_at IS NULL) AS coding_count "
+            "(SELECT COUNT(*) FROM coding cg JOIN document d ON d.id=cg.document_id "
+            " WHERE cg.code_id = c.id AND cg.deleted_at IS NULL "
+            f" AND {_INCLUDED_DOCUMENT_SQL}) AS coding_count "
             "FROM code c WHERE c.project_id=? AND c.deleted_at IS NULL "
             "ORDER BY c.name",
             (req.project_id,),
@@ -885,13 +997,17 @@ async def suggest_hierarchy(req: HierarchySuggestRequest):
         codes = await cursor.fetchall()
 
         if not codes:
-            return {"groups": [], "standalone": []}
+            return {
+                "groups": [], "standalone": [], "code_count": 0, "codes_included": 0,
+                "examples_included": True, "answer_truncated": False,
+            }
 
         code_examples: dict[int, list[str]] = {}
         for code in codes:
             cursor = await db.execute(
-                "SELECT selected_text FROM coding "
-                "WHERE code_id=? AND deleted_at IS NULL LIMIT 3",
+                "SELECT cg.selected_text FROM coding cg JOIN document d ON d.id=cg.document_id "
+                f"WHERE cg.code_id=? AND cg.deleted_at IS NULL AND {_INCLUDED_DOCUMENT_SQL} "
+                "ORDER BY cg.id LIMIT 3",
                 (code["id"],),
             )
             examples = await cursor.fetchall()
@@ -899,21 +1015,19 @@ async def suggest_hierarchy(req: HierarchySuggestRequest):
     finally:
         await db.close()
 
-    code_lines = []
-    for i, code in enumerate(codes, 1):
-        line = f'{i}. "{code["name"]}" ({code["coding_count"]} segments)'
+    # One line per code; example passages are dropped first when the codebook is too long.
+    def code_line(code, with_examples: bool) -> str:
+        line = f'"{code["name"]}" ({code["coding_count"]} segments)'
         if code["description"]:
             line += f" - Description: {code['description']}"
-        examples = code_examples.get(code["id"], [])
+        examples = code_examples.get(code["id"], []) if with_examples else []
         if examples:
             example_strs = ", ".join(f'"{ex}"' for ex in examples)
             line += f" Examples: {example_strs}"
-        code_lines.append(line)
-
-    codes_text = "\n".join(code_lines)
+        return line
 
     system = "You are a qualitative research methods expert."
-    prompt = (
+    instructions = (
         "Below is a codebook with codes used in a qualitative analysis project. "
         "Suggest a hierarchical organization by grouping related codes under "
         "parent categories.\n\n"
@@ -922,7 +1036,8 @@ async def suggest_hierarchy(req: HierarchySuggestRequest):
         "- A code can only belong to one parent\n"
         "- Not every code needs a parent — leave standalone codes as-is\n"
         "- Return ONLY valid JSON\n\n"
-        f"Codes:\n{codes_text}\n\n"
+    )
+    response_format = (
         'Return JSON format:\n'
         '{\n'
         '  "groups": [\n'
@@ -935,31 +1050,50 @@ async def suggest_hierarchy(req: HierarchySuggestRequest):
         '  "standalone": ["CodeX", "CodeY"]\n'
         '}'
     )
+    think = settings.get("think_mode", "off") == "on"
+    budget = _prompt_budget(think, system, instructions, "Codes:\n\n\n", response_format)
+    wrapper = f"{len(codes)}. \n"
+    lines = [code_line(code, with_examples=True) for code in codes]
+    examples_included = sum(_estimate_tokens(line + wrapper) for line in lines) <= budget
+    if not examples_included:
+        lines = [code_line(code, with_examples=False) for code in codes]
+    chosen = _fit_passages(lines, budget, wrapper)
+    codes_text = "\n".join(
+        f"{number}. {lines[index]}" for number, index in enumerate(chosen, 1)
+    )
+    prompt = f"{instructions}Codes:\n{codes_text}\n\n{response_format}"
+    coverage = {
+        "code_count": len(codes),
+        "codes_included": len(chosen),
+        "examples_included": examples_included,
+    }
 
     try:
-        think = settings.get("think_mode", "off") == "on"
         response = await _ollama_generate(prompt, llm_model, ollama_url, system, think=think)
     except httpx.ConnectError:
         raise HTTPException(503, "Cannot connect to Ollama. Make sure it is running.")
     except Exception as e:
         raise HTTPException(503, f"Ollama generation failed: {e}")
+    # A suggestion cut off at the length limit may lack groups even when its JSON parses.
+    coverage["answer_truncated"] = response.endswith(LENGTH_LIMIT_NOTE)
 
-    # Try to parse JSON from the response
-    try:
-        parsed = json.loads(response)
-        return parsed
-    except json.JSONDecodeError:
-        pass
-
+    # Parse the whole response as JSON, else the outermost {...} block within it.
     json_match = re.search(r'\{[\s\S]*\}', response)
-    if json_match:
+    for candidate in (response, json_match.group() if json_match else None):
+        if candidate is None:
+            continue
         try:
-            parsed = json.loads(json_match.group())
-            return parsed
+            parsed = json.loads(candidate)
         except json.JSONDecodeError:
-            pass
+            continue
+        if isinstance(parsed, dict):
+            return {**parsed, **coverage}
 
-    return {"error": "Could not parse JSON from LLM response", "raw_response": response}
+    return {
+        "error": "Could not parse JSON from LLM response",
+        "raw_response": response,
+        **coverage,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -999,7 +1133,7 @@ async def generate_definition(req: GenerateDefinitionRequest):
             "SELECT c.selected_text FROM coding c "
             "JOIN document d ON c.document_id = d.id "
             "WHERE c.code_id=? AND d.project_id=? AND c.deleted_at IS NULL "
-            "LIMIT 50",
+            f"AND {_INCLUDED_DOCUMENT_SQL} ORDER BY d.name, d.id, c.start_pos",
             (req.code_id, req.project_id),
         )
         segments = await cursor.fetchall()
@@ -1007,37 +1141,53 @@ async def generate_definition(req: GenerateDefinitionRequest):
         await db.close()
 
     if not segments:
-        return {"definition": "No coded segments found for this code.", "segment_count": 0}
+        return {
+            "definition": "No coded segments found for this code.",
+            "segment_count": 0,
+            "total_segments": 0,
+        }
 
     code_name = code["name"]
     current_desc = code["description"]
-
-    passage_lines = "\n".join(
-        f'{i+1}. "{seg["selected_text"]}"' for i, seg in enumerate(segments)
-    )
 
     desc_line = ""
     if current_desc:
         desc_line = f"Current description: {current_desc}\n\n"
 
     system = "You are a qualitative research methods expert."
-    prompt = (
+    intro = (
         f'A researcher has applied the code "{code_name}" to the following text passages. '
         "Based on these passages, write a concise, precise definition for this code that "
         "captures what it means in this research context.\n\n"
         f"{desc_line}"
-        f"Coded passages:\n{passage_lines}\n\n"
+    )
+    guidance = (
         "Write a definition that:\n"
         "- Captures the core meaning across all passages\n"
         "- Is specific enough to guide future coding decisions\n"
         "- Notes any important variations or sub-themes\n"
         "- Is 2-4 sentences long"
     )
+    think = settings.get("think_mode", "off") == "on"
+    passages = [seg["selected_text"] for seg in segments]
+    wrapper = f'{len(segments)}. ""\n'
+    chosen = _fit_passages(
+        passages,
+        _prompt_budget(think, system, intro, "Coded passages:\n\n\n", guidance),
+        wrapper,
+    )
+    passage_lines = "\n".join(
+        f'{number}. "{passages[index]}"' for number, index in enumerate(chosen, 1)
+    )
+    prompt = f"{intro}Coded passages:\n{passage_lines}\n\n{guidance}"
 
     try:
-        think = settings.get("think_mode", "off") == "on"
         response = await _ollama_generate(prompt, llm_model, ollama_url, system, think=think)
-        return {"definition": response, "segment_count": len(segments)}
+        return {
+            "definition": response,
+            "segment_count": len(chosen),
+            "total_segments": len(segments),
+        }
     except httpx.ConnectError:
         raise HTTPException(503, "Cannot connect to Ollama. Make sure it is running.")
     except Exception as e:

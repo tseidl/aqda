@@ -1,7 +1,7 @@
 import { useState, useMemo, useRef, useEffect, type DragEvent } from 'react';
 import { useMutation, useQueryClient, useQuery } from '@tanstack/react-query';
-import { ChevronRight, ChevronDown, Plus, Trash2, Pencil, Sparkles, Copy, GripVertical } from 'lucide-react';
-import { codes as codesApi, settings as settingsApi, ai, type Code, type Memo } from '../api';
+import { ChevronRight, ChevronDown, Plus, Trash2, Pencil, Sparkles, Copy, GripVertical, RotateCcw } from 'lucide-react';
+import { codes as codesApi, settings as settingsApi, ai, type Code, type DeletedCode, type Memo } from '../api';
 import { MentionTextarea, MentionView } from './MentionTextarea';
 import { buildMentionCandidates, type MentionCandidate } from './mentions';
 
@@ -102,6 +102,8 @@ function CodeNode({
     mutationFn: () => codesApi.delete(code.id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['codes', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['codes-trash', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['codings'] });
       if (selectedCodeId === code.id) onSelectCode(null);
     },
   });
@@ -112,7 +114,7 @@ function CodeNode({
       const details = impact.child_count > 0
         ? `\n\nThis also moves ${impact.child_count} child code${impact.child_count === 1 ? '' : 's'} and ${impact.coding_count} coded segment${impact.coding_count === 1 ? '' : 's'} to the code trash.`
         : `\n\n${impact.coding_count} coded segment${impact.coding_count === 1 ? '' : 's'} will move to the code trash.`;
-      if (confirm(`Move code "${code.name}" to trash?${details}\n\nRestoring this code will restore exactly this deletion.`)) {
+      if (confirm(`Move code "${code.name}" to trash?${details}\n\nYou can restore it under "Deleted codes" at the bottom of the code list.`)) {
         deleteMut.mutate();
       }
     } catch (error) {
@@ -284,7 +286,7 @@ function CodeDescriptionEditor({ code, projectId, codes, memos, onJumpToMention 
   const saveTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const [summaryText, setSummaryText] = useState<string | null>(null);
   const [summaryLoading, setSummaryLoading] = useState(false);
-  const [summarySegments, setSummarySegments] = useState(0);
+  const [summarySegments, setSummarySegments] = useState({ used: 0, total: 0 });
   const [copied, setCopied] = useState(false);
   const [saveFailed, setSaveFailed] = useState(false);
   // confirmedRef: the description known to be stored on the server.
@@ -327,10 +329,11 @@ function CodeDescriptionEditor({ code, projectId, codes, memos, onJumpToMention 
     try {
       const result = await ai.summarizeCode({ project_id: projectId, code_id: code.id });
       setSummaryText(result.summary);
-      setSummarySegments(result.segment_count);
-    } catch {
-      setSummaryText('Could not generate summary. Make sure Ollama is running and an LLM model is selected in Settings.');
-      setSummarySegments(0);
+      setSummarySegments({ used: result.segment_count, total: result.total_segments });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message.replace(/^\d{3}:\s*/, '') : '';
+      setSummaryText(`Could not generate summary. ${detail || 'Make sure Ollama is running and an LLM model is selected in Settings.'}`);
+      setSummarySegments({ used: 0, total: 0 });
     } finally {
       setSummaryLoading(false);
     }
@@ -400,7 +403,9 @@ function CodeDescriptionEditor({ code, projectId, codes, memos, onJumpToMention 
         <div className="mt-2 p-2.5 bg-purple-50 border border-purple-100 rounded-md">
           <div className="flex items-center justify-between mb-1.5">
             <span className="text-[10px] text-purple-500 font-medium">
-              Based on {summarySegments} coded segment{summarySegments !== 1 ? 's' : ''}
+              {summarySegments.total === 0 ? '' : summarySegments.used < summarySegments.total
+                ? `Based on ${summarySegments.used} of ${summarySegments.total} coded segments, spread over all of them; the rest did not fit the model's context window`
+                : `Based on ${summarySegments.total} coded segment${summarySegments.total !== 1 ? 's' : ''}`}
             </span>
             <button
               onClick={handleCopy}
@@ -410,6 +415,73 @@ function CodeDescriptionEditor({ code, projectId, codes, memos, onJumpToMention 
             </button>
           </div>
           <p className="text-xs text-purple-900 leading-relaxed whitespace-pre-wrap">{summaryText}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Deleted codes, one entry per deletion, each restorable exactly as it was deleted. */
+function CodeTrash({ projectId }: { projectId: number }) {
+  const [open, setOpen] = useState(false);
+  const queryClient = useQueryClient();
+  const { data: deleted = [], isLoading } = useQuery({
+    queryKey: ['codes-trash', projectId],
+    queryFn: () => codesApi.trash(projectId),
+    enabled: open,
+  });
+
+  const restoreMut = useMutation({
+    mutationFn: (id: number) => codesApi.restore(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['codes', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['codes-trash', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['codings'] });
+    },
+    onError: (error: Error) => alert(error.message),
+  });
+
+  // "2 child codes · 14 coded segments · was under Emotions"
+  const details = (code: DeletedCode) => [
+    code.child_count ? `${code.child_count} child code${code.child_count === 1 ? '' : 's'}` : null,
+    `${code.coding_count ?? 0} coded segment${code.coding_count === 1 ? '' : 's'}`,
+    code.parent_name ? `was under “${code.parent_name}”` : null,
+  ].filter(Boolean).join(' · ');
+
+  return (
+    <div className="mt-3 border-t border-gray-100 pt-2 px-2">
+      <button
+        onClick={() => setOpen(!open)}
+        className="flex items-center gap-1 px-1 text-xs text-gray-400 hover:text-gray-600"
+      >
+        {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+        <Trash2 size={12} /> Deleted codes
+      </button>
+      {open && (
+        <div className="mt-1 space-y-1">
+          {isLoading ? (
+            <p className="px-2 py-1 text-xs text-gray-400">Loading…</p>
+          ) : deleted.length === 0 ? (
+            <p className="px-2 py-1 text-xs text-gray-400">No deleted codes.</p>
+          ) : (
+            deleted.map((code) => (
+              <div key={code.id} className="flex items-start gap-2 rounded-md px-2 py-1.5 hover:bg-gray-50">
+                <span className="mt-1 w-2.5 h-2.5 rounded-sm shrink-0" style={{ backgroundColor: code.color }} />
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm text-gray-600">{code.name}</p>
+                  <p className="text-[11px] text-gray-400">{details(code)}</p>
+                </div>
+                <button
+                  onClick={() => restoreMut.mutate(code.id)}
+                  disabled={restoreMut.isPending}
+                  className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-xs text-indigo-600 hover:bg-indigo-50 disabled:opacity-50"
+                  title="Restore this code with the child codes and coded segments deleted with it"
+                >
+                  <RotateCcw size={11} /> Restore
+                </button>
+              </div>
+            ))
+          )}
         </div>
       )}
     </div>
@@ -594,6 +666,7 @@ export function CodeTree({ projectId, codes, memos, selectedCodeId, onSelectCode
             />
           ))
         )}
+        <CodeTrash projectId={projectId} />
       </div>
 
       {/* Code description editor — shown when a code is selected */}

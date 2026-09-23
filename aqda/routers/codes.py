@@ -208,6 +208,10 @@ async def restore_code(code_id: int):
         code = await cursor.fetchone()
         if not code:
             raise HTTPException(404, "Code not found")
+        if code["deleted_at"] is None:
+            return dict(await (
+                await db.execute("SELECT * FROM code WHERE id=?", (code_id,))
+            ).fetchone())
         batch_id = code["deletion_batch_id"]
         if batch_id:
             await db.execute(
@@ -278,13 +282,20 @@ async def code_delete_impact(code_id: int):
 
 @router.get("/trash")
 async def list_deleted_codes(project_id: int):
-    """List soft-deleted codes for a project."""
+    """List each code deletion once, with what restoring it brings back."""
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT c.*, "
-            "(SELECT COUNT(*) FROM coding WHERE code_id=c.id) as coding_count "
+            "SELECT c.*, parent.name AS parent_name, "
+            "CASE WHEN c.deletion_batch_id IS NULL "
+            "THEN (SELECT COUNT(*) FROM coding WHERE code_id=c.id AND deleted_at=c.deleted_at) "
+            "ELSE (SELECT COUNT(*) FROM coding WHERE deletion_batch_id=c.deletion_batch_id) "
+            "END AS coding_count, "
+            "CASE WHEN c.deletion_batch_id IS NULL THEN 0 "
+            "ELSE (SELECT COUNT(*) FROM code WHERE deletion_batch_id=c.deletion_batch_id "
+            "AND id<>c.id) END AS child_count "
             "FROM code c LEFT JOIN code_deletion_batch b ON b.id=c.deletion_batch_id "
+            "LEFT JOIN code parent ON parent.id=c.parent_id "
             "WHERE c.project_id=? AND c.deleted_at IS NOT NULL "
             "AND (c.deletion_batch_id IS NULL OR b.root_code_id=c.id) "
             "ORDER BY c.deleted_at DESC",

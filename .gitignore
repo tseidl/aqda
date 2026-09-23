@@ -30,6 +30,8 @@ Thumbs.db
 # Environment
 .env
 
-# Claude Code
+# Private AI-assistant instructions and planning notes
 .claude/
 CLAUDE.md
+AGENTS.md
+feature-plan.md

@@ -334,6 +334,10 @@ export function SettingsPage() {
                 onChange={(e) => update('ollama_url', e.target.value)}
                 className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
               />
+              <p className="mt-1 text-xs text-gray-400">
+                With the default address, Ollama runs on this computer and your texts never leave it.
+                If you enter the address of another computer or server, AI features send passages to it.
+              </p>
             </div>
             <div className="flex items-center gap-3">
               <span

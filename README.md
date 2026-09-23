@@ -2,7 +2,7 @@
 
 **A free, open-source tool for qualitative researchers. AI-powered, local-first, privacy-respecting.**
 
-AQDA gives you a modern coding interface with local AI assistance — without cloud subscriptions, without your data ever leaving your machine. It runs as a local web app in your browser.
+AQDA gives you a modern coding interface with local AI assistance — without cloud subscriptions, and with your data staying on your machine (unless you deliberately connect it to an Ollama server elsewhere). It runs as a local web app in your browser.
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -13,7 +13,7 @@ AQDA gives you a modern coding interface with local AI assistance — without cl
 
 ### Core Qualitative Coding
 
-- **Text coding** — Select text, apply codes, build your codebook. Click on any coded passage to see applied codes or remove them.
+- **Text coding** — Select text (including audio transcripts), apply codes, build your codebook. Click on any coded passage to see applied codes or remove them.
 - **Hierarchical codes** — Organize codes in parent-child trees with colors and descriptions. Drag and drop in the sidebar to re-parent or reorder.
 - **Text, Word, PDF, image & audio files** — Import `.txt`, `.docx` (formatting is dropped), and `.pdf` documents, images (JPG, PNG, GIF, WebP), and audio files (MP3, WAV, M4A) with optional local transcription via Whisper.
 - **Memos** — Write analytical notes at the project, document, or code level. Anchor a memo to a specific passage and jump back to it, and reference codes or other memos inline by typing `@` — click a reference to jump straight to it.
@@ -24,19 +24,21 @@ AQDA gives you a modern coding interface with local AI assistance — without cl
 
 ### AI-Powered Augmentation
 
-AQDA uses [Ollama](https://ollama.com) to run AI models locally on your computer. No internet connection required, no data shared with anyone.
+AQDA uses [Ollama](https://ollama.com) to run AI models locally on your computer. No internet connection required, no data shared with anyone. (If you point AQDA at an Ollama server on another machine, the AI features send passages to that machine.)
 
 | Feature | What it does |
 |---------|-------------|
 | **Topic Search** | Find passages across your documents that match a topic or theme you describe |
 | **Code Suggest** | Given a code, find uncoded passages that might belong to it (from its definition and coded examples); review each and **Apply** or **Dismiss** it |
-| **Consistency Check** | Flag coded segments that seem like outliers within a code — like inter-rater reliability with yourself over time |
+| **Consistency Check** | Flag coded segments whose meaning stands out from the other segments of the same code — a prompt to re-read them, not a measure of agreement |
 | **Hierarchy Suggest** | After inductive coding, get suggestions for grouping your codes into parent categories |
 | **Code Definition Generator** | Applied a code many times but haven't written a definition yet? Generate one from the actual coded passages |
 
 When you click on an AI result, AQDA jumps to the passage in the document and highlights it, so you can immediately see the context and decide whether to code it.
 
-Topic Search and Code Suggest cover text, PDF, and transcribed audio. Mark any document as **Reference** from its header (e.g. pre-coded examples or training material) to keep it out of AI results.
+Topic Search and Code Suggest cover text, PDF, and transcribed audio. Use **Exclude documents…** in the AI panel for material that is not part of your data, such as interview guides, instructions, or documents collecting example quotes for your codebook. Excluded documents are ignored by every AI feature: they are not searched, and their coded segments are not used for suggestions, summaries, definitions, or the consistency check.
+
+Summaries, definitions, and hierarchy suggestions send the model only as many passages as fit into its context window, judged by a deliberately generous estimate of their length. When a code has more, AQDA sends a selection spread over all of its passages and says how many it sent (for example, 34 of 120). Answers that reach AQDA's length limit are marked as possibly incomplete.
 
 These tools are designed as a **methodological interlocutor** — they interrogate your coding rather than generate it. The researcher always has the final word.
 
@@ -128,7 +130,7 @@ Run `pipx ensurepath`, then **close and reopen your terminal**. This adds pipx's
 3. In AQDA, go to **Settings** and select your models under "Embedding Model" and "LLM Model"
 4. Open the **AI panel** (sparkle icon in the left sidebar)
 
-All AI processing happens on your machine. Nothing is sent to any server.
+With Ollama running on your machine (the default), all AI processing happens locally and nothing is sent to any server.
 
 ### Audio Transcription (Optional)
 
@@ -170,7 +172,7 @@ This removes the app but keeps your data in `~/.aqda/`. To remove everything, al
 
 ## Your Data
 
-AQDA saves every change immediately. There is no Save button. Its private working database
+AQDA saves every change to your project as you work; you never need to save it. Its private working database
 lives at `~/.aqda/aqda.db`; normal users never need to open or move this file.
 
 - **Automatic backups** — AQDA keeps seven verified daily backups in `~/.aqda/backups/`
@@ -178,6 +180,10 @@ lives at `~/.aqda/aqda.db`; normal users never need to open or move this file.
   (the ten newest collaboration backups are kept; adjustable in Settings)
 - **Move or archive a project** with an `.aqda` snapshot from the Export menu
 - **Deleted projects** go to a trash bin and can be restored
+- **Deleted codes** go to *Deleted codes* at the bottom of the code list and can be restored
+  together with their child codes and coded segments
+- **Deleting a document** is permanent: its coded segments are removed, while memos linked to
+  it are kept, each with a note naming the deleted document (and the passage it was about)
 
 Do not put the live `aqda.db` in Google Drive, Dropbox, OneDrive, or a network folder.
 AQDA's collaboration feature below provides the same convenient shared-folder experience

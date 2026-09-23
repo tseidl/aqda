@@ -4,19 +4,31 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowLeft, Upload, FileText, Tags, StickyNote, Search,
   Download, ChevronDown, Sparkles, Plus, Trash2, Settings,
-  Filter, LayoutList, CheckSquare, Square, Tag, BookMarked, Cloud, AlertTriangle, Pencil,
+  Filter, LayoutList, CheckSquare, Square, Tag, EyeOff, Cloud, AlertTriangle, Pencil,
   FolderOpen, X,
 } from 'lucide-react';
-import { projects, documents, codes, codings, memos, shared, type Document as Doc } from '../api';
+import {
+  projects, documents, codes, codings, memos, shared,
+  type Code, type Document as Doc, type Memo,
+} from '../api';
 import { CodeTree } from '../components/CodeTree';
 import { DocumentViewer } from '../components/DocumentViewer';
 import { MemoPanel } from '../components/MemoPanel';
 import { SegmentsBrowser } from '../components/SegmentsBrowser';
 import { AiPanel } from '../components/AiPanel';
 import type { MentionCandidate } from '../components/mentions';
+import { useSelectionRepair } from '../components/selectionRepair';
 import { CloseAqdaButton } from '../components/CloseAqdaButton';
 
 type Tab = 'codes' | 'documents' | 'memos' | 'segments' | 'ai';
+
+// Identities used to re-find a selection after a collaborator's version replaced IDs.
+const identifyDoc = (d: Doc) => `${d.name}\u0000${d.created_at}`;
+const identifyCode = (c: Code) => `${c.name}\u0000${c.created_at}`;
+const identifyMemo = (m: Memo) => `${m.title}\u0000${m.created_at}`;
+
+// Plural-aware count, e.g. "1 coded segment" / "3 coded segments".
+const countOf = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
 
 export function ProjectView() {
   const { projectId: pid } = useParams();
@@ -92,6 +104,7 @@ export function ProjectView() {
     ) {
       queryClient.invalidateQueries({ queryKey: ['documents', projectId] });
       queryClient.invalidateQueries({ queryKey: ['codes', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['codes-trash', projectId] });
       queryClient.invalidateQueries({ queryKey: ['codings'] });
       queryClient.invalidateQueries({ queryKey: ['memos', projectId] });
     }
@@ -168,7 +181,7 @@ export function ProjectView() {
     onError: (error: Error) => setCollaborationNotice(error.message),
   });
 
-  const { data: docList = [] } = useQuery({
+  const { data: docList = [], dataUpdatedAt: docsUpdatedAt } = useQuery({
     queryKey: ['documents', projectId],
     queryFn: () => documents.list(projectId),
   });
@@ -212,16 +225,22 @@ export function ProjectView() {
       .sort((a, b) => a[0].localeCompare(b[0]));
   }, [docList]);
 
-  const { data: codeList = [] } = useQuery({
+  const { data: codeList = [], dataUpdatedAt: codesUpdatedAt } = useQuery({
     queryKey: ['codes', projectId],
     queryFn: () => codes.list(projectId),
   });
 
   // Shared with MemoPanel (same query key) — used for @-mention candidates.
-  const { data: memoList = [] } = useQuery({
+  const { data: memoList = [], dataUpdatedAt: memosUpdatedAt } = useQuery({
     queryKey: ['memos', projectId],
     queryFn: () => memos.list({ project_id: projectId }),
   });
+
+  // A collaborator's version arriving re-creates every record under new IDs; follow
+  // the open document, code, and memo to their new IDs or clear them if they are gone.
+  useSelectionRepair(selectedDocId, setSelectedDocId, docList, docsUpdatedAt, identifyDoc);
+  useSelectionRepair(selectedCodeId, setSelectedCodeId, codeList, codesUpdatedAt, identifyCode);
+  useSelectionRepair(selectedMemoId, setSelectedMemoId, memoList, memosUpdatedAt, identifyMemo);
 
   const { data: selectedDoc } = useQuery({
     queryKey: ['document', selectedDocId],
@@ -267,23 +286,55 @@ export function ProjectView() {
     },
   });
 
+  // Deleting documents also removes their codings and turns linked memos into project memos.
+  const invalidateAfterDocumentDelete = () => {
+    queryClient.invalidateQueries({ queryKey: ['documents', projectId] });
+    queryClient.invalidateQueries({ queryKey: ['codes', projectId] });
+    queryClient.invalidateQueries({ queryKey: ['codings'] });
+    queryClient.invalidateQueries({ queryKey: ['memos', projectId] });
+  };
+
   const deleteDocMut = useMutation({
     mutationFn: documents.delete,
     onSuccess: (_, deletedId) => {
-      queryClient.invalidateQueries({ queryKey: ['documents', projectId] });
+      invalidateAfterDocumentDelete();
       if (selectedDocId === deletedId) setSelectedDocId(null);
     },
+    onError: (error: Error) => alert(error.message),
   });
 
   const bulkDeleteMut = useMutation({
     mutationFn: (ids: number[]) => documents.deleteBulk(ids),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['documents', projectId] });
+      invalidateAfterDocumentDelete();
       if (selectedDocId && selectedDocIds.has(selectedDocId)) setSelectedDocId(null);
       setSelectedDocIds(new Set());
       setSelectionMode(false);
     },
+    onError: (error: Error) => alert(error.message),
   });
+
+  // Ask before deleting documents, stating what is lost for good and what is kept.
+  const confirmDocumentDelete = async (ids: number[], question: string) => {
+    try {
+      const impact = await documents.deleteImpact(ids);
+      const one = ids.length === 1;
+      const lines = [question, ''];
+      lines.push(
+        impact.coding_count > 0
+          ? `${one ? 'Its' : 'Their'} ${countOf(impact.coding_count, 'coded segment')} will be deleted permanently.`
+          : `${one ? 'It has' : 'They have'} no coded segments.`
+      );
+      if (impact.memo_count > 0) {
+        lines.push(`${countOf(impact.memo_count, 'memo')} linked to ${one ? 'it' : 'them'} will be kept, each with a note naming the deleted document (and passage).`);
+      }
+      lines.push('', 'Documents cannot be restored from a trash.');
+      return confirm(lines.join('\n'));
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'Could not check what would be deleted.');
+      return false;
+    }
+  };
 
   const renameDocMut = useMutation({
     mutationFn: ({ id, name }: { id: number; name: string }) =>
@@ -874,9 +925,10 @@ export function ProjectView() {
                       </button>
                       {selectedDocIds.size > 0 && (
                         <button
-                          onClick={() => {
-                            if (confirm(`Delete ${selectedDocIds.size} documents?`)) {
-                              bulkDeleteMut.mutate(Array.from(selectedDocIds));
+                          onClick={async () => {
+                            const ids = Array.from(selectedDocIds);
+                            if (await confirmDocumentDelete(ids, `Delete ${countOf(ids.length, 'document')}?`)) {
+                              bulkDeleteMut.mutate(ids);
                             }
                           }}
                           disabled={bulkDeleteMut.isPending}
@@ -1028,10 +1080,10 @@ export function ProjectView() {
                               {doc.name}
                             </span>
                           )}
-                          {/* Reference (excluded from AI) indicator */}
+                          {/* Excluded from AI features (set in the AI panel) */}
                           {doc.exclude_from_ai ? (
-                            <span title="Reference — excluded from AI suggestions" className="shrink-0 text-amber-500">
-                              <BookMarked size={12} />
+                            <span title="Excluded from AI features (change in the AI panel)" className="shrink-0 text-gray-400">
+                              <EyeOff size={12} />
                             </span>
                           ) : null}
                           {/* User-set short tag */}
@@ -1079,9 +1131,11 @@ export function ProjectView() {
                             {doc.source_type === 'pdf' ? 'PDF' : doc.source_type === 'image' ? 'IMG' : doc.source_type === 'audio' ? 'AUD' : 'TXT'}
                           </span>
                           <button
-                            onClick={(e) => {
+                            onClick={async (e) => {
                               e.stopPropagation();
-                              if (confirm(`Delete "${doc.name}"?`)) deleteDocMut.mutate(doc.id);
+                              if (await confirmDocumentDelete([doc.id], `Delete "${doc.name}"?`)) {
+                                deleteDocMut.mutate(doc.id);
+                              }
                             }}
                             className="hidden group-hover:block p-0.5 text-gray-400 hover:text-red-500"
                           >

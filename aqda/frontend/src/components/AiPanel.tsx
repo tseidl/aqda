@@ -1,11 +1,11 @@
 import { useState, useRef, useEffect } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Sparkles, Search, Wand2, X, Power, RefreshCw,
-  ShieldCheck, GitBranch, BookOpen, Settings2, Check,
+  ShieldCheck, GitBranch, BookOpen, Settings2, Check, EyeOff,
 } from 'lucide-react';
 import {
-  ai, settings as settingsApi, codings as codingsApi,
+  ai, settings as settingsApi, codings as codingsApi, documents as documentsApi,
   type Code, type SimilarResult, type ConsistencyResult, type HierarchySuggestion,
 } from '../api';
 
@@ -38,6 +38,120 @@ const MODES: ModeConfig[] = [
   { id: 'definition', label: 'Define Code', icon: <BookOpen size={13} />, group: 'codebook', description: 'Generate a definition from coded passages' },
 ];
 
+/** Choose which documents every AI feature ignores; the choice is saved with the project. */
+function DocumentExclusions({ projectId, disabled }: { projectId: number; disabled: boolean }) {
+  const queryClient = useQueryClient();
+  const { data: docs = [] } = useQuery({
+    queryKey: ['documents', projectId],
+    queryFn: () => documentsApi.list(projectId),
+  });
+  const [draft, setDraft] = useState<Set<number> | null>(null);
+  // The documents listed when the choice was opened; if one has since disappeared (deleted,
+  // or replaced by a collaborator's version) the choice refers to old documents.
+  const [openedWith, setOpenedWith] = useState<number[]>([]);
+  const [filter, setFilter] = useState('');
+  const excludedCount = docs.filter((d) => d.exclude_from_ai).length;
+  const listChanged =
+    openedWith.length !== docs.length || openedWith.some((id) => !docs.some((d) => d.id === id));
+
+  // Start the choice from the current exclusions of the current documents.
+  const openChoice = () => {
+    setFilter('');
+    setDraft(new Set(docs.filter((d) => d.exclude_from_ai).map((d) => d.id)));
+    setOpenedWith(docs.map((d) => d.id));
+  };
+
+  const saveMut = useMutation({
+    mutationFn: (ids: number[]) => documentsApi.setAiExclusions(projectId, ids, openedWith),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['documents', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['document'] });
+      setDraft(null);
+      setOpenedWith([]);
+    },
+  });
+
+  const toggle = (id: number) => setDraft((current) => {
+    const next = new Set(current);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    return next;
+  });
+
+  if (draft === null) {
+    return (
+      <div className="mb-2 px-1 flex items-center justify-between gap-2 text-[11px]">
+        <span className="flex items-center gap-1 text-gray-500">
+          <EyeOff size={11} />
+          {excludedCount
+            ? `${excludedCount} document${excludedCount === 1 ? '' : 's'} excluded`
+            : 'No documents excluded'}
+        </span>
+        <button
+          onClick={openChoice}
+          disabled={disabled || docs.length === 0}
+          className="text-purple-600 hover:text-purple-700 disabled:opacity-40"
+        >
+          Exclude documents…
+        </button>
+      </div>
+    );
+  }
+
+  const needle = filter.trim().toLowerCase();
+  const shown = docs.filter((d) => !needle || d.name.toLowerCase().includes(needle));
+  return (
+    <div className="mb-2 rounded-md border border-gray-200 bg-gray-50 p-2">
+      <p className="mb-1.5 text-[11px] leading-snug text-gray-600">
+        Excluded documents are ignored by every AI feature: they are not searched, and their
+        coded segments are not used for suggestions, summaries, definitions, or the consistency
+        check. Use this for material that is not part of your data, such as interview guides,
+        instructions, consent forms, or documents collecting example quotes for your codebook.
+      </p>
+      {docs.length > 8 && (
+        <input
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          placeholder="Filter documents…"
+          className="mb-1 w-full rounded border border-gray-200 bg-white px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-purple-500"
+        />
+      )}
+      <div className="max-h-48 space-y-0.5 overflow-auto">
+        {shown.map((d) => (
+          <label key={d.id} className="flex cursor-pointer items-center gap-2 rounded px-1 py-0.5 text-xs text-gray-700 hover:bg-white">
+            <input type="checkbox" checked={draft.has(d.id)} onChange={() => toggle(d.id)} />
+            <span className="truncate">{d.name}</span>
+          </label>
+        ))}
+      </div>
+      {listChanged && (
+        <p className="mt-1 text-[11px] text-amber-700">
+          The document list changed while you were choosing.{' '}
+          <button onClick={openChoice} className="font-medium underline">Start again</button>
+        </p>
+      )}
+      {saveMut.error && (
+        <p className="mt-1 text-[11px] text-red-600">{saveMut.error.message.replace(/^\d{3}:\s*/, '')}</p>
+      )}
+      <div className="mt-2 flex gap-1">
+        <button
+          onClick={() => saveMut.mutate([...draft])}
+          disabled={saveMut.isPending || listChanged}
+          className="flex-1 rounded bg-purple-600 py-1 text-xs font-medium text-white hover:bg-purple-700 disabled:opacity-50"
+        >
+          {saveMut.isPending ? 'Saving…' : 'Save'}
+        </button>
+        <button
+          onClick={() => { setDraft(null); setOpenedWith([]); }}
+          className="rounded bg-white px-2 py-1 text-xs text-gray-500 hover:bg-gray-100"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function AiPanel({ projectId, codes, onNavigate }: Props) {
   const [mode, setMode] = useState<AiMode>('search');
   const [query, setQuery] = useState('');
@@ -50,7 +164,7 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
   const [similarResults, setSimilarResults] = useState<SimilarResult[]>([]);
   const [consistencyResults, setConsistencyResults] = useState<ConsistencyResult[]>([]);
   const [hierarchyResult, setHierarchyResult] = useState<HierarchySuggestion | null>(null);
-  const [definitionResult, setDefinitionResult] = useState<{ definition: string; segment_count: number } | null>(null);
+  const [definitionResult, setDefinitionResult] = useState<{ definition: string; segment_count: number; total_segments: number } | null>(null);
 
   // Model overrides
   const [llmOverride, setLlmOverride] = useState<string>('');
@@ -113,6 +227,40 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
 
   const effectiveLlm = llmOverride || currentSettings?.llm_model || '';
   const effectiveEmbed = embedOverride || currentSettings?.embedding_model || '';
+
+  const { data: projectDocs, isSuccess: docsLoaded } = useQuery({
+    queryKey: ['documents', projectId],
+    queryFn: () => documentsApi.list(projectId),
+  });
+
+  // A code or document the panel refers to can disappear (deleted, or replaced by a
+  // collaborator's version); drop the selection and results instead of acting on old IDs.
+  useEffect(() => {
+    if (selectedCodeId !== null && !codes.some((c) => c.id === selectedCodeId)) {
+      // A run for the vanished code must not fill the panel when its answer arrives later.
+      abortRef.current?.abort();
+      abortRef.current = null;
+      setSelectedCodeId(null);
+      setSimilarResults([]);
+      setSuggestionCodeId(null);
+      setConsistencyResults([]);
+      setDefinitionResult(null);
+    }
+  }, [codes, selectedCodeId]);
+
+  useEffect(() => {
+    if (!docsLoaded) return;
+    const ids = new Set(projectDocs.map((d) => d.id));
+    const stale =
+      similarResults.some((r) => !ids.has(r.document_id)) ||
+      consistencyResults.some((cr) => cr.outliers.some((o) => !ids.has(o.document_id)));
+    if (stale) {
+      setSimilarResults([]);
+      setSuggestionCodeId(null);
+      setConsistencyResults([]);
+      setError('The project changed since these results were produced, so they were cleared. Run again for current results.');
+    }
+  }, [docsLoaded, projectDocs, similarResults, consistencyResults]);
 
   const isRunning = ollamaStatus?.running ?? false;
   const models = ollamaModels?.models ?? [];
@@ -271,14 +419,9 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
       }
     } catch (e) {
       if (e instanceof DOMException && e.name === 'AbortError') return;
+      // The server's own message (after the "503: " status prefix) says what went wrong.
       const msg = e instanceof Error ? e.message : String(e);
-      if (msg.includes('503') || msg.includes('connect')) {
-        setError('Cannot connect to Ollama. Make sure it is running and the required model is pulled.');
-      } else if (msg.includes('400')) {
-        setError('No model configured. Select one below or in Settings.');
-      } else {
-        setError(msg);
-      }
+      setError(msg.replace(/^\d{3}:\s*/, ''));
     } finally {
       setLoading(false);
       abortRef.current = null;
@@ -402,6 +545,8 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
 
       {/* Mode description */}
       <p className="text-[11px] text-gray-400 px-1 mb-2">{currentMode.description}</p>
+
+      <DocumentExclusions projectId={projectId} disabled={loading} />
 
       {/* Input area — varies by mode */}
       {mode === 'search' && (
@@ -631,6 +776,25 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
                     </div>
                   </div>
                 )}
+                {hierarchyResult.codes_included !== undefined &&
+                  hierarchyResult.code_count !== undefined &&
+                  hierarchyResult.codes_included < hierarchyResult.code_count && (
+                  <p className="text-[10px] text-amber-700 px-1">
+                    The model saw {hierarchyResult.codes_included} of {hierarchyResult.code_count} codes;
+                    the codebook was too long for its context window.
+                  </p>
+                )}
+                {hierarchyResult.answer_truncated && (
+                  <p className="text-[10px] text-amber-700 px-1">
+                    The model's answer reached AQDA's length limit, so the suggestion may be incomplete.
+                  </p>
+                )}
+                {hierarchyResult.examples_included === false && (
+                  <p className="text-[10px] text-amber-700 px-1">
+                    Example passages were left out because the codebook was long; the model saw
+                    code names, segment counts, and definitions only.
+                  </p>
+                )}
                 <p className="text-[10px] text-gray-400 px-1 italic">
                   This is a suggestion — review and apply changes manually in the code tree.
                 </p>
@@ -644,7 +808,9 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
           <div className="space-y-2">
             <div className="border border-gray-100 rounded-md p-3 bg-gray-50/50">
               <p className="text-xs text-gray-500 mb-1.5">
-                Generated from {definitionResult.segment_count} coded segment{definitionResult.segment_count !== 1 ? 's' : ''}
+                {definitionResult.segment_count < definitionResult.total_segments
+                  ? `Generated from ${definitionResult.segment_count} of ${definitionResult.total_segments} coded segments, spread over all of them; the rest did not fit the model's context window`
+                  : `Generated from ${definitionResult.total_segments} coded segment${definitionResult.total_segments !== 1 ? 's' : ''}`}
               </p>
               <p className="text-sm text-gray-800 leading-relaxed whitespace-pre-wrap">
                 {definitionResult.definition}

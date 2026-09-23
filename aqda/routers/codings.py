@@ -130,29 +130,6 @@ async def create_coding(data: CodingCreate):
         await db.close()
 
 
-@router.get("/audit")
-async def coding_audit(project_id: int | None = None):
-    db = await get_db()
-    try:
-        conditions = ["cg.repair_status LIKE 'review_%'"]
-        params = []
-        if project_id is not None:
-            conditions.append("d.project_id=?")
-            params.append(project_id)
-        rows = await (
-            await db.execute(
-                "SELECT cg.id, cg.document_id, cg.start_pos, cg.end_pos, cg.selected_text, "
-                "cg.repair_status, d.name AS document_name, c.name AS code_name "
-                "FROM coding cg JOIN document d ON d.id=cg.document_id "
-                "JOIN code c ON c.id=cg.code_id WHERE " + " AND ".join(conditions),
-                params,
-            )
-        ).fetchall()
-        return {"count": len(rows), "items": [dict(row) for row in rows]}
-    finally:
-        await db.close()
-
-
 @router.delete("/{coding_id}", status_code=204)
 async def delete_coding(coding_id: int):
     # Soft-delete for consistency with code deletion and to keep it recoverable.

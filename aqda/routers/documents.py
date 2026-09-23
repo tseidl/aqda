@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import re
+from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 
@@ -31,10 +32,9 @@ router = APIRouter()
 class DocumentUpdate(BaseModel):
     name: str | None = None
     label: str | None = None
-    exclude_from_ai: bool | None = None
 
 
-ALLOWED_DOCUMENT_FIELDS = {"name", "label", "exclude_from_ai"}
+ALLOWED_DOCUMENT_FIELDS = {"name", "label"}
 
 
 class VariableUpdate(BaseModel):
@@ -333,6 +333,119 @@ class BulkDeleteRequest(BaseModel):
     ids: list[int]
 
 
+class AiExclusionUpdate(BaseModel):
+    project_id: int
+    excluded_ids: list[int]
+    # Every document the researcher saw while choosing; the choice only applies to that list.
+    listed_ids: list[int]
+
+
+# Longest passage quoted in the note added to a memo whose document is deleted.
+MEMO_NOTE_PASSAGE_CHARS = 300
+
+
+def _deleted_document_note(name: str, passage: str | None) -> str:
+    """The note that tells a researcher which deleted document (and passage) a memo was about."""
+    date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if not passage:
+        return f"[This memo was linked to the document “{name}”, deleted on {date}.]"
+    if len(passage) > MEMO_NOTE_PASSAGE_CHARS:
+        passage = passage[:MEMO_NOTE_PASSAGE_CHARS].rstrip() + "…"
+    return (
+        f"[This memo was linked to a passage in the document “{name}”, deleted on {date}: "
+        f"“{passage}”]"
+    )
+
+
+async def _detach_memos(db, placeholders: str, ids: list[int]) -> None:
+    """Keep memos written about deleted documents, noting at the top what they were linked to."""
+    rows = await (
+        await db.execute(
+            "SELECT m.id, m.content, m.start_pos, m.end_pos, d.name, d.content AS text, "
+            "d.transcript, d.source_type FROM memo m JOIN document d ON d.id=m.document_id "
+            f"WHERE m.document_id IN ({placeholders})",
+            ids,
+        )
+    ).fetchall()
+    for row in rows:
+        passage = None
+        if row["start_pos"] is not None and row["end_pos"] is not None:
+            text = row["transcript"] if row["source_type"] == "audio" else row["text"]
+            passage = (text or "")[row["start_pos"]:row["end_pos"]].strip() or None
+        note = _deleted_document_note(row["name"], passage)
+        content = f"{note}\n\n{row['content']}" if row["content"] else note
+        await db.execute(
+            "UPDATE memo SET content=?, document_id=NULL, coding_id=NULL, start_pos=NULL, "
+            "end_pos=NULL, modified_at=datetime('now') WHERE id=?",
+            (content, row["id"]),
+        )
+
+
+@router.post("/delete-impact")
+async def documents_delete_impact(data: BulkDeleteRequest):
+    """Count what deleting these documents removes (codings) and keeps (memos)."""
+    if not data.ids:
+        return {"document_count": 0, "coding_count": 0, "memo_count": 0}
+    db = await get_db()
+    try:
+        placeholders = ",".join("?" * len(data.ids))
+        row = await (
+            await db.execute(
+                f"SELECT (SELECT COUNT(*) FROM document WHERE id IN ({placeholders})) AS docs, "
+                f"(SELECT COUNT(*) FROM coding WHERE document_id IN ({placeholders}) "
+                "AND deleted_at IS NULL) AS codings, "
+                f"(SELECT COUNT(*) FROM memo WHERE document_id IN ({placeholders})) AS memos",
+                [*data.ids, *data.ids, *data.ids],
+            )
+        ).fetchone()
+        return {
+            "document_count": row["docs"],
+            "coding_count": row["codings"],
+            "memo_count": row["memos"],
+        }
+    finally:
+        await db.close()
+
+
+@router.put("/ai-exclusions")
+async def set_ai_exclusions(data: AiExclusionUpdate):
+    """Set exactly which of a project's documents all AI features ignore."""
+    db = await get_db()
+    try:
+        # Check and change the documents in one transaction.
+        await db.execute("BEGIN IMMEDIATE")
+        rows = await (
+            await db.execute(
+                "SELECT id, exclude_from_ai FROM document WHERE project_id=?",
+                (data.project_id,),
+            )
+        ).fetchall()
+        wanted = set(data.excluded_ids)
+        # The whole set is replaced, so a choice made on an outdated document list (for
+        # example before a collaborator's version arrived) must not change current exclusions.
+        current = {row["id"] for row in rows}
+        if set(data.listed_ids) != current or not wanted <= current:
+            raise HTTPException(
+                409, "The document list changed while you were choosing. Please choose again."
+            )
+        changes = [
+            (1 if row["id"] in wanted else 0, row["id"])
+            for row in rows
+            if bool(row["exclude_from_ai"]) != (row["id"] in wanted)
+        ]
+        if changes:
+            await db.executemany("UPDATE document SET exclude_from_ai=? WHERE id=?", changes)
+            await touch_project(db, data.project_id)
+        await db.commit()
+        return {"excluded_ids": sorted(row["id"] for row in rows if row["id"] in wanted)}
+    except Exception:
+        if db.in_transaction:
+            await db.rollback()
+        raise
+    finally:
+        await db.close()
+
+
 @router.post("/parse-variables")
 async def parse_variables_bulk(project_id: int):
     """Re-parse filename variables for all documents in a project."""
@@ -375,6 +488,7 @@ async def delete_documents_bulk(data: BulkDeleteRequest):
             f"SELECT DISTINCT project_id FROM document WHERE id IN ({placeholders})", data.ids
         )
         project_ids = [row["project_id"] for row in await cursor.fetchall()]
+        await _detach_memos(db, placeholders, data.ids)
         await db.execute(f"DELETE FROM document WHERE id IN ({placeholders})", data.ids)
         await db.execute(
             f"DELETE FROM document_variable WHERE document_id IN ({placeholders})", data.ids
@@ -418,8 +532,6 @@ async def update_document(document_id: int, data: DocumentUpdate):
         for field, val in fields.items():
             if field not in ALLOWED_DOCUMENT_FIELDS:
                 continue
-            if field == "exclude_from_ai":
-                val = 1 if val else 0
             if current[field] == val:
                 continue
             updates.append(f"{field}=?")
@@ -446,6 +558,7 @@ async def delete_document(document_id: int):
     try:
         cursor = await db.execute("SELECT project_id FROM document WHERE id=?", (document_id,))
         row = await cursor.fetchone()
+        await _detach_memos(db, "?", [document_id])
         await db.execute("DELETE FROM document WHERE id=?", (document_id,))
         if row:
             await touch_project(db, row["project_id"])

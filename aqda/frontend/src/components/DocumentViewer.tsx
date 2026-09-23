@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { X, Tag, Sparkles, ChevronDown, ChevronRight, ChevronUp, Plus, Trash2, Loader2, StickyNote, BookMarked, Search, Minus as MinusIcon, Plus as PlusIcon } from 'lucide-react';
+import { X, Tag, Sparkles, ChevronDown, ChevronRight, ChevronUp, Plus, Trash2, Loader2, StickyNote, EyeOff, Search, Minus as MinusIcon, Plus as PlusIcon } from 'lucide-react';
 import { codes as codesApi, documents as docsApi, type Document, type Coding, type Code, type Memo } from '../api';
 import { MentionTextarea } from './MentionTextarea';
 import { buildMentionCandidates } from './mentions';
@@ -80,6 +80,61 @@ function codePointToUtf16(index: OffsetIndex, offset: number): number {
   return cp + countBelow(index.astralCodePoints, cp);
 }
 
+/** UTF-16 offset of a DOM boundary point within `root`'s text. Points outside `root`
+ *  (a triple-click or a drag past the last line) clamp to the start or end of the text,
+ *  and points on elements rather than text nodes are measured like any other. */
+function textOffset(root: HTMLElement, container: Node, offset: number): number {
+  const whole = document.createRange();
+  whole.selectNodeContents(root);
+  if (!root.contains(container)) {
+    const point = document.createRange();
+    point.setStart(container, offset);
+    return point.compareBoundaryPoints(Range.START_TO_START, whole) <= 0
+      ? 0
+      : (root.textContent?.length ?? 0);
+  }
+  whole.setEnd(container, offset);
+  return whole.toString().length;
+}
+
+/** Lower-case text for case-insensitive find, with maps back to original offsets.
+ *  Lower-casing can lengthen text ("İ" becomes "i" plus a combining dot), so match
+ *  positions in the folded text are mapped back rather than reused: a match start inside
+ *  such a character moves to its start, a match end inside it moves to its end. */
+function foldCase(text: string): {
+  folded: string;
+  startOf: (index: number) => number;
+  endOf: (index: number) => number;
+} {
+  const lowered = text.toLowerCase();
+  if (lowered.length === text.length) {
+    return { folded: lowered, startOf: (index) => index, endOf: (index) => index };
+  }
+  let folded = '';
+  const charStart: number[] = [];  // per folded unit: where its original character starts
+  const charEnd: number[] = [];  // per folded unit: where its original character ends
+  const firstUnit: boolean[] = [];  // per folded unit: is it the first unit of that character
+  for (let i = 0; i < text.length;) {
+    const char = String.fromCodePoint(text.codePointAt(i)!);
+    const lower = char.toLowerCase();
+    for (let k = 0; k < lower.length; k++) {
+      charStart.push(i);
+      charEnd.push(i + char.length);
+      firstUnit.push(k === 0);
+    }
+    folded += lower;
+    i += char.length;
+  }
+  return {
+    folded,
+    startOf: (index) => (index >= folded.length ? text.length : charStart[index]),
+    endOf: (index) => {
+      if (index >= folded.length) return text.length;
+      return firstUnit[index] ? charStart[index] : charEnd[index];
+    },
+  };
+}
+
 export function DocumentViewer({ document: doc, codings, codes, memos, selectedCodeId, onApplyCode, onDeleteCoding, onAddMemo, highlightRange, onHighlightClear }: Props) {
   const contentRef = useRef<HTMLDivElement>(null);
   const textContentRef = useRef<HTMLDivElement>(null);
@@ -102,6 +157,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
   const [editingTag, setEditingTag] = useState(false);
   const [tagValue, setTagValue] = useState('');
   const [memoDraft, setMemoDraft] = useState<{ title: string; content: string } | null>(null);
+  const [newCodeError, setNewCodeError] = useState<string | null>(null);
   const highlightRef = useRef<HTMLElement | null>(null);
   const popupClickRef = useRef(false);
   // In-document find (Cmd/Ctrl+F)
@@ -151,14 +207,6 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     },
   });
 
-  const setExcludeMut = useMutation({
-    mutationFn: (exclude: boolean) => docsApi.update(doc.id, { exclude_from_ai: exclude }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['document', doc.id] });
-      queryClient.invalidateQueries({ queryKey: ['documents', doc.project_id] });
-    },
-  });
-
   const handleTranscribe = async () => {
     setTranscribing(true);
     setTranscribeError(null);
@@ -201,14 +249,14 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
   // In-document find: positions of every case-insensitive match of the query.
   const findMatches = useMemo(() => {
     if (!findOpen || !findQuery) return [] as { start: number; end: number }[];
-    const hay = codeableText.toLowerCase();
-    const needle = findQuery.toLowerCase();
+    const { folded: hay, startOf, endOf } = foldCase(codeableText);
+    const needle = foldCase(findQuery).folded;
     const out: { start: number; end: number }[] = [];
     let idx = hay.indexOf(needle);
     while (idx !== -1 && out.length < 5000) {
       out.push({
-        start: utf16ToCodePoint(offsetIndex, idx),
-        end: utf16ToCodePoint(offsetIndex, idx + needle.length),
+        start: utf16ToCodePoint(offsetIndex, startOf(idx)),
+        end: utf16ToCodePoint(offsetIndex, endOf(idx + needle.length)),
       });
       idx = hay.indexOf(needle, idx + Math.max(1, needle.length));
     }
@@ -332,70 +380,51 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
       setClickedCoding(null);
       setMemoDraft(null);
       const range = sel.getRangeAt(0);
-      if (!textContentRef.current.contains(range.startContainer) ||
-          !textContentRef.current.contains(range.endContainer)) return;
+      const root = textContentRef.current;
+      if (!range.intersectsNode(root)) return;
+      let rawStart = textOffset(root, range.startContainer, range.startOffset);
+      let rawEnd = textOffset(root, range.endContainer, range.endOffset);
+      // Surrounding whitespace (a triple-click includes the line break) is not part of the passage.
+      while (rawStart < rawEnd && /\s/.test(codeableText[rawStart])) rawStart++;
+      while (rawEnd > rawStart && /\s/.test(codeableText[rawEnd - 1])) rawEnd--;
 
-      const walker = document.createTreeWalker(textContentRef.current, NodeFilter.SHOW_TEXT);
-      let offset = 0;
-      let rawStart = -1;
-      let rawEnd = -1;
-
-      while (walker.nextNode()) {
-        const node = walker.currentNode;
-        if (node === range.startContainer) rawStart = offset + range.startOffset;
-        if (node === range.endContainer) { rawEnd = offset + range.endOffset; break; }
-        offset += node.textContent?.length ?? 0;
-      }
-
-      if (rawStart >= 0 && rawEnd > rawStart) {
-        const text = codeableText.slice(rawStart, rawEnd);
-        if (!text.trim()) { setSelection(null); return; }
-        const startPos = utf16ToCodePoint(offsetIndex, rawStart);
-        const endPos = utf16ToCodePoint(offsetIndex, rawEnd);
-        const rect = range.getBoundingClientRect();
-        const containerRect = contentRef.current.getBoundingClientRect();
-        setSelection({
-          start: startPos, end: endPos, text,
-          rect: {
-            top: rect.top - containerRect.top + contentRef.current.scrollTop,
-            bottom: rect.bottom - containerRect.top + contentRef.current.scrollTop,
-            left: rect.left - containerRect.left + rect.width / 2,
-          },
-        });
-      }
+      if (rawEnd <= rawStart) { setSelection(null); return; }
+      const text = codeableText.slice(rawStart, rawEnd);
+      const startPos = utf16ToCodePoint(offsetIndex, rawStart);
+      const endPos = utf16ToCodePoint(offsetIndex, rawEnd);
+      const rect = range.getBoundingClientRect();
+      const containerRect = contentRef.current.getBoundingClientRect();
+      setSelection({
+        start: startPos, end: endPos, text,
+        rect: {
+          top: rect.top - containerRect.top + contentRef.current.scrollTop,
+          bottom: rect.bottom - containerRect.top + contentRef.current.scrollTop,
+          left: rect.left - containerRect.left + rect.width / 2,
+        },
+      });
       return;
     }
 
     // No selection — check if clicked on a coded passage
     if (sel.anchorNode && textContentRef.current.contains(sel.anchorNode)) {
-      const walker = document.createTreeWalker(textContentRef.current, NodeFilter.SHOW_TEXT);
-      let offset = 0;
-      let rawClickPos = -1;
-      while (walker.nextNode()) {
-        const node = walker.currentNode;
-        if (node === sel.anchorNode) { rawClickPos = offset + sel.anchorOffset; break; }
-        offset += node.textContent?.length ?? 0;
-      }
-
-      if (rawClickPos >= 0) {
-        const clickPos = utf16ToCodePoint(offsetIndex, rawClickPos);
-        const overlapping = codings.filter(c => c.start_pos <= clickPos && c.end_pos > clickPos);
-        if (overlapping.length > 0) {
-          const range = document.createRange();
-          range.setStart(sel.anchorNode, sel.anchorOffset);
-          range.setEnd(sel.anchorNode, sel.anchorOffset);
-          const rect = range.getBoundingClientRect();
-          const containerRect = contentRef.current.getBoundingClientRect();
-          setClickedCoding({
-            codings: overlapping,
-            rect: {
-              top: rect.top - containerRect.top + contentRef.current.scrollTop,
-              left: Math.max(10, rect.left - containerRect.left),
-            },
-          });
-          setSelection(null);
-          return;
-        }
+      const rawClickPos = textOffset(textContentRef.current, sel.anchorNode, sel.anchorOffset);
+      const clickPos = utf16ToCodePoint(offsetIndex, rawClickPos);
+      const overlapping = codings.filter(c => c.start_pos <= clickPos && c.end_pos > clickPos);
+      if (overlapping.length > 0) {
+        const range = document.createRange();
+        range.setStart(sel.anchorNode, sel.anchorOffset);
+        range.setEnd(sel.anchorNode, sel.anchorOffset);
+        const rect = range.getBoundingClientRect();
+        const containerRect = contentRef.current.getBoundingClientRect();
+        setClickedCoding({
+          codings: overlapping,
+          rect: {
+            top: rect.top - containerRect.top + contentRef.current.scrollTop,
+            left: Math.max(10, rect.left - containerRect.left),
+          },
+        });
+        setSelection(null);
+        return;
       }
     }
 
@@ -406,8 +435,8 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     setMemoDraft(null);
   }, [codings, codeableText, offsetIndex]);
 
-  // The popup's code filter starts empty for every new selection.
-  useEffect(() => { setCodeFilter(''); }, [selection]);
+  // The popup's code filter and any earlier error start empty for every new selection.
+  useEffect(() => { setCodeFilter(''); setNewCodeError(null); }, [selection]);
 
   // Apply code to selection
   const applyCode = useCallback(
@@ -432,17 +461,68 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
   // Create a new code (with optional definition) and apply it to the selection
   const createNewCode = useCallback(async () => {
     if (!newCodeName.trim()) return;
-    const newCode = await codesApi.create({
-      project_id: doc.project_id,
-      name: newCodeName.trim(),
-      description: newCodeDesc.trim() || undefined,
-    });
+    let newCode: Code;
+    try {
+      newCode = await codesApi.create({
+        project_id: doc.project_id,
+        name: newCodeName.trim(),
+        description: newCodeDesc.trim() || undefined,
+      });
+    } catch (error) {
+      setNewCodeError(error instanceof Error ? error.message.replace(/^\d{3}:\s*/, '') : String(error));
+      return;
+    }
+    setNewCodeError(null);
     queryClient.invalidateQueries({ queryKey: ['codes', doc.project_id] });
     applyCode(newCode.id);
     setNewCodeName('');
     setNewCodeDesc('');
     setShowNewCodeInput(false);
   }, [newCodeName, newCodeDesc, doc.project_id, applyCode, queryClient]);
+
+  // The codeable text with coding highlights; shared by text, PDF, and audio transcripts.
+  const textBody = (
+    <div ref={textContentRef} className="p-6 max-w-4xl mx-auto text-gray-800 whitespace-pre-wrap select-text" style={{ fontSize: `${docFontSize}px`, lineHeight: 1.8 }}>
+      {renderedContent.map((seg, i) => {
+        const isFirstHighlight = i === firstHighlightIdx;
+        if (seg.codings.length === 0 && !seg.highlighted) {
+          return <span key={i}>{seg.text}</span>;
+        }
+        if (seg.codings.length === 0 && seg.highlighted) {
+          return (
+            <mark
+              key={i}
+              ref={isFirstHighlight ? (el) => { highlightRef.current = el; } : undefined}
+              className="ai-search-highlight"
+              style={{ backgroundColor: 'rgba(120, 120, 120, 0.2)', borderBottom: '2px solid #9ca3af' }}
+            >
+              {seg.text}
+            </mark>
+          );
+        }
+        // Use the first coding's color as primary, show all on hover
+        const primary = seg.codings[0];
+        const color = primary.code_color ?? '#6366f1';
+        return (
+          <mark
+            key={i}
+            ref={isFirstHighlight ? (el) => { highlightRef.current = el; } : undefined}
+            data-color={color}
+            className={seg.highlighted ? 'ai-search-highlight' : undefined}
+            style={{
+              backgroundColor: seg.highlighted
+                ? 'rgba(120, 120, 120, 0.25)'
+                : color + '30',
+              borderBottom: `2px solid ${seg.highlighted ? '#9ca3af' : color}`,
+            }}
+            title={seg.codings.map((c) => c.code_name).join(', ')}
+          >
+            {seg.text}
+          </mark>
+        );
+      })}
+    </div>
+  );
 
   return (
     <div className="h-full flex flex-col">
@@ -493,16 +573,14 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
             </span>
           </div>
           <div className="flex items-center gap-3">
-            <button
-              onClick={() => setExcludeMut.mutate(!doc.exclude_from_ai)}
-              className={`text-xs flex items-center gap-1 ${
-                doc.exclude_from_ai ? 'text-amber-600 font-medium' : 'text-gray-400 hover:text-gray-600'
-              }`}
-              title="Reference material is excluded from AI search and code suggestions — useful for pre-coded examples / training documents."
-            >
-              <BookMarked size={13} />
-              {doc.exclude_from_ai ? 'Reference (no AI)' : 'Mark as reference'}
-            </button>
+            {doc.exclude_from_ai ? (
+              <span
+                className="text-xs flex items-center gap-1 text-gray-400"
+                title="Excluded from AI features. Change this in the AI panel."
+              >
+                <EyeOff size={13} /> Excluded from AI
+              </span>
+            ) : null}
             {Object.keys(variables).length > 0 && !showVariables && (
               <span className="text-xs text-gray-400">
                 {Object.keys(variables).length} variable{Object.keys(variables).length !== 1 ? 's' : ''}
@@ -713,84 +791,11 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
               )}
             </div>
             {/* Transcript (codeable text) */}
-            {doc.transcript && (
-              <div ref={textContentRef} className="p-6 max-w-4xl mx-auto text-gray-800 whitespace-pre-wrap select-text" style={{ fontSize: `${docFontSize}px`, lineHeight: 1.8 }}>
-                {renderedContent.map((seg, i) => {
-                  const isFirstHighlight = i === firstHighlightIdx;
-                  if (seg.codings.length === 0 && !seg.highlighted) {
-                    return <span key={i}>{seg.text}</span>;
-                  }
-                  if (seg.codings.length === 0 && seg.highlighted) {
-                    return (
-                      <mark
-                        key={i}
-                        ref={isFirstHighlight ? (el) => { highlightRef.current = el; } : undefined}
-                        className="ai-search-highlight"
-                        style={{ backgroundColor: 'rgba(120, 120, 120, 0.2)', borderBottom: '2px solid #9ca3af' }}
-                      >
-                        {seg.text}
-                      </mark>
-                    );
-                  }
-                  const primary = seg.codings[0];
-                  const color = primary.code_color ?? '#6366f1';
-                  return (
-                    <mark
-                      key={i}
-                      ref={isFirstHighlight ? (el) => { highlightRef.current = el; } : undefined}
-                      data-color={color}
-                      className="coded-segment cursor-pointer rounded-xs"
-                      style={{ backgroundColor: `${color}25`, borderBottom: `2px solid ${color}` }}
-                      title={seg.codings.map((c) => c.code_name).join(', ')}
-                    >
-                      {seg.text}
-                    </mark>
-                  );
-                })}
-              </div>
-            )}
+            {doc.transcript && textBody}
           </div>
-        ) : (<>
-        <div ref={textContentRef} className="p-6 max-w-4xl mx-auto text-gray-800 whitespace-pre-wrap select-text" style={{ fontSize: `${docFontSize}px`, lineHeight: 1.8 }}>
-          {renderedContent.map((seg, i) => {
-            const isFirstHighlight = i === firstHighlightIdx;
-            if (seg.codings.length === 0 && !seg.highlighted) {
-              return <span key={i}>{seg.text}</span>;
-            }
-            if (seg.codings.length === 0 && seg.highlighted) {
-              return (
-                <mark
-                  key={i}
-                  ref={isFirstHighlight ? (el) => { highlightRef.current = el; } : undefined}
-                  className="ai-search-highlight"
-                  style={{ backgroundColor: 'rgba(120, 120, 120, 0.2)', borderBottom: '2px solid #9ca3af' }}
-                >
-                  {seg.text}
-                </mark>
-              );
-            }
-            // Use the first coding's color as primary, show all on hover
-            const primary = seg.codings[0];
-            const color = primary.code_color ?? '#6366f1';
-            return (
-              <mark
-                key={i}
-                ref={isFirstHighlight ? (el) => { highlightRef.current = el; } : undefined}
-                data-color={color}
-                className={seg.highlighted ? 'ai-search-highlight' : undefined}
-                style={{
-                  backgroundColor: seg.highlighted
-                    ? 'rgba(120, 120, 120, 0.25)'
-                    : color + '30',
-                  borderBottom: `2px solid ${seg.highlighted ? '#9ca3af' : color}`,
-                }}
-                title={seg.codings.map((c) => c.code_name).join(', ')}
-              >
-                {seg.text}
-              </mark>
-            );
-          })}
-        </div>
+        ) : (
+          textBody
+        )}
 
         {/* Selection popup */}
         {selection && (() => {
@@ -962,6 +967,9 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
                 >
                   Create &amp; apply
                 </button>
+                {newCodeError && (
+                  <p className="text-xs text-red-600">Could not create the code: {newCodeError}</p>
+                )}
               </div>
             ) : (
               <button
@@ -1021,7 +1029,6 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
           </div>
         )}
 
-        </>)}
       </div>
     </div>
   );
