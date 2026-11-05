@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
+import { useState, useRef, useCallback, useMemo, useEffect, useLayoutEffect } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { X, Tag, Sparkles, ChevronDown, ChevronRight, ChevronUp, Plus, Trash2, Loader2, StickyNote, EyeOff, Search, Minus as MinusIcon, Plus as PlusIcon } from 'lucide-react';
 import { codes as codesApi, documents as docsApi, type Document, type Coding, type Code, type Memo } from '../api';
@@ -14,7 +14,7 @@ interface Props {
   onApplyCode: (codeId: number, startPos: number, endPos: number, text: string) => void;
   onDeleteCoding: (id: number) => void;
   onSelectCode: (id: number) => void;
-  onAddMemo?: (startPos: number, endPos: number, text: string, title?: string, content?: string) => void;
+  onAddMemo?: (documentId: number, startPos: number, endPos: number, text: string, title?: string, content?: string) => void;
   highlightRange?: { start: number; end: number } | null;
   onHighlightClear?: () => void;
 }
@@ -96,6 +96,28 @@ function textOffset(root: HTMLElement, container: Node, offset: number): number 
   whole.setEnd(container, offset);
   return whole.toString().length;
 }
+
+/** The DOM range covering UTF-16 offsets [start, end) of root's text (the inverse of textOffset). */
+function rangeFromOffsets(root: HTMLElement, start: number, end: number): Range | null {
+  const range = document.createRange();
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let seen = 0;
+  let startSet = false;
+  for (let node = walker.nextNode() as Text | null; node; node = walker.nextNode() as Text | null) {
+    const len = node.data.length;
+    if (!startSet && start <= seen + len) { range.setStart(node, start - seen); startSet = true; }
+    if (startSet && end <= seen + len) { range.setEnd(node, end - seen); return range; }
+    seen += len;
+  }
+  return null;
+}
+
+// Focus a popup field without scrolling the document to it (a stable ref callback, so it
+// runs once when the field appears).
+const focusWithoutScroll = (el: HTMLElement | null) => el?.focus({ preventScroll: true });
+
+// Name of the CSS highlight that keeps the passage being coded marked (see index.css).
+const PENDING_HIGHLIGHT = 'aqda-pending-passage';
 
 /** Lower-case text for case-insensitive find, with maps back to original offsets.
  *  Lower-casing can lengthen text ("İ" becomes "i" plus a combining dot), so match
@@ -367,6 +389,37 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     [renderedContent],
   );
 
+  // Save a memo typed in the selection popup instead of dropping it. Only Cancel and the
+  // close button discard a draft; an untouched draft is not saved.
+  const keepMemoDraft = useCallback(
+    (documentId: number, sel: TextSelection | null, draft: { title: string; content: string } | null) => {
+      if (!sel || !draft || !onAddMemo) return;
+      if (!draft.title.trim() && !draft.content.trim()) return;
+      onAddMemo(documentId, sel.start, sel.end, sel.text, draft.title, draft.content);
+    },
+    [onAddMemo],
+  );
+
+  // Close the selection popup, keeping any memo typed in it.
+  const closeMemoDraft = useCallback(() => {
+    keepMemoDraft(doc.id, selection, memoDraft);
+    setMemoDraft(null);
+  }, [keepMemoDraft, doc.id, selection, memoDraft]);
+
+  // The popup state as last rendered, for saving a draft when the document changes.
+  const popupState = useRef({ selection, memoDraft, keepMemoDraft });
+  useEffect(() => { popupState.current = { selection, memoDraft, keepMemoDraft }; });
+
+  // Switching documents (or leaving the project) closes the popup: its passage belongs to the
+  // previous document. A memo typed in it is saved to that document.
+  useEffect(() => () => {
+    const { selection: sel, memoDraft: draft, keepMemoDraft: keep } = popupState.current;
+    keep(doc.id, sel, draft);
+    setSelection(null);
+    setMemoDraft(null);
+    setShowNewCodeInput(false);
+  }, [doc.id]);
+
   // Handle text selection or click on coded passage
   const handleMouseUp = useCallback(() => {
     // Skip if the click was on a popup (buttons, etc.)
@@ -378,7 +431,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     // Text was selected — show apply-code popup
     if (!sel.isCollapsed) {
       setClickedCoding(null);
-      setMemoDraft(null);
+      closeMemoDraft();
       const range = sel.getRangeAt(0);
       const root = textContentRef.current;
       if (!range.intersectsNode(root)) return;
@@ -423,20 +476,51 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
             left: Math.max(10, rect.left - containerRect.left),
           },
         });
+        closeMemoDraft();
         setSelection(null);
         return;
       }
     }
 
     // Clicked on uncoded text — clear all popups
+    closeMemoDraft();
     setClickedCoding(null);
     setSelection(null);
     setShowNewCodeInput(false);
-    setMemoDraft(null);
-  }, [codings, codeableText, offsetIndex]);
+  }, [codings, codeableText, offsetIndex, closeMemoDraft]);
 
   // The popup's code filter and any earlier error start empty for every new selection.
   useEffect(() => { setCodeFilter(''); setNewCodeError(null); }, [selection]);
+
+  // Keep the passage marked while its popup is open: focusing the popup's fields removes the
+  // browser's own selection. A CSS highlight paints the range without changing the text.
+  useEffect(() => {
+    const root = textContentRef.current;
+    if (!selection || !root || typeof CSS === 'undefined' || !CSS.highlights) return;
+    const range = rangeFromOffsets(
+      root,
+      codePointToUtf16(offsetIndex, selection.start),
+      codePointToUtf16(offsetIndex, selection.end),
+    );
+    if (!range) return;
+    CSS.highlights.set(PENDING_HIGHLIGHT, new Highlight(range));
+    return () => { CSS.highlights.delete(PENDING_HIGHLIGHT); };
+  }, [selection, offsetIndex, renderedContent]);
+
+  // Open the popup above the passage if it fits in view there, else below if it fits there,
+  // else on the side with more room. Measured before paint, so the popup does not flicker.
+  const popupRef = useRef<HTMLDivElement>(null);
+  const [popupAbove, setPopupAbove] = useState(true);
+  const memoOpen = memoDraft !== null;
+  useLayoutEffect(() => {
+    const popup = popupRef.current;
+    const box = contentRef.current;
+    if (!selection || !popup || !box) return;
+    const height = popup.offsetHeight;
+    const roomAbove = selection.rect.top - box.scrollTop - 10;
+    const roomBelow = box.scrollTop + box.clientHeight - selection.rect.bottom - 8;
+    setPopupAbove(roomAbove >= height || (roomBelow < height && roomAbove > roomBelow));
+  }, [selection, memoOpen, showNewCodeInput]);
 
   // Apply code to selection
   const applyCode = useCallback(
@@ -452,11 +536,11 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
   // Save the memo drafted in the selection popup
   const saveMemo = useCallback(() => {
     if (!selection || !onAddMemo) return;
-    onAddMemo(selection.start, selection.end, selection.text, memoDraft?.title ?? '', memoDraft?.content ?? '');
+    onAddMemo(doc.id, selection.start, selection.end, selection.text, memoDraft?.title ?? '', memoDraft?.content ?? '');
     setMemoDraft(null);
     setSelection(null);
     window.getSelection()?.removeAllRanges();
-  }, [selection, onAddMemo, memoDraft]);
+  }, [selection, onAddMemo, memoDraft, doc.id]);
 
   // Create a new code (with optional definition) and apply it to the selection
   const createNewCode = useCallback(async () => {
@@ -807,13 +891,11 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
           const filteredCodes = codes.filter(
             (c) => c.id !== selectedCodeId && (!needle || c.name.toLowerCase().includes(needle))
           );
-          // If the selection is near the top of the visible area, show popup below
-          const scrollTop = contentRef.current?.scrollTop ?? 0;
-          const nearTop = selection.rect.top - scrollTop < 200;
           return (
           <div
+            ref={popupRef}
             className="absolute z-50 bg-white rounded-lg shadow-xl border border-gray-200 p-3 min-w-[220px] max-w-[280px]"
-            style={nearTop ? {
+            style={!popupAbove ? {
               top: selection.rect.bottom + 8,
               left: Math.max(10, Math.min(selection.rect.left - 110, (contentRef.current?.clientWidth ?? 400) - 290)),
             } : {
@@ -833,7 +915,6 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
                   “{selection.text.length > 90 ? selection.text.slice(0, 90) + '…' : selection.text}”
                 </p>
                 <input
-                  autoFocus
                   placeholder="Title (optional)"
                   value={memoDraft.title}
                   onChange={(e) => setMemoDraft((d) => (d ? { ...d, title: e.target.value } : d))}
@@ -841,6 +922,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
                 />
                 <MentionTextarea
                   rows={3}
+                  autoFocus
                   className="border border-gray-200 rounded mb-2 focus-within:ring-1 focus-within:ring-amber-400"
                   textClassName="px-2 py-1 text-sm"
                   value={memoDraft.content}
@@ -899,7 +981,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
             {/* Code list, narrowed by the filter box; Enter applies the first match */}
             {codes.length > 8 && (
               <input
-                autoFocus
+                ref={focusWithoutScroll}
                 value={codeFilter}
                 placeholder="Type to filter codes…"
                 onChange={(e) => setCodeFilter(e.target.value)}
@@ -939,7 +1021,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
             {showNewCodeInput ? (
               <div className="mt-2 pt-2 border-t border-gray-100 space-y-1.5">
                 <input
-                  autoFocus
+                  ref={focusWithoutScroll}
                   placeholder="New code name"
                   value={newCodeName}
                   onChange={(e) => setNewCodeName(e.target.value)}

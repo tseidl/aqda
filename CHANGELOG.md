@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### New features
+- **Import spreadsheets** — importing a single `.csv`, `.tsv`, or `.xlsx` file opens a table
+  import: each row becomes a document, you choose the column with the text to code and
+  (optionally) the column that names the documents, and the other columns become document
+  variables. Semicolon-separated CSV files (common in German Excel) are recognized; for Excel
+  files you can choose the sheet. Rows without text are skipped and counted. Spreadsheets in
+  a multi-file import are skipped with a note to import them on their own.
+
+### Improvements
+- **Passage memos** — the cursor starts in the note instead of the optional title, and a memo
+  you have typed is saved when you click elsewhere, select another passage, or switch
+  documents. Only Cancel or the close button discard it.
+
+### Bug fixes
+- **The text no longer jumps when the coding popup opens** — in projects with more than eight
+  codes, the popup's filter box scrolled the document whenever the popup opened partly out of
+  view (typically for a passage a few lines below the top of the window). The popup now opens
+  on the side of the passage where it fits, and its fields take focus without scrolling.
+- **The passage being coded stays marked** — the selection highlight disappeared once the
+  popup's filter or memo field took focus; the passage now stays marked until the popup closes.
+- **Switching documents closes the coding popup** — it stayed open on the new document, and
+  choosing a code there would have coded the new document at the old document's positions.
+
 ## 0.5.0
 
 ### New features

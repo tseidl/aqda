@@ -2,18 +2,25 @@
 
 import asyncio
 import base64
+import json
 import re
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 
 from aqda.db import get_db, MAX_UPLOAD_BYTES, touch_project, touch_projects
+from aqda.services.tables import read_table, suggest_text_column, table_extension, xlsx_sheet_names
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
 AUDIO_EXTENSIONS = {'.mp3', '.wav', '.m4a', '.ogg', '.flac', '.webm', '.wma', '.aac'}
 # Binary office formats AQDA cannot read; decoding them as text yields garbage.
-UNSUPPORTED_EXTENSIONS = {'.doc', '.odt', '.rtf', '.pages', '.ppt', '.pptx', '.xls', '.xlsx', '.zip'}
+UNSUPPORTED_EXTENSIONS = {'.doc', '.odt', '.rtf', '.pages', '.ppt', '.pptx', '.zip'}
 UNSUPPORTED_MESSAGE = "This format is not supported. Save the file as .docx, .txt, or .pdf first."
+OLD_EXCEL_MESSAGE = "This format is not supported. Save the spreadsheet as .xlsx or .csv first."
+# Spreadsheets go through the table import, where the researcher picks the text column.
+TABLE_MESSAGE = "Import a spreadsheet on its own, so you can choose the column with the text."
+# Rows shown in the table import preview.
+TABLE_PREVIEW_ROWS = 5
 
 AUDIO_MIME_MAP = {
     '.mp3': 'audio/mpeg',
@@ -188,7 +195,8 @@ def _decode_text_bytes(data: bytes) -> str:
 
 
 def _detect_source_type(filename: str) -> str:
-    """Classify an upload; 'docx' and 'unsupported' are import-time kinds, not stored types."""
+    """Classify an upload; 'docx', 'table', 'old_excel', and 'unsupported' are import-time
+    kinds, not stored types."""
     ext = '.' + filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
     if ext == '.pdf':
         return 'pdf'
@@ -200,6 +208,10 @@ def _detect_source_type(filename: str) -> str:
         return 'audio'
     if ext in UNSUPPORTED_EXTENSIONS:
         return 'unsupported'
+    if ext == '.xls':
+        return 'old_excel'
+    if table_extension(filename):
+        return 'table'
     return 'text'
 
 
@@ -208,6 +220,10 @@ async def _read_upload_text(filename: str, content_bytes: bytes) -> tuple[str, s
     source_type = _detect_source_type(filename)
     if source_type == "unsupported":
         raise ValueError(UNSUPPORTED_MESSAGE)
+    if source_type == "old_excel":
+        raise ValueError(OLD_EXCEL_MESSAGE)
+    if source_type == "table":
+        raise ValueError(TABLE_MESSAGE)
     if source_type == "pdf":
         return "pdf", await _extract_pdf_text(content_bytes)
     if source_type == "docx":
@@ -325,6 +341,118 @@ async def upload_documents_bulk(
             )
             results = [dict(r) for r in await cursor.fetchall()]
         return {"documents": results, "skipped": skipped}
+    finally:
+        await db.close()
+
+
+def _table_preview_sync(filename: str, content: bytes, sheet: str | None) -> dict:
+    """Read a spreadsheet and describe it for the import dialog."""
+    sheets = xlsx_sheet_names(content) if table_extension(filename) == ".xlsx" else []
+    headers, rows = read_table(filename, content, _decode_text_bytes, sheet)
+    return {
+        "columns": headers,
+        "rows": rows[:TABLE_PREVIEW_ROWS],
+        "row_count": len(rows),
+        "sheets": sheets,
+        "sheet": sheet if sheet is not None else (sheets[0] if sheets else None),
+        "suggested_text_column": suggest_text_column(headers, rows),
+    }
+
+
+async def _read_table_upload(file: UploadFile) -> tuple[str, bytes]:
+    """Read an uploaded spreadsheet, enforcing the upload size limit."""
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"File too large. Maximum size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+    return file.filename or "table.csv", content
+
+
+@router.post("/table-preview")
+async def preview_table(file: UploadFile = File(...), sheet: str | None = Form(None)):
+    """Return a spreadsheet's columns and first rows, so the researcher can pick the text column."""
+    filename, content = await _read_table_upload(file)
+    try:
+        return await asyncio.to_thread(_table_preview_sync, filename, content, sheet)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception:
+        raise HTTPException(400, "The table could not be read.")
+
+
+@router.post("/table-import", status_code=201)
+async def import_table(
+    project_id: int = Form(...),
+    file: UploadFile = File(...),
+    text_column: str = Form(...),
+    name_column: str | None = Form(None),
+    variable_columns: str = Form("[]"),
+    sheet: str | None = Form(None),
+):
+    """Create one document per spreadsheet row.
+
+    ``text_column`` becomes the document text, ``name_column`` (optional) its name, and each
+    of ``variable_columns`` (a JSON list) a document variable. Rows without text are skipped.
+    """
+    filename, content = await _read_table_upload(file)
+    try:
+        headers, rows = await asyncio.to_thread(
+            read_table, filename, content, _decode_text_bytes, sheet
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception:
+        raise HTTPException(400, "The table could not be read.")
+
+    try:
+        var_names = json.loads(variable_columns)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid list of variable columns.")
+    if not isinstance(var_names, list) or not all(isinstance(v, str) for v in var_names):
+        raise HTTPException(400, "Invalid list of variable columns.")
+    name_column = name_column or None
+    unknown = [c for c in [text_column, name_column, *var_names] if c is not None and c not in headers]
+    if unknown:
+        raise HTTPException(400, f"The table has no column named “{unknown[0]}”.")
+    text_idx = headers.index(text_column)
+    name_idx = headers.index(name_column) if name_column else None
+    var_idx = [(v, headers.index(v)) for v in dict.fromkeys(var_names) if v != text_column]
+
+    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+    digits = len(str(len(rows)))
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT id FROM project WHERE id=? AND deleted_at IS NULL", (project_id,)
+        )
+        if not await cursor.fetchone():
+            raise HTTPException(404, "Project not found")
+        imported, skipped, first_id = 0, 0, None
+        for number, row in enumerate(rows, start=1):
+            text = row[text_idx]
+            if not text.strip():
+                skipped += 1
+                continue
+            name = (row[name_idx].strip() if name_idx is not None else "") or (
+                f"{stem} – row {number:0{digits}d}"
+            )
+            cursor = await db.execute(
+                "INSERT INTO document (project_id, name, content, source_type) VALUES (?, ?, ?, 'text')",
+                (project_id, name, text),
+            )
+            doc_id = cursor.lastrowid
+            first_id = first_id or doc_id
+            values = [(doc_id, key, row[i]) for key, i in var_idx if row[i].strip()]
+            if values:
+                await db.executemany(
+                    "INSERT INTO document_variable (document_id, key, value) VALUES (?, ?, ?)",
+                    values,
+                )
+            imported += 1
+        if not imported:
+            raise HTTPException(400, f"No row has text in “{text_column}”.")
+        await touch_project(db, project_id)
+        await db.commit()
+        return {"imported": imported, "skipped_empty": skipped, "first_document_id": first_id}
     finally:
         await db.close()
 

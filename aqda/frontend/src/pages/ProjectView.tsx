@@ -19,12 +19,15 @@ import { AiPanel } from '../components/AiPanel';
 import type { MentionCandidate } from '../components/mentions';
 import { useSelectionRepair } from '../components/selectionRepair';
 import { CloseAqdaButton } from '../components/CloseAqdaButton';
+import { TableImportDialog } from '../components/TableImportDialog';
 
 type Tab = 'codes' | 'documents' | 'memos' | 'segments' | 'ai';
 
 // Identities used to re-find a selection after a collaborator's version replaced IDs.
 const identifyDoc = (d: Doc) => `${d.name}\u0000${d.created_at}`;
 const identifyCode = (c: Code) => `${c.name}\u0000${c.created_at}`;
+// Spreadsheets go through the table import, where the researcher picks the text column.
+const isTableFile = (file: File) => /\.(csv|tsv|xlsx)$/i.test(file.name);
 const identifyMemo = (m: Memo) => `${m.title}\u0000${m.created_at}`;
 
 // Plural-aware count, e.g. "1 coded segment" / "3 coded segments".
@@ -60,6 +63,8 @@ export function ProjectView() {
   const [uploadProgress, setUploadProgress] = useState<{ completed: number; total: number } | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadNotice, setUploadNotice] = useState<string | null>(null);
+  // A spreadsheet waiting for the researcher to choose its text column.
+  const [tableFile, setTableFile] = useState<File | null>(null);
   const [selectedDocIds, setSelectedDocIds] = useState<Set<number>>(new Set());
   const [selectionMode, setSelectionMode] = useState(false);
   const [renamingDocId, setRenamingDocId] = useState<number | null>(null);
@@ -417,31 +422,36 @@ export function ProjectView() {
 
   // Create a memo anchored to the current document + selected passage.
   const handleAddMemo = useCallback(
-    (startPos: number, endPos: number, text: string, title?: string, content?: string) => {
-      if (!selectedDocId) return;
+    (documentId: number, startPos: number, endPos: number, text: string, title?: string, content?: string) => {
       const trimmed = text.trim();
       const snippet = trimmed.length > 50 ? trimmed.slice(0, 50) + '…' : trimmed;
       const note = (content ?? '').trim();
       createMemoMut.mutate({
         project_id: projectId,
-        document_id: selectedDocId,
+        document_id: documentId,
         start_pos: startPos,
         end_pos: endPos,
         title: (title && title.trim()) || snippet || 'Memo',
         content: note || `“${trimmed}”`,
       });
     },
-    [selectedDocId, projectId, createMemoMut]
+    [projectId, createMemoMut]
   );
 
   const handleFileUpload = useCallback(() => {
     const input = document.createElement('input');
     input.type = 'file';
     input.multiple = true;
-    input.accept = '.txt,.text,.docx,.pdf,.jpg,.jpeg,.png,.gif,.bmp,.webp,.mp3,.wav,.m4a,.ogg,.flac,.webm,.aac';
+    input.accept = '.txt,.text,.docx,.pdf,.csv,.tsv,.xlsx,.jpg,.jpeg,.png,.gif,.bmp,.webp,.mp3,.wav,.m4a,.ogg,.flac,.webm,.aac';
     input.onchange = () => {
-      if (input.files?.length) {
-        uploadMut.mutate(Array.from(input.files));
+      const files = Array.from(input.files ?? []);
+      // A single spreadsheet opens the table import; in a batch, the import skips it with a note.
+      if (files.length === 1 && isTableFile(files[0])) {
+        setUploadError(null);
+        setUploadNotice(null);
+        setTableFile(files[0]);
+      } else if (files.length) {
+        uploadMut.mutate(files);
       }
     };
     input.click();
@@ -628,6 +638,26 @@ export function ProjectView() {
           <CloseAqdaButton />
         </div>
       </header>
+
+      {tableFile && (
+        <TableImportDialog
+          projectId={projectId}
+          file={tableFile}
+          onClose={() => setTableFile(null)}
+          onImported={(result) => {
+            setTableFile(null);
+            queryClient.invalidateQueries({ queryKey: ['documents', projectId] });
+            setSelectedDocId(result.first_document_id);
+            setActiveTab('documents');
+            setUploadNotice(
+              `Imported ${result.imported} document${result.imported !== 1 ? 's' : ''} from ${tableFile.name}` +
+              (result.skipped_empty
+                ? `; ${result.skipped_empty} row${result.skipped_empty !== 1 ? 's' : ''} without text ${result.skipped_empty !== 1 ? 'were' : 'was'} skipped.`
+                : '.')
+            );
+          }}
+        />
+      )}
 
       {showCollaborationPicker && (
         <div

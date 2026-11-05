@@ -193,6 +193,22 @@ export interface SkippedUpload {
   reason: string;
 }
 
+/** A spreadsheet's columns and first rows, for choosing what to import. */
+export interface TablePreview {
+  columns: string[];
+  rows: string[][];
+  row_count: number;
+  sheets: string[];
+  sheet: string | null;
+  suggested_text_column: string;
+}
+
+export interface TableImportResult {
+  imported: number;
+  skipped_empty: number;
+  first_document_id: number;
+}
+
 export interface BulkUploadResult {
   documents: Document[];
   skipped: SkippedUpload[];
@@ -361,6 +377,30 @@ export const documents = {
       onProgress?.(Math.min(i + BATCH_SIZE, files.length), files.length);
     }
     return { documents, skipped };
+  },
+  previewTable: async (file: File, sheet: string | null): Promise<TablePreview> => {
+    const form = new FormData();
+    form.append('file', file);
+    if (sheet !== null) form.append('sheet', sheet);
+    const res = await fetch(`${BASE}/documents/table-preview`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error(await errorDetail(res));
+    return res.json();
+  },
+  importTable: async (
+    projectId: number,
+    file: File,
+    choice: { sheet: string | null; textColumn: string; nameColumn: string | null; variableColumns: string[] },
+  ): Promise<TableImportResult> => {
+    const form = new FormData();
+    form.append('project_id', String(projectId));
+    form.append('file', file);
+    form.append('text_column', choice.textColumn);
+    if (choice.nameColumn) form.append('name_column', choice.nameColumn);
+    form.append('variable_columns', JSON.stringify(choice.variableColumns));
+    if (choice.sheet !== null) form.append('sheet', choice.sheet);
+    const res = await fetch(`${BASE}/documents/table-import`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error(await errorDetail(res));
+    return res.json();
   },
   update: (id: number, data: { name?: string; label?: string }) =>
     request<Document>(`/documents/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),

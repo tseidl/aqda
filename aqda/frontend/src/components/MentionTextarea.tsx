@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type ChangeEvent, type MouseEvent, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type MouseEvent, type ReactNode } from 'react';
 import type { MentionCandidate } from './mentions';
 
 /** Render text with `@Label` mentions underlined/coloured. Mention styling only
@@ -124,6 +124,9 @@ export function MentionTextarea({
   const [mention, setMention] = useState<{ query: string; start: number } | null>(null);
   const labels = useMemo(() => candidates.map((c) => c.label).filter(Boolean), [candidates]);
 
+  // Focus on mount without scrolling the page (the attribute would scroll the field into view).
+  useEffect(() => { if (autoFocus) taRef.current?.focus({ preventScroll: true }); }, [autoFocus]);
+
   const detect = (v: string, caret: number) => {
     const m = v.slice(0, caret).match(/(?:^|\s)@([^\s@]*)$/);
     setMention(m ? { query: m[1], start: caret - m[1].length - 1 } : null);
@@ -179,7 +182,6 @@ export function MentionTextarea({
         onKeyDown={(e) => { if (e.key === 'Escape' && mention) { e.stopPropagation(); setMention(null); } }}
         placeholder={placeholder}
         rows={fill ? undefined : rows}
-        autoFocus={autoFocus}
         className={`relative ${fill ? 'flex-1' : 'w-full'} bg-transparent resize-none focus:outline-none whitespace-pre-wrap break-words ${textClassName}`}
         style={{ color: 'transparent', caretColor: '#111827', scrollbarGutter: 'stable' }}
       />

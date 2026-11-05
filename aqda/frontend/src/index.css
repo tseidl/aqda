@@ -18,6 +18,10 @@ mark[data-color]:hover {
 }
 
 /* AI search highlight — pulse then settle */
+/* The passage whose coding popup is open (DocumentViewer). */
+::highlight(aqda-pending-passage) {
+  background-color: rgba(99, 102, 241, 0.28);
+}
 .ai-search-highlight {
   animation: ai-highlight-pulse 2s ease-in-out;
   border-radius: 2px;

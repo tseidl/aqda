@@ -17,6 +17,7 @@ AQDA gives you a modern coding interface with local AI assistance — without cl
 - **Hierarchical codes** — Organize codes in parent-child trees with colors and descriptions. Drag and drop in the sidebar to re-parent or reorder.
 - **Text, Word, PDF, image & audio files** — Import `.txt`, `.docx` (formatting is dropped), and `.pdf` documents, images (JPG, PNG, GIF, WebP), and audio files (MP3, WAV, M4A) with optional local transcription via Whisper.
 - **Memos** — Write analytical notes at the project, document, or code level. Anchor a memo to a specific passage and jump back to it, and reference codes or other memos inline by typing `@` — click a reference to jump straight to it.
+- **Spreadsheets** — Import a `.csv`, `.tsv`, or `.xlsx` table with one document per row: choose the column with the text to code, and keep the other columns as document variables.
 - **Document variables & tags** — Add metadata (author, date, source) to documents, auto-extracted from filenames on import. Give a document a short tag (e.g. `INT`) shown next to it in the sidebar.
 - **Coder identity** — Set your name in Settings; each coding records who made it, so collaborators show up as distinct coders in REFI-QDA exports.
 - **Segments browser** — Browse all coded segments across documents. Click to jump to the passage in context, or delete directly from the list.
