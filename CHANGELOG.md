@@ -11,6 +11,10 @@
   a multi-file import are skipped with a note to import them on their own.
 
 ### Improvements
+- **Skipped files are listed in full** — when a multi-file import skips files, the Docs
+  panel now lists every skipped file with its reason until dismissed (before: the first three).
+  Files that arrive empty come with a hint that online-only cloud files (Dropbox, Google
+  Drive) must be made available offline first.
 - **Passage memos** — the cursor starts in the note instead of the optional title, and a memo
   you have typed is saved when you click elsewhere, select another passage, or switch
   documents. Only Cancel or the close button discard it.
@@ -22,6 +26,9 @@
   on the side of the passage where it fits, and its fields take focus without scrolling.
 - **The passage being coded stays marked** — the selection highlight disappeared once the
   popup's filter or memo field took focus; the passage now stays marked until the popup closes.
+- **Passage highlights stay on their document** — after opening a passage from an AI result,
+  a memo, or the Segments tab, its grey highlight was also drawn on the next document opened,
+  at the same positions, and its 4-second fade restarted whenever the screen updated.
 - **Switching documents closes the coding popup** — it stayed open on the new document, and
   choosing a code there would have coded the new document at the old document's positions.
 

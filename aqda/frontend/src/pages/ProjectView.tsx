@@ -9,7 +9,7 @@ import {
 } from 'lucide-react';
 import {
   projects, documents, codes, codings, memos, shared,
-  type Code, type Document as Doc, type Memo,
+  type Code, type Document as Doc, type Memo, type SkippedUpload,
 } from '../api';
 import { CodeTree } from '../components/CodeTree';
 import { DocumentViewer } from '../components/DocumentViewer';
@@ -59,10 +59,14 @@ export function ProjectView() {
   const [docVarFilters, setDocVarFilters] = useState<Record<string, string>>({});
   const [showDocVars, setShowDocVars] = useState(false);
   const [showDocControls, setShowDocControls] = useState(false);
-  const [highlightRange, setHighlightRange] = useState<{ start: number; end: number } | null>(null);
+  // A passage to flash after navigating to it (from memos, segments, or AI results). It belongs
+  // to one document, so it is never drawn on another one.
+  const [highlight, setHighlight] = useState<{ docId: number; start: number; end: number } | null>(null);
   const [uploadProgress, setUploadProgress] = useState<{ completed: number; total: number } | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadNotice, setUploadNotice] = useState<string | null>(null);
+  // Files the last import skipped, listed in full until dismissed.
+  const [skippedFiles, setSkippedFiles] = useState<SkippedUpload[]>([]);
   // A spreadsheet waiting for the researcher to choose its text column.
   const [tableFile, setTableFile] = useState<File | null>(null);
   const [selectedDocIds, setSelectedDocIds] = useState<Set<number>>(new Set());
@@ -264,6 +268,7 @@ export function ProjectView() {
     mutationFn: async (files: File[]) => {
       setUploadError(null);
       setUploadNotice(null);
+      setSkippedFiles([]);
       if (files.length === 1) {
         const d = await documents.upload(projectId, files[0]);
         return { documents: [d], skipped: [] };
@@ -277,13 +282,7 @@ export function ProjectView() {
       setUploadProgress(null);
       queryClient.invalidateQueries({ queryKey: ['documents', projectId] });
       if (res.documents.length === 1 && res.skipped.length === 0) setSelectedDocId(res.documents[0].id);
-      if (res.skipped.length > 0) {
-        const shown = res.skipped.slice(0, 3).map((s) => `${s.name}: ${s.reason}`).join('; ');
-        setUploadNotice(
-          `Skipped ${res.skipped.length} file${res.skipped.length !== 1 ? 's' : ''} — ` +
-          `${shown}${res.skipped.length > 3 ? '; …' : ''}`
-        );
-      }
+      setSkippedFiles(res.skipped);
     },
     onError: (err) => {
       setUploadProgress(null);
@@ -437,6 +436,17 @@ export function ProjectView() {
     },
     [projectId, createMemoMut]
   );
+
+  // Open a document, optionally flashing a passage in it.
+  const navigateToPassage = useCallback((docId: number, startPos?: number, endPos?: number) => {
+    setSelectedDocId(docId);
+    setHighlight(startPos !== undefined && endPos !== undefined ? { docId, start: startPos, end: endPos } : null);
+  }, []);
+  // Stable, so the viewer's 4-second auto-clear is not restarted by every re-render.
+  const clearHighlight = useCallback(() => setHighlight(null), []);
+  // Opening another document drops the highlight of the previous one (corrected during render,
+  // so the old highlight is never drawn on the new document).
+  if (highlight && highlight.docId !== selectedDocId) setHighlight(null);
 
   const handleFileUpload = useCallback(() => {
     const input = document.createElement('input');
@@ -876,6 +886,27 @@ export function ProjectView() {
               <button onClick={() => setUploadError(null)} className="text-red-400 hover:text-red-600 ml-2">dismiss</button>
             </div>
           )}
+          {skippedFiles.length > 0 && (
+            <div className="px-3 py-2 border-b border-amber-200 bg-amber-50 text-xs text-amber-800 shrink-0">
+              <div className="flex items-start justify-between gap-2">
+                <span className="font-medium">
+                  {skippedFiles.length} file{skippedFiles.length !== 1 ? 's were' : ' was'} not imported
+                </span>
+                <button onClick={() => setSkippedFiles([])} className="text-amber-400 hover:text-amber-600">dismiss</button>
+              </div>
+              <ul className="mt-1 max-h-40 overflow-auto space-y-0.5">
+                {skippedFiles.map((f, i) => (
+                  <li key={i} className="break-words"><span className="font-medium">{f.name}</span>: {f.reason}</li>
+                ))}
+              </ul>
+              {skippedFiles.some((f) => f.reason === 'empty or unreadable') && (
+                <p className="mt-1.5 text-amber-700">
+                  Files kept only online (for example in Dropbox or Google Drive) can arrive empty.
+                  Make the folder available offline and import those files again.
+                </p>
+              )}
+            </div>
+          )}
           {uploadNotice && (
             <div className="px-3 py-2 border-b border-gray-100 bg-amber-50 text-xs text-amber-700 flex items-center justify-between shrink-0">
               <span>{uploadNotice}</span>
@@ -1197,36 +1228,21 @@ export function ProjectView() {
                 onJumpToMention={handleJumpToMention}
                 selectedDocId={selectedDocId}
                 selectedDocName={selectedDoc?.name}
-                onNavigate={(docId, startPos, endPos) => {
-                  setSelectedDocId(docId);
-                  if (startPos !== undefined && endPos !== undefined) {
-                    setHighlightRange({ start: startPos, end: endPos });
-                  }
-                }}
+                onNavigate={navigateToPassage}
               />
             )}
             {activeTab === 'segments' && (
               <SegmentsBrowser
                 projectId={projectId}
                 codes={codeList}
-                onNavigate={(docId, startPos, endPos) => {
-                  setSelectedDocId(docId);
-                  if (startPos !== undefined && endPos !== undefined) {
-                    setHighlightRange({ start: startPos, end: endPos });
-                  }
-                }}
+                onNavigate={navigateToPassage}
               />
             )}
             {activeTab === 'ai' && (
               <AiPanel
                 projectId={projectId}
                 codes={codeList}
-                onNavigate={(docId, startPos, endPos) => {
-                  setSelectedDocId(docId);
-                  if (startPos !== undefined && endPos !== undefined) {
-                    setHighlightRange({ start: startPos, end: endPos });
-                  }
-                }}
+                onNavigate={navigateToPassage}
               />
             )}
           </div>
@@ -1251,8 +1267,8 @@ export function ProjectView() {
               onDeleteCoding={(id) => deleteCodingMut.mutate(id)}
               onSelectCode={(id) => { setSelectedCodeId(id); setActiveTab('codes'); }}
               onAddMemo={handleAddMemo}
-              highlightRange={highlightRange}
-              onHighlightClear={() => setHighlightRange(null)}
+              highlightRange={highlight}
+              onHighlightClear={clearHighlight}
             />
           ) : (
             <div className="h-full flex items-center justify-center text-gray-400">
