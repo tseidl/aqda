@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
 
 ### New features
 - **Import spreadsheets** — importing a single `.csv`, `.tsv`, or `.xlsx` file opens a table
