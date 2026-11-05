@@ -42,7 +42,7 @@ def make_xlsx() -> bytes:
 
 @pytest.mark.asyncio
 async def test_csv_preview_detects_delimiter_headers_and_text_column():
-    preview = await documents.preview_table(file=upload(SURVEY_CSV, "survey.csv"), sheet=None)
+    preview = await documents.preview_table(file=upload(SURVEY_CSV, "survey.csv"), sheet=None, skip_rows=None)
     assert preview["columns"] == ["id", "answer", "group", "group (2)"]
     assert preview["row_count"] == 3
     assert preview["rows"][0][1] == "I moved here for work.\nThen I stayed."
@@ -63,6 +63,7 @@ async def test_csv_import_creates_one_document_per_row_with_variables(tmp_path, 
         name_column="id",
         variable_columns='["group", "group (2)", "answer"]',
         sheet=None,
+        skip_rows=0,
     )
     assert result["imported"] == 2 and result["skipped_empty"] == 1
 
@@ -81,14 +82,14 @@ async def test_csv_import_creates_one_document_per_row_with_variables(tmp_path, 
     with pytest.raises(HTTPException) as missing:
         await documents.import_table(
             project_id=project["id"], file=upload(SURVEY_CSV, "survey.csv"),
-            text_column="nope", name_column=None, variable_columns="[]", sheet=None,
+            text_column="nope", name_column=None, variable_columns="[]", sheet=None, skip_rows=0,
         )
     assert missing.value.status_code == 400
 
     with pytest.raises(HTTPException) as empty:
         await documents.import_table(
             project_id=project["id"], file=upload(b"id,answer\n1,\n2,\n", "blank.csv"),
-            text_column="answer", name_column=None, variable_columns="[]", sheet=None,
+            text_column="answer", name_column=None, variable_columns="[]", sheet=None, skip_rows=0,
         )
     assert empty.value.status_code == 400
     # A refused import adds nothing.
@@ -98,7 +99,7 @@ async def test_csv_import_creates_one_document_per_row_with_variables(tmp_path, 
     with pytest.raises(HTTPException) as gone:
         await documents.import_table(
             project_id=project["id"], file=upload(SURVEY_CSV, "survey.csv"),
-            text_column="answer", name_column=None, variable_columns="[]", sheet=None,
+            text_column="answer", name_column=None, variable_columns="[]", sheet=None, skip_rows=0,
         )
     assert gone.value.status_code == 404
 
@@ -110,9 +111,9 @@ async def test_xlsx_import_reads_chosen_sheet_and_formats_cells(tmp_path, use_da
     project = await projects.create_project(projects.ProjectCreate(name="Excel"))
     data = make_xlsx()
 
-    preview = await documents.preview_table(file=upload(data, "study.xlsx"), sheet=None)
+    preview = await documents.preview_table(file=upload(data, "study.xlsx"), sheet=None, skip_rows=None)
     assert preview["sheets"] == ["Notes", "Responses"] and preview["sheet"] == "Notes"
-    preview = await documents.preview_table(file=upload(data, "study.xlsx"), sheet="Responses")
+    preview = await documents.preview_table(file=upload(data, "study.xlsx"), sheet="Responses", skip_rows=None)
     assert preview["rows"][0] == ["P1", "34", "2026-05-01", "A long answer about the town."]
     assert preview["rows"][1][2] == "2026-05-02 14:30:00"
     assert preview["suggested_text_column"] == "response"
@@ -120,12 +121,56 @@ async def test_xlsx_import_reads_chosen_sheet_and_formats_cells(tmp_path, use_da
     result = await documents.import_table(
         project_id=project["id"], file=upload(data, "study.xlsx"),
         text_column="response", name_column=None,
-        variable_columns='["respondent", "age"]', sheet="Responses",
+        variable_columns='["respondent", "age"]', sheet="Responses", skip_rows=0,
     )
     assert result["imported"] == 2
     docs = sorted(await documents.list_documents(project["id"]), key=lambda d: d["name"])
     assert [d["name"] for d in docs] == ["study – row 1", "study – row 2"]
     assert docs[0]["variables"] == {"respondent": "P1", "age": "34"}
+
+
+# A Qualtrics export: question wording and import IDs below the column names.
+QUALTRICS_CSV = (
+    'ResponseId,Q1,Q2\n'
+    '"Response ID","Why did you move here?","Age"\n'
+    '"{""ImportId"":""_recordId""}","{""ImportId"":""QID1_TEXT""}","{""ImportId"":""QID2""}"\n'
+    'R_1,For work.,34\n'
+    'R_2,For family.,51\n'
+).encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_survey_header_rows_are_skipped(tmp_path, use_data_dir):
+    use_data_dir(tmp_path / "skip")
+    await db_module.init_db()
+    project = await projects.create_project(projects.ProjectCreate(name="Qualtrics"))
+
+    preview = await documents.preview_table(
+        file=upload(QUALTRICS_CSV, "qualtrics.csv"), sheet=None, skip_rows=None
+    )
+    assert preview["skip_rows"] == 2 and preview["skip_rows_suggested"]
+    assert preview["row_count"] == 2 and preview["rows"][0][0] == "R_1"
+    # The researcher's own number overrides the suggestion.
+    preview = await documents.preview_table(
+        file=upload(QUALTRICS_CSV, "qualtrics.csv"), sheet=None, skip_rows=0
+    )
+    assert preview["row_count"] == 4 and not preview["skip_rows_suggested"]
+    # Ordinary tables skip nothing unless asked.
+    plain = await documents.preview_table(file=upload(SURVEY_CSV, "survey.csv"), sheet=None, skip_rows=None)
+    assert plain["skip_rows"] == 0
+
+    result = await documents.import_table(
+        project_id=project["id"], file=upload(QUALTRICS_CSV, "qualtrics.csv"),
+        text_column="Q1", name_column="ResponseId", variable_columns='["Q2"]',
+        sheet=None, skip_rows=2,
+    )
+    assert result["imported"] == 2
+    docs = {d["name"]: d for d in await documents.list_documents(project["id"])}
+    assert sorted(docs) == ["R_1", "R_2"] and docs["R_1"]["variables"] == {"Q2": "34"}
+
+    with pytest.raises(HTTPException) as too_many:
+        await documents.preview_table(file=upload(QUALTRICS_CSV, "qualtrics.csv"), sheet=None, skip_rows=9)
+    assert too_many.value.status_code == 400 and "skipping 9" in too_many.value.detail
 
 
 @pytest.mark.asyncio

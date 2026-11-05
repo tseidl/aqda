@@ -7,7 +7,9 @@
   import: each row becomes a document, you choose the column with the text to code and
   (optionally) the column that names the documents, and the other columns become document
   variables. Semicolon-separated CSV files (common in German Excel) are recognized; for Excel
-  files you can choose the sheet. Rows without text are skipped and counted. Spreadsheets in
+  files you can choose the sheet. Rows directly below the column names can be skipped; for a
+  Qualtrics export, AQDA recognizes its two extra header rows (question wording and import
+  IDs) and skips them by default. Rows without text are skipped and counted. Spreadsheets in
   a multi-file import are skipped with a note to import them on their own.
 
 ### Improvements

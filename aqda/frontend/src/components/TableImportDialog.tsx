@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useMutation, useQuery } from '@tanstack/react-query';
+import { keepPreviousData, useMutation, useQuery } from '@tanstack/react-query';
 import { Loader2, Table, X } from 'lucide-react';
 import { documents, type TableImportResult, type TablePreview } from '../api';
 
@@ -13,13 +13,18 @@ interface Props {
 /** Import a spreadsheet: one document per row, with a chosen text column and variables. */
 export function TableImportDialog({ projectId, file, onClose, onImported }: Props) {
   const [sheet, setSheet] = useState<string | null>(null);
+  // Rows below the header to leave out; null lets AQDA suggest (e.g. for a Qualtrics export).
+  const [skipRows, setSkipRows] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const preview = useQuery({
-    queryKey: ['table-preview', file.name, file.size, file.lastModified, sheet],
-    queryFn: () => documents.previewTable(file, sheet),
+    queryKey: ['table-preview', file.name, file.size, file.lastModified, sheet, skipRows],
+    queryFn: () => documents.previewTable(file, sheet, skipRows),
     retry: false,
     staleTime: Infinity,
+    // Keep showing the last preview (and the choices made) while a new one loads.
+    placeholderData: keepPreviousData,
   });
+  const chooseSheet = (next: string) => { setSheet(next); setSkipRows(null); };
 
   return (
     <div
@@ -55,20 +60,28 @@ export function TableImportDialog({ projectId, file, onClose, onImported }: Prop
           <div className="p-5">
             <p className="rounded-md bg-red-50 p-3 text-sm text-red-700">{preview.error.message}</p>
             {/* A sheet without usable rows should not trap the researcher on that sheet. */}
+            {skipRows !== null && skipRows > 0 && (
+              <button onClick={() => setSkipRows(0)} className="mt-3 mr-4 text-sm text-indigo-600 hover:underline">
+                Skip no rows
+              </button>
+            )}
             {sheet !== null && (
-              <button onClick={() => setSheet(null)} className="mt-3 text-sm text-indigo-600 hover:underline">
+              <button onClick={() => { setSheet(null); setSkipRows(null); }} className="mt-3 text-sm text-indigo-600 hover:underline">
                 Back to the first sheet
               </button>
             )}
           </div>
         )}
-        {preview.data && (
+        {preview.data && !preview.isError && (
           <TableChoices
             key={preview.data.sheet ?? ''}
             projectId={projectId}
             file={file}
             preview={preview.data}
-            onSheetChange={setSheet}
+            loading={preview.isPlaceholderData}
+            skipRows={skipRows ?? preview.data.skip_rows}
+            onSheetChange={chooseSheet}
+            onSkipRowsChange={setSkipRows}
             onBusyChange={setBusy}
             onClose={onClose}
             onImported={onImported}
@@ -80,11 +93,18 @@ export function TableImportDialog({ projectId, file, onClose, onImported }: Prop
 }
 
 /** Column choices for one sheet; remounted (and reset) when the sheet changes. */
-function TableChoices({ projectId, file, preview, onSheetChange, onBusyChange, onClose, onImported }: {
+function TableChoices({
+  projectId, file, preview, loading, skipRows, onSheetChange, onSkipRowsChange, onBusyChange, onClose, onImported,
+}: {
   projectId: number;
   file: File;
   preview: TablePreview;
+  /** A new preview is loading; the one shown is out of date. */
+  loading: boolean;
+  /** The rows-to-skip number as typed (the preview may still show the previous one). */
+  skipRows: number;
   onSheetChange: (sheet: string) => void;
+  onSkipRowsChange: (rows: number) => void;
   onBusyChange: (busy: boolean) => void;
   onClose: () => void;
   onImported: (result: TableImportResult) => void;
@@ -100,7 +120,7 @@ function TableChoices({ projectId, file, preview, onSheetChange, onBusyChange, o
     mutationFn: () => {
       onBusyChange(true);
       return documents.importTable(projectId, file, {
-        sheet: preview.sheet, textColumn, nameColumn: nameColumn || null, variableColumns,
+        sheet: preview.sheet, skipRows: preview.skip_rows, textColumn, nameColumn: nameColumn || null, variableColumns,
       });
     },
     onSuccess: (result) => { onBusyChange(false); onImported(result); },
@@ -118,13 +138,31 @@ function TableChoices({ projectId, file, preview, onSheetChange, onBusyChange, o
   return (
     <>
       <div className="max-h-[60vh] space-y-4 overflow-auto p-5">
-        {preview.sheets.length > 1 && (
+        <div className="flex items-end gap-3">
+          {preview.sheets.length > 1 && (
+            <label className="block flex-1 text-xs font-medium text-gray-600">
+              Sheet
+              <select value={preview.sheet ?? ''} onChange={(e) => onSheetChange(e.target.value)} className={selectClass}>
+                {preview.sheets.map((s) => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </label>
+          )}
           <label className="block text-xs font-medium text-gray-600">
-            Sheet
-            <select value={preview.sheet ?? ''} onChange={(e) => onSheetChange(e.target.value)} className={selectClass}>
-              {preview.sheets.map((s) => <option key={s} value={s}>{s}</option>)}
-            </select>
+            Rows to skip below the header
+            <input
+              type="number"
+              min={0}
+              value={skipRows}
+              onChange={(e) => onSkipRowsChange(Math.max(0, Math.floor(Number(e.target.value) || 0)))}
+              className="mt-1 block w-24 rounded-md border border-gray-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500"
+            />
           </label>
+        </div>
+        {preview.skip_rows_suggested && (
+          <p className="-mt-2 text-xs text-gray-500">
+            This looks like a Qualtrics export: the {preview.skip_rows} rows with question wording
+            and import IDs below the column names are skipped.
+          </p>
         )}
         <div className="grid grid-cols-2 gap-3">
           <label className="block text-xs font-medium text-gray-600">
@@ -212,7 +250,7 @@ function TableChoices({ projectId, file, preview, onSheetChange, onBusyChange, o
           </button>
           <button
             onClick={() => importMut.mutate()}
-            disabled={importMut.isPending}
+            disabled={importMut.isPending || loading}
             className="flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
           >
             {importMut.isPending && <Loader2 size={14} className="animate-spin" />}

@@ -201,6 +201,10 @@ export interface TablePreview {
   sheets: string[];
   sheet: string | null;
   suggested_text_column: string;
+  /** Rows below the header left out of the preview and the import. */
+  skip_rows: number;
+  /** Whether AQDA chose skip_rows itself (a recognized survey export). */
+  skip_rows_suggested: boolean;
 }
 
 export interface TableImportResult {
@@ -378,10 +382,11 @@ export const documents = {
     }
     return { documents, skipped };
   },
-  previewTable: async (file: File, sheet: string | null): Promise<TablePreview> => {
+  previewTable: async (file: File, sheet: string | null, skipRows: number | null): Promise<TablePreview> => {
     const form = new FormData();
     form.append('file', file);
     if (sheet !== null) form.append('sheet', sheet);
+    if (skipRows !== null) form.append('skip_rows', String(skipRows));
     const res = await fetch(`${BASE}/documents/table-preview`, { method: 'POST', body: form });
     if (!res.ok) throw new Error(await errorDetail(res));
     return res.json();
@@ -389,7 +394,9 @@ export const documents = {
   importTable: async (
     projectId: number,
     file: File,
-    choice: { sheet: string | null; textColumn: string; nameColumn: string | null; variableColumns: string[] },
+    choice: {
+      sheet: string | null; skipRows: number; textColumn: string; nameColumn: string | null; variableColumns: string[];
+    },
   ): Promise<TableImportResult> => {
     const form = new FormData();
     form.append('project_id', String(projectId));
@@ -398,6 +405,7 @@ export const documents = {
     if (choice.nameColumn) form.append('name_column', choice.nameColumn);
     form.append('variable_columns', JSON.stringify(choice.variableColumns));
     if (choice.sheet !== null) form.append('sheet', choice.sheet);
+    form.append('skip_rows', String(choice.skipRows));
     const res = await fetch(`${BASE}/documents/table-import`, { method: 'POST', body: form });
     if (!res.ok) throw new Error(await errorDetail(res));
     return res.json();

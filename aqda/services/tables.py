@@ -50,7 +50,7 @@ def _clean_headers(raw: list[str]) -> list[str]:
 
 
 def _shape(rows: list[list[str]]) -> tuple[list[str], list[list[str]]]:
-    """Split off the header row and give every data row exactly one cell per column."""
+    """Split off the header row and give every row below it exactly one cell per column."""
     # Trailing empty columns (common in Excel exports) are dropped.
     width = max((len(r) for r in rows), default=0)
     while width and all(len(r) < width or not r[width - 1] for r in rows):
@@ -58,11 +58,18 @@ def _shape(rows: list[list[str]]) -> tuple[list[str], list[list[str]]]:
     if not rows or width == 0:
         raise ValueError("The table is empty.")
     headers = _clean_headers((rows[0] + [""] * width)[:width])
-    data = [(r + [""] * width)[:width] for r in rows[1:]]
-    data = [r for r in data if any(cell for cell in r)]
-    if not data:
-        raise ValueError("The table has a header row but no data rows.")
-    return headers, data
+    return headers, [(r + [""] * width)[:width] for r in rows[1:]]
+
+
+def suggest_skip_rows(body: list[list[str]]) -> int:
+    """Rows below the header that hold no responses: 2 for a Qualtrics export, else 0.
+
+    Qualtrics puts the question wording in the second row and import IDs such as
+    {"ImportId":"QID1"} in the third.
+    """
+    if len(body) >= 2 and any(cell.startswith('{"ImportId"') for cell in body[1]):
+        return 2
+    return 0
 
 
 def _read_delimited(text: str, ext: str) -> list[list[str]]:
@@ -113,18 +120,29 @@ def _read_xlsx(content: bytes, sheet: str | None) -> list[list[str]]:
 
 
 def read_table(
-    filename: str, content: bytes, decode_text, sheet: str | None = None
-) -> tuple[list[str], list[list[str]]]:
-    """Return (column names, data rows) of a .csv, .tsv, or .xlsx upload.
+    filename: str, content: bytes, decode_text, sheet: str | None = None,
+    skip_rows: int | None = 0,
+) -> tuple[list[str], list[list[str]], int]:
+    """Return (column names, data rows, rows skipped) of a .csv, .tsv, or .xlsx upload.
 
-    ``decode_text`` turns CSV bytes into text (the document import's encoding detection).
-    Raises ValueError with a researcher-facing message when the table cannot be used.
+    ``skip_rows`` rows directly below the header are left out (None: as suggested by
+    ``suggest_skip_rows``); blank rows are dropped. ``decode_text`` turns CSV bytes into text
+    (the document import's encoding detection). Raises ValueError with a researcher-facing
+    message when the table cannot be used.
     """
     ext = table_extension(filename)
     if ext is None:
         raise ValueError("Choose a .csv, .tsv, or .xlsx file.")
     rows = _read_xlsx(content, sheet) if ext == ".xlsx" else _read_delimited(decode_text(content), ext)
-    return _shape(rows)
+    headers, body = _shape(rows)
+    if skip_rows is None:
+        skip_rows = suggest_skip_rows(body)
+    data = [r for r in body[max(skip_rows, 0):] if any(cell for cell in r)]
+    if not data:
+        if skip_rows:
+            raise ValueError(f"No rows are left after skipping {skip_rows} below the header.")
+        raise ValueError("The table has a header row but no data rows.")
+    return headers, data, skip_rows
 
 
 def suggest_text_column(headers: list[str], rows: list[list[str]]) -> str:

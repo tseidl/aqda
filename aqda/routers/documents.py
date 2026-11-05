@@ -345,11 +345,16 @@ async def upload_documents_bulk(
         await db.close()
 
 
-def _table_preview_sync(filename: str, content: bytes, sheet: str | None) -> dict:
+def _table_preview_sync(
+    filename: str, content: bytes, sheet: str | None, skip_rows: int | None
+) -> dict:
     """Read a spreadsheet and describe it for the import dialog."""
     sheets = xlsx_sheet_names(content) if table_extension(filename) == ".xlsx" else []
-    headers, rows = read_table(filename, content, _decode_text_bytes, sheet)
+    headers, rows, skipped = read_table(filename, content, _decode_text_bytes, sheet, skip_rows)
     return {
+        "skip_rows": skipped,
+        # Whether AQDA chose the skipped rows itself (a recognized survey export).
+        "skip_rows_suggested": skip_rows is None and skipped > 0,
         "columns": headers,
         "rows": rows[:TABLE_PREVIEW_ROWS],
         "row_count": len(rows),
@@ -368,11 +373,20 @@ async def _read_table_upload(file: UploadFile) -> tuple[str, bytes]:
 
 
 @router.post("/table-preview")
-async def preview_table(file: UploadFile = File(...), sheet: str | None = Form(None)):
-    """Return a spreadsheet's columns and first rows, so the researcher can pick the text column."""
+async def preview_table(
+    file: UploadFile = File(...),
+    sheet: str | None = Form(None),
+    skip_rows: int | None = Form(None),
+):
+    """Return a spreadsheet's columns and first rows, so the researcher can pick the text column.
+
+    Without ``skip_rows``, rows below the header are skipped only for a recognized survey export.
+    """
     filename, content = await _read_table_upload(file)
+    if skip_rows is not None and skip_rows < 0:
+        raise HTTPException(400, "The number of rows to skip cannot be negative.")
     try:
-        return await asyncio.to_thread(_table_preview_sync, filename, content, sheet)
+        return await asyncio.to_thread(_table_preview_sync, filename, content, sheet, skip_rows)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     except Exception:
@@ -387,16 +401,20 @@ async def import_table(
     name_column: str | None = Form(None),
     variable_columns: str = Form("[]"),
     sheet: str | None = Form(None),
+    skip_rows: int = Form(0),
 ):
     """Create one document per spreadsheet row.
 
     ``text_column`` becomes the document text, ``name_column`` (optional) its name, and each
-    of ``variable_columns`` (a JSON list) a document variable. Rows without text are skipped.
+    of ``variable_columns`` (a JSON list) a document variable. The ``skip_rows`` rows below the
+    header are left out, and rows without text are skipped.
     """
     filename, content = await _read_table_upload(file)
+    if skip_rows < 0:
+        raise HTTPException(400, "The number of rows to skip cannot be negative.")
     try:
-        headers, rows = await asyncio.to_thread(
-            read_table, filename, content, _decode_text_bytes, sheet
+        headers, rows, _ = await asyncio.to_thread(
+            read_table, filename, content, _decode_text_bytes, sheet, skip_rows
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc))
