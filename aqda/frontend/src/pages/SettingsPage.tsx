@@ -437,7 +437,7 @@ export function SettingsPage() {
                 <span className="text-sm font-medium text-gray-700">Enable thinking mode</span>
               </label>
               <p className="text-xs text-gray-400 mt-1 ml-7">
-                Some models (like qwen3) can "think" before answering, which may improve quality but takes much longer. Off by default.
+                Some models can reason before they answer. This may improve an answer, but it usually takes several times as long. Off unless you turn it on here.
               </p>
             </div>
           </div>

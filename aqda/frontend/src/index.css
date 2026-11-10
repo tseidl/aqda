@@ -49,3 +49,12 @@ mark[data-color]:hover {
 ::-webkit-scrollbar-thumb:hover {
   background: #9ca3af;
 }
+
+/* A bar that keeps moving while a model answer is awaited (its duration is unknown). */
+.aqda-working-bar {
+  animation: aqda-working 1.6s ease-in-out infinite;
+}
+@keyframes aqda-working {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
+}

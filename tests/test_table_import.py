@@ -191,3 +191,20 @@ async def test_spreadsheets_in_a_file_import_point_to_the_table_import(tmp_path,
         "survey.csv": documents.TABLE_MESSAGE,
         "old.xls": documents.OLD_EXCEL_MESSAGE,
     }
+
+
+# A whole interview or report in one cell exceeds the CSV reader's default cell limit.
+@pytest.mark.asyncio
+async def test_table_import_accepts_very_long_cells(tmp_path, use_data_dir):
+    use_data_dir(tmp_path / "long-cell")
+    await db_module.init_db()
+    project = await projects.create_project(projects.ProjectCreate(name="Reports"))
+    report = "A long report. " * 12_000  # 180,000 characters
+    data = f'id,text\nr1,"{report}"\nr2,Short\n'.encode()
+    result = await documents.import_table(
+        project_id=project["id"], file=upload(data, "reports.csv"), text_column="text",
+        name_column="id", variable_columns="[]", sheet=None, skip_rows=0,
+    )
+    assert result["imported"] == 2
+    first = await documents.get_document(result["first_document_id"])
+    assert first["content"] == report.strip()

@@ -40,6 +40,10 @@ export function ProjectView() {
   const navigate = useNavigate();
 
   const [activeTab, setActiveTab] = useState<Tab>('documents');
+  // The AI panel is created when first opened and then kept (hidden) while other tabs are
+  // open, so its results and a running task are still there on return.
+  const [aiOpened, setAiOpened] = useState(false);
+  if (activeTab === 'ai' && !aiOpened) setAiOpened(true);
   const [selectedDocId, setSelectedDocId] = useState<number | null>(null);
   const [selectedCodeId, setSelectedCodeId] = useState<number | null>(null);
   const [selectedMemoId, setSelectedMemoId] = useState<number | null>(null);
@@ -158,14 +162,24 @@ export function ProjectView() {
   });
 
   const unlinkMut = useMutation({
-    mutationFn: () => shared.unlinkProject(projectId),
+    mutationFn: (force: boolean) => shared.unlinkProject(projectId, force),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['project', projectId] });
       queryClient.invalidateQueries({ queryKey: ['projects'] });
       queryClient.invalidateQueries({ queryKey: ['shared-status'] });
       alert('Collaboration stopped. The project and all of your work remain safely on this computer.');
     },
-    onError: (error: Error) => alert(error.message),
+    onError: (error: Error, force) => {
+      const reason = error.message.replace(/^\d{3}:\s*/, '');
+      // The folder cannot be reached: stopping is still possible, but leaves the snapshot there.
+      if (!force && /^409:/.test(error.message)) {
+        if (confirm(`${reason}\n\nStop sharing anyway? If the folder is gone for good, nothing is lost. If it comes back, the last version this computer saved there stays visible to your collaborators.`)) {
+          unlinkMut.mutate(true);
+        }
+      } else {
+        alert(reason);
+      }
+    },
   });
 
   const resolveConflictMut = useMutation({
@@ -580,7 +594,7 @@ export function ProjectView() {
               <button
                 onClick={() => {
                   if (confirm('Stop collaboration for this project on this computer? Your local project and all its work will remain safe.')) {
-                    unlinkMut.mutate();
+                    unlinkMut.mutate(false);
                   }
                 }}
                 disabled={unlinkMut.isPending}
@@ -1238,12 +1252,15 @@ export function ProjectView() {
                 onNavigate={navigateToPassage}
               />
             )}
-            {activeTab === 'ai' && (
-              <AiPanel
-                projectId={projectId}
-                codes={codeList}
-                onNavigate={navigateToPassage}
-              />
+            {aiOpened && (
+              <div className={activeTab === 'ai' ? 'h-full' : 'hidden'}>
+                <AiPanel
+                  projectId={projectId}
+                  codes={codeList}
+                  active={activeTab === 'ai'}
+                  onNavigate={navigateToPassage}
+                />
+              </div>
             )}
           </div>
 

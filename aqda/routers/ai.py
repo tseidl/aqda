@@ -9,6 +9,7 @@ import re
 import sqlite3
 import statistics
 import struct
+import time
 
 from collections.abc import Callable
 
@@ -30,6 +31,11 @@ def _get_http_client() -> httpx.AsyncClient:
         _http_client = httpx.AsyncClient(timeout=120.0)
     return _http_client
 
+
+# Ollama unloads a model five minutes after its last use unless told otherwise, and loading
+# it again costs seconds to minutes. Each request asks to keep the model for this long, so
+# reading and coding between two AI tasks does not mean waiting for the model again.
+OLLAMA_KEEP_ALIVE = "30m"
 
 # Track embedding progress for the UI
 _embedding_progress: dict = {"active": False, "current": 0, "total": 0, "doc_name": ""}
@@ -95,7 +101,7 @@ async def _ollama_embed(
     client = _get_http_client()
     resp = await client.post(
         f"{ollama_url}/api/embed",
-        json={"model": model, "input": text},
+        json={"model": model, "input": text, "keep_alive": OLLAMA_KEEP_ALIVE},
     )
     resp.raise_for_status()
     data = resp.json()
@@ -116,6 +122,11 @@ LLM_RESPONSE_TOKENS = 2048
 LLM_THINKING_RESPONSE_TOKENS = 4096
 # Appended when the model stops at the length limit, so a cut-off answer is never silent.
 LENGTH_LIMIT_NOTE = "\n\n[The answer reached AQDA's length limit and may be incomplete.]"
+REASONING_ONLY_MESSAGE = (
+    "The model used the whole answer length for reasoning and did not get to its answer. "
+    "Run it again, or turn off thinking mode in Settings."
+)
+EMPTY_ANSWER_MESSAGE = "The model reached AQDA's length limit without writing an answer."
 
 
 def _response_tokens(think: bool) -> int:
@@ -123,25 +134,149 @@ def _response_tokens(think: bool) -> int:
     return LLM_THINKING_RESPONSE_TOKENS if think else LLM_RESPONSE_TOKENS
 
 
+# Longest silence AQDA accepts from Ollama while it generates. Before the first word the
+# model may still be loading and reading the passages, which takes minutes on slow machines.
+LLM_IDLE_TIMEOUT_SECONDS = 600
+
+# Progress of the running generation, polled by the frontend. The answer is read as a stream,
+# so AQDA can show that something is happening even though it cannot say how long it will take.
+_generation_progress: dict = {"active": False, "phase": "", "words": 0, "started": 0.0}
+# Where the time of the last finished generation went, as reported by Ollama (seconds and
+# token counts): loading the model, reading the prompt, and writing (reasoning included).
+_last_generation: dict = {}
+
+
+def _generation_timing(final: dict) -> dict:
+    """Summarize the timing fields of Ollama's final streamed object (durations are in ns)."""
+    def seconds(key: str) -> float:
+        return round((final.get(key) or 0) / 1e9, 2)
+
+    return {
+        "load_seconds": seconds("load_duration"),
+        "prompt_tokens": final.get("prompt_eval_count") or 0,
+        "prompt_seconds": seconds("prompt_eval_duration"),
+        "answer_tokens": final.get("eval_count") or 0,
+        "answer_seconds": seconds("eval_duration"),
+        "total_seconds": seconds("total_duration"),
+    }
+
+
+def _count_words(piece: str, words: int, in_word: bool) -> tuple[int, bool]:
+    """Continue a running word count over the next piece of streamed text."""
+    for char in piece:
+        if char.isspace():
+            in_word = False
+        elif not in_word:
+            in_word = True
+            words += 1
+    return words, in_word
+
+
 async def _ollama_generate(
-    prompt: str, model: str, ollama_url: str, system: str = "", think: bool = False
+    prompt: str, model: str, ollama_url: str, system: str = "", think: bool = False,
+    task: int | None = None,
 ) -> str:
-    """Generate text from Ollama within a known context window and answer length."""
+    """Generate text from Ollama within a known context window and answer length.
+
+    The answer is streamed: the time limit applies to each silence rather than to the whole
+    answer, progress is recorded in ``_generation_progress``, and a cancelled ``task`` closes
+    the connection, which stops the model.
+    """
     client = _get_http_client()
     payload: dict = {
         "model": model,
         "prompt": prompt,
         "system": system,
-        "stream": False,
+        "stream": True,
         "think": think,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {"num_ctx": LLM_CONTEXT_TOKENS, "num_predict": _response_tokens(think)},
     }
-    resp = await client.post(f"{ollama_url}/api/generate", json=payload)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("done_reason") == "length":
-        return data["response"] + LENGTH_LIMIT_NOTE
-    return data["response"]
+    timeout = httpx.Timeout(LLM_IDLE_TIMEOUT_SECONDS, connect=10.0)
+    parts: list[str] = []
+    done_reason = None
+    words, in_word = 0, False
+    reasoned = False  # Ollama reports reasoning and writing as one duration
+    _generation_progress.update(active=True, phase="waiting", words=0, started=time.monotonic())
+    try:
+        async with client.stream(
+            "POST", f"{ollama_url}/api/generate", json=payload, timeout=timeout
+        ) as resp:
+            if resp.status_code >= 400:
+                # Ollama explains failures (unknown model, no thinking support) in the body.
+                body = (await resp.aread()).decode("utf-8", errors="replace")
+                try:
+                    reason = json.loads(body).get("error") or body
+                except (ValueError, AttributeError):
+                    reason = body
+                raise RuntimeError(str(reason).strip() or f"HTTP status {resp.status_code}")
+            async for line in resp.aiter_lines():
+                if task is not None:
+                    _check_cancelled(task)
+                if not line.strip():
+                    continue
+                data = json.loads(line)
+                if data.get("error"):
+                    raise RuntimeError(str(data["error"]))
+                if data.get("thinking"):
+                    reasoned = True
+                    if not parts:
+                        _generation_progress["phase"] = "thinking"
+                piece = data.get("response") or ""
+                if piece:
+                    parts.append(piece)
+                    words, in_word = _count_words(piece, words, in_word)
+                    _generation_progress.update(phase="writing", words=words)
+                done_reason = data.get("done_reason") or done_reason
+                if data.get("done"):
+                    _last_generation.clear()
+                    _last_generation.update(_generation_timing(data), reasoned=reasoned)
+                    break
+    finally:
+        _generation_progress["active"] = False
+    response = "".join(parts)
+    if done_reason == "length":
+        if not response.strip():
+            # Reasoning counts towards the answer length and can use all of it.
+            raise HTTPException(502, REASONING_ONLY_MESSAGE if think else EMPTY_ANSWER_MESSAGE)
+        return response + LENGTH_LIMIT_NOTE
+    return response
+
+
+async def _generate_or_fail(
+    prompt: str, model: str, ollama_url: str, system: str, think: bool, task: int,
+) -> str:
+    """Run a generation and turn its failures into messages a researcher can act on."""
+    _last_generation.clear()
+    generation = asyncio.ensure_future(
+        _ollama_generate(prompt, model, ollama_url, system, think=think, task=task)
+    )
+    try:
+        # Watch for a cancel while waiting: before its first word the model sends nothing,
+        # so the check inside the stream would only run once the answer starts.
+        while not generation.done():
+            await asyncio.wait({generation}, timeout=0.25)
+            if not generation.done() and task <= _cancelled_up_to:
+                generation.cancel()  # closes the connection, which stops the model
+                await asyncio.wait({generation})
+                raise HTTPException(409, "Cancelled")
+        return generation.result()
+    except HTTPException:
+        raise  # cancelled, or the model wrote no answer
+    except httpx.ConnectError:
+        raise HTTPException(503, "Cannot connect to Ollama. Make sure it is running.")
+    except httpx.TimeoutException:
+        minutes = LLM_IDLE_TIMEOUT_SECONDS // 60
+        raise HTTPException(
+            504,
+            f"The model did not respond for {minutes} minutes, so AQDA stopped waiting. "
+            "Try a smaller or faster model, or check whether Ollama is busy with something else.",
+        )
+    except Exception as exc:
+        raise HTTPException(503, f"Ollama generation failed: {exc or type(exc).__name__}")
+    finally:
+        if not generation.done():
+            generation.cancel()
 
 
 def _estimate_tokens(text: str) -> int:
@@ -373,97 +508,102 @@ def _finalize_suggestions(
 EMBED_BATCH_SIZE = 10  # embed this many chunks per Ollama call
 
 
-async def _ensure_doc_embedded(
-    doc_id: int, doc_content: str, project_id: int,
-    embed_model: str, ollama_url: str,
-    chunk_size: int, chunk_overlap: int, chunk_mode: str = "fixed",
-    task: int = 0,
-):
-    """Embed a document's chunks into SQLite cache if not already stored."""
-    chunks = _chunk_text(doc_content, chunk_size, chunk_overlap, chunk_mode)
-    if not chunks:
-        conn = _sync_db()
-        try:
-            conn.execute(
-                "DELETE FROM embedding_cache WHERE document_id=? AND model=?",
-                (doc_id, embed_model),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        return
-
-    chunk_ids = [
-        _chunk_id(doc_id, c["start"], c["end"], embed_model, c["text"])
-        for c in chunks
-    ]
-
-    # Step 1: Compare with cached chunks in Python; paragraph mode can produce far
-    # more chunks than SQLite accepts as bound parameters in a single statement.
-    wanted_ids = set(chunk_ids)
-    conn = _sync_db()
-    try:
-        cursor = conn.execute(
-            "SELECT id FROM embedding_cache WHERE document_id=? AND model=?",
-            (doc_id, embed_model),
-        )
-        cached_ids = {row["id"] for row in cursor.fetchall()}
-        stale_ids = sorted(cached_ids - wanted_ids)
-        for batch_start in range(0, len(stale_ids), 500):
-            batch = stale_ids[batch_start:batch_start + 500]
-            conn.execute(
-                f"DELETE FROM embedding_cache WHERE id IN ({','.join('?' * len(batch))})",
-                batch,
-            )
-        conn.commit()
-        existing_ids = cached_ids & wanted_ids
-    finally:
-        conn.close()
-
-    new_chunks = [
-        (cid, chunk) for cid, chunk in zip(chunk_ids, chunks)
-        if cid not in existing_ids
-    ]
-    if not new_chunks:
-        return
-
-    # Step 2: Embed via Ollama — no DB connection held open.
-    embedded: list[tuple[str, dict, bytes]] = []
-    for batch_start in range(0, len(new_chunks), EMBED_BATCH_SIZE):
-        _check_cancelled(task)
-        batch = new_chunks[batch_start:batch_start + EMBED_BATCH_SIZE]
-        texts = [chunk["text"] for _, chunk in batch]
-        try:
-            embeddings = await _ollama_embed(texts, embed_model, ollama_url)
-            for (cid, chunk), emb in zip(batch, embeddings):
-                # Pack immediately to free the float list
-                embedded.append((cid, chunk, _pack_embedding(emb)))
-        except httpx.ConnectError:
-            raise HTTPException(503, "Cannot connect to Ollama. Make sure it is running.")
-        except Exception as exc:
-            # Never report a search over only the batches that happened to succeed.
-            raise HTTPException(502, f"Ollama embedding failed: {exc}")
-
-    # A cancel that arrived during the last Ollama call must not be followed by writes.
+async def _embed_and_store(
+    conn: sqlite3.Connection, batch: list[tuple[str, int, dict]], project_id: int,
+    embed_model: str, ollama_url: str, task: int,
+) -> None:
+    """Embed one batch of (chunk id, document id, chunk) and store it in the cache."""
     _check_cancelled(task)
-    if not embedded:
-        return
+    try:
+        embeddings = await _ollama_embed(
+            [chunk["text"] for _, _, chunk in batch], embed_model, ollama_url
+        )
+    except httpx.ConnectError:
+        raise HTTPException(503, "Cannot connect to Ollama. Make sure it is running.")
+    except Exception as exc:
+        # Never report a search over only the batches that happened to succeed.
+        raise HTTPException(502, f"Ollama embedding failed: {exc}")
+    # A cancel that arrived during the Ollama call must not be followed by writes.
+    _check_cancelled(task)
+    try:
+        conn.executemany(
+            "INSERT OR IGNORE INTO embedding_cache "
+            "(id, document_id, project_id, model, start_pos, end_pos, chunk_text, embedding) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (cid, doc_id, project_id, embed_model, chunk["start"], chunk["end"],
+                 chunk["text"], _pack_embedding(embedding))
+                for (cid, doc_id, chunk), embedding in zip(batch, embeddings)
+            ],
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # A document deleted while it was being embedded; the search skips it anyway.
+        conn.rollback()
 
-    # Step 3: Write to DB (sync sqlite3 — avoids aiosqlite memory leak)
+
+async def _embed_documents(
+    docs: list, project_id: int, embed_model: str, ollama_url: str,
+    chunk_size: int, chunk_overlap: int, chunk_mode: str, task: int,
+) -> None:
+    """Embed every chunk of ``docs`` that is not in the SQLite cache yet.
+
+    Chunks go to Ollama in batches that may span documents, so a project of many short
+    documents (spreadsheet rows) needs one request per batch rather than one per document.
+    Each batch is stored as soon as it is embedded: a cancelled or failed run keeps what it
+    finished. Uses sync sqlite3 (avoids an aiosqlite memory leak) and never holds a
+    transaction open across an Ollama call.
+    """
     conn = _sync_db()
     try:
-        for cid, chunk, emb_blob in embedded:
-            conn.execute(
-                "INSERT OR IGNORE INTO embedding_cache "
-                "(id, document_id, project_id, model, start_pos, end_pos, "
-                "chunk_text, embedding) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (cid, doc_id, project_id, embed_model, chunk["start"],
-                 chunk["end"], chunk["text"], emb_blob),
+        cached: dict[int, set[str]] = {}
+        for row in conn.execute(
+            "SELECT id, document_id FROM embedding_cache WHERE project_id=? AND model=?",
+            (project_id, embed_model),
+        ):
+            cached.setdefault(row["document_id"], set()).add(row["id"])
+
+        pending: list[tuple[str, int, dict]] = []
+        for i, doc in enumerate(docs):
+            _check_cancelled(task)
+            _embedding_progress["current"] = i + 1
+            _embedding_progress["doc_name"] = doc["name"]
+            # Content is loaded one document at a time to save memory.
+            row = conn.execute(
+                "SELECT content, transcript, source_type FROM document WHERE id=?", (doc["id"],)
+            ).fetchone()
+            chunks = _chunk_text(
+                _embed_text_for(row) if row else "", chunk_size, chunk_overlap, chunk_mode
             )
-        conn.commit()
+            wanted = {
+                _chunk_id(doc["id"], c["start"], c["end"], embed_model, c["text"]): c
+                for c in chunks
+            }
+            have = cached.get(doc["id"], set())
+            # Chunks cached for an earlier text or chunk setting. Deleted in batches:
+            # paragraph mode can produce more chunks than SQLite accepts as parameters.
+            stale = sorted(have - wanted.keys())
+            for batch_start in range(0, len(stale), 500):
+                batch = stale[batch_start:batch_start + 500]
+                conn.execute(
+                    f"DELETE FROM embedding_cache WHERE id IN ({','.join('?' * len(batch))})",
+                    batch,
+                )
+            if stale:
+                conn.commit()
+            pending.extend((cid, doc["id"], c) for cid, c in wanted.items() if cid not in have)
+            while len(pending) >= EMBED_BATCH_SIZE:
+                await _embed_and_store(
+                    conn, pending[:EMBED_BATCH_SIZE], project_id, embed_model, ollama_url, task
+                )
+                del pending[:EMBED_BATCH_SIZE]
+            if i % 50 == 49:
+                # Let other requests (the progress poll, a cancel) through on a cached project.
+                await asyncio.sleep(0)
+        if pending:
+            await _embed_and_store(conn, pending, project_id, embed_model, ollama_url, task)
     finally:
         conn.close()
-    embedded.clear()
 
 
 def _search_embeddings(
@@ -518,9 +658,23 @@ async def embedding_progress():
     return _embedding_progress
 
 
+@router.get("/generation-progress")
+async def generation_progress():
+    """What the running generation is doing: waiting for the model, reasoning, or writing."""
+    progress = _generation_progress
+    seconds = int(time.monotonic() - progress["started"]) if progress["active"] else 0
+    return {
+        "active": progress["active"],
+        "phase": progress["phase"] if progress["active"] else "",
+        "words": progress["words"],
+        "seconds": seconds,
+    }
+
+
 @router.post("/cancel")
 async def cancel_ai_task():
-    """Stop the running embedding task after its current batch; cached chunks are kept."""
+    """Stop the running AI task: embedding after its current batch (cached chunks are kept),
+    generation at the model's next word."""
     global _cancelled_up_to
     _cancelled_up_to = _latest_task
     return {"cancelled": True}
@@ -592,29 +746,14 @@ async def find_similar(req: SimilarSearchRequest):
     if not docs:
         return []
 
-    # Ensure all documents are embedded (load content one at a time to save memory)
+    # Ensure all documents are embedded
     _embedding_progress["active"] = True
     _embedding_progress["total"] = len(docs)
     try:
-        for i, doc in enumerate(docs):
-            _check_cancelled(task)
-            _embedding_progress["current"] = i + 1
-            _embedding_progress["doc_name"] = doc["name"]
-            # Load content with sync sqlite3 (avoids aiosqlite memory leak)
-            conn = _sync_db()
-            try:
-                cursor = conn.execute(
-                    "SELECT content, transcript, source_type FROM document WHERE id=?",
-                    (doc["id"],),
-                )
-                row = cursor.fetchone()
-                content = _embed_text_for(row) if row else ""
-            finally:
-                conn.close()
-            await _ensure_doc_embedded(
-                doc["id"], content, req.project_id,
-                embed_model, ollama_url, chunk_size, chunk_overlap, chunk_mode, task,
-            )
+        await _embed_documents(
+            docs, req.project_id, embed_model, ollama_url,
+            chunk_size, chunk_overlap, chunk_mode, task,
+        )
     finally:
         _embedding_progress["active"] = False
 
@@ -740,6 +879,10 @@ async def suggest_codings(req: AutoCodeRequest):
     return await asyncio.to_thread(finalize)
 
 
+# Writing is the slow part of a summary; without a limit models write 600-1,400 words.
+SUMMARY_MAX_WORDS = 300
+
+
 class SummarizeCodeRequest(BaseModel):
     project_id: int
     code_id: int
@@ -749,6 +892,7 @@ class SummarizeCodeRequest(BaseModel):
 @router.post("/summarize-code")
 async def summarize_code(req: SummarizeCodeRequest):
     """Generate an LLM summary of all passages coded under a specific code."""
+    task = _begin_cancellable_task()  # registered before the first await
     settings = await _get_settings()
     ollama_url = settings.get("ollama_url", "http://localhost:11434")
     llm_model = req.llm_model or settings.get("llm_model", "")
@@ -793,7 +937,8 @@ async def summarize_code(req: SummarizeCodeRequest):
         "You are a qualitative research assistant. Below are text passages that have been "
         f"coded under the code '{code_name}'. The code is defined as: '{code_description}'. "
         "Synthesize these passages into a thematic summary. Identify key patterns, variations, "
-        "and notable aspects across all the passages. Be analytical, not just descriptive."
+        "and notable aspects across all the passages. Be analytical, not just descriptive. "
+        f"Write at most {SUMMARY_MAX_WORDS} words."
     )
     think = settings.get("think_mode", "off") == "on"
     passages = [seg["selected_text"] for seg in segments]
@@ -805,17 +950,13 @@ async def summarize_code(req: SummarizeCodeRequest):
     )
     prompt = f"Here are {len(chosen)} of {len(segments)} coded passages:\n\n{segment_texts}"
 
-    try:
-        response = await _ollama_generate(prompt, llm_model, ollama_url, system, think=think)
-        return {
-            "summary": response,
-            "segment_count": len(chosen),
-            "total_segments": len(segments),
-        }
-    except httpx.ConnectError:
-        raise HTTPException(503, "Cannot connect to Ollama. Make sure it is running.")
-    except Exception as e:
-        raise HTTPException(503, f"Ollama generation failed: {e}")
+    response = await _generate_or_fail(prompt, llm_model, ollama_url, system, think, task)
+    return {
+        "summary": response,
+        "segment_count": len(chosen),
+        "total_segments": len(segments),
+        "timing": dict(_last_generation),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -966,6 +1107,43 @@ async def consistency_check(req: ConsistencyCheckRequest):
 # 3. POST /ai/suggest-hierarchy — Codebook Hierarchy Suggester
 # ---------------------------------------------------------------------------
 
+def _normalise_hierarchy(parsed) -> dict | None:
+    """Bring a model's hierarchy answer into the shape the interface shows, or None.
+
+    Local models often return valid JSON that differs slightly from the requested format
+    (a list named "codes" instead of "children", a missing key, a number among the names).
+    Groups without a name or without codes are dropped; an answer with nothing usable
+    counts as unparseable.
+    """
+    if not isinstance(parsed, dict):
+        return None
+
+    def names(value) -> list[str]:
+        items = value if isinstance(value, list) else []
+        texts = [str(item).strip() for item in items if isinstance(item, (str, int))]
+        return [text for text in texts if text]
+
+    groups = []
+    raw_groups = parsed.get("groups")
+    for group in raw_groups if isinstance(raw_groups, list) else []:
+        if not isinstance(group, dict):
+            continue
+        parent = group.get("suggested_parent") or group.get("parent") or group.get("name")
+        children = names(group.get("children")) or names(group.get("codes"))
+        if not isinstance(parent, str) or not parent.strip() or not children:
+            continue
+        description = group.get("description")
+        groups.append({
+            "suggested_parent": parent.strip(),
+            "description": description if isinstance(description, str) else "",
+            "children": children,
+        })
+    standalone = names(parsed.get("standalone"))
+    if not groups and not standalone:
+        return None
+    return {"groups": groups, "standalone": standalone}
+
+
 class HierarchySuggestRequest(BaseModel):
     project_id: int
     llm_model: str | None = None
@@ -974,6 +1152,7 @@ class HierarchySuggestRequest(BaseModel):
 @router.post("/suggest-hierarchy")
 async def suggest_hierarchy(req: HierarchySuggestRequest):
     """Ask an LLM to suggest a hierarchical grouping for the project's codebook."""
+    task = _begin_cancellable_task()  # registered before the first await
     settings = await _get_settings()
     ollama_url = settings.get("ollama_url", "http://localhost:11434")
     llm_model = req.llm_model or settings.get("llm_model", "")
@@ -1068,14 +1247,10 @@ async def suggest_hierarchy(req: HierarchySuggestRequest):
         "examples_included": examples_included,
     }
 
-    try:
-        response = await _ollama_generate(prompt, llm_model, ollama_url, system, think=think)
-    except httpx.ConnectError:
-        raise HTTPException(503, "Cannot connect to Ollama. Make sure it is running.")
-    except Exception as e:
-        raise HTTPException(503, f"Ollama generation failed: {e}")
+    response = await _generate_or_fail(prompt, llm_model, ollama_url, system, think, task)
     # A suggestion cut off at the length limit may lack groups even when its JSON parses.
     coverage["answer_truncated"] = response.endswith(LENGTH_LIMIT_NOTE)
+    coverage["timing"] = dict(_last_generation)
 
     # Parse the whole response as JSON, else the outermost {...} block within it.
     json_match = re.search(r'\{[\s\S]*\}', response)
@@ -1086,8 +1261,9 @@ async def suggest_hierarchy(req: HierarchySuggestRequest):
             parsed = json.loads(candidate)
         except json.JSONDecodeError:
             continue
-        if isinstance(parsed, dict):
-            return {**parsed, **coverage}
+        suggestion = _normalise_hierarchy(parsed)
+        if suggestion is not None:
+            return {**suggestion, **coverage}
 
     return {
         "error": "Could not parse JSON from LLM response",
@@ -1109,6 +1285,7 @@ class GenerateDefinitionRequest(BaseModel):
 @router.post("/generate-definition")
 async def generate_definition(req: GenerateDefinitionRequest):
     """Generate a code definition from its coded passages using an LLM."""
+    task = _begin_cancellable_task()  # registered before the first await
     settings = await _get_settings()
     ollama_url = settings.get("ollama_url", "http://localhost:11434")
     llm_model = req.llm_model or settings.get("llm_model", "")
@@ -1181,14 +1358,10 @@ async def generate_definition(req: GenerateDefinitionRequest):
     )
     prompt = f"{intro}Coded passages:\n{passage_lines}\n\n{guidance}"
 
-    try:
-        response = await _ollama_generate(prompt, llm_model, ollama_url, system, think=think)
-        return {
-            "definition": response,
-            "segment_count": len(chosen),
-            "total_segments": len(segments),
-        }
-    except httpx.ConnectError:
-        raise HTTPException(503, "Cannot connect to Ollama. Make sure it is running.")
-    except Exception as e:
-        raise HTTPException(503, f"Ollama generation failed: {e}")
+    response = await _generate_or_fail(prompt, llm_model, ollama_url, system, think, task)
+    return {
+        "definition": response,
+        "segment_count": len(chosen),
+        "total_segments": len(segments),
+        "timing": dict(_last_generation),
+    }

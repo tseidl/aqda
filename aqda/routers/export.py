@@ -485,7 +485,8 @@ async def export_json(project_id: int):
 
     data = {
         "format": "AQDA analysis export (documents exclude source content)",
-        "project": project,
+        # Collaboration state describes this computer (folder paths), not the project.
+        "project": {k: v for k, v in project.items() if not k.startswith("shared_")},
         "documents": docs_meta,
         "codes": codes,
         "codings": codings,

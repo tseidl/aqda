@@ -1,9 +1,10 @@
 import { useState, useMemo, useRef, useEffect, type DragEvent } from 'react';
 import { useMutation, useQueryClient, useQuery } from '@tanstack/react-query';
 import { ChevronRight, ChevronDown, Plus, Trash2, Pencil, Sparkles, Copy, GripVertical, RotateCcw } from 'lucide-react';
-import { codes as codesApi, settings as settingsApi, ai, type Code, type DeletedCode, type Memo } from '../api';
+import { codes as codesApi, settings as settingsApi, ai, type Code, type DeletedCode, type GenerationTiming, type Memo } from '../api';
 import { MentionTextarea, MentionView } from './MentionTextarea';
 import { buildMentionCandidates, type MentionCandidate } from './mentions';
+import { AnswerTiming, GenerationProgress } from './GenerationProgress';
 
 interface Props {
   projectId: number;
@@ -287,6 +288,7 @@ function CodeDescriptionEditor({ code, projectId, codes, memos, onJumpToMention 
   const [summaryText, setSummaryText] = useState<string | null>(null);
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [summarySegments, setSummarySegments] = useState({ used: 0, total: 0 });
+  const [summaryTiming, setSummaryTiming] = useState<GenerationTiming | undefined>(undefined);
   const [copied, setCopied] = useState(false);
   const [saveFailed, setSaveFailed] = useState(false);
   // confirmedRef: the description known to be stored on the server.
@@ -330,10 +332,12 @@ function CodeDescriptionEditor({ code, projectId, codes, memos, onJumpToMention 
       const result = await ai.summarizeCode({ project_id: projectId, code_id: code.id });
       setSummaryText(result.summary);
       setSummarySegments({ used: result.segment_count, total: result.total_segments });
+      setSummaryTiming(result.timing);
     } catch (error) {
       const detail = error instanceof Error ? error.message.replace(/^\d{3}:\s*/, '') : '';
       setSummaryText(`Could not generate summary. ${detail || 'Make sure Ollama is running and an LLM model is selected in Settings.'}`);
       setSummarySegments({ used: 0, total: 0 });
+      setSummaryTiming(undefined);
     } finally {
       setSummaryLoading(false);
     }
@@ -399,7 +403,9 @@ function CodeDescriptionEditor({ code, projectId, codes, memos, onJumpToMention 
         </button>
       </div>
 
-      {summaryText && (
+      {summaryLoading && <GenerationProgress className="mt-2" />}
+
+      {summaryText && !summaryLoading && (
         <div className="mt-2 p-2.5 bg-purple-50 border border-purple-100 rounded-md">
           <div className="flex items-center justify-between mb-1.5">
             <span className="text-[10px] text-purple-500 font-medium">
@@ -415,6 +421,7 @@ function CodeDescriptionEditor({ code, projectId, codes, memos, onJumpToMention 
             </button>
           </div>
           <p className="text-xs text-purple-900 leading-relaxed whitespace-pre-wrap">{summaryText}</p>
+          <AnswerTiming timing={summaryTiming} className="mt-1.5" />
         </div>
       )}
     </div>

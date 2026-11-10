@@ -79,8 +79,7 @@ async def list_documents(project_id: int):
     try:
         cursor = await db.execute(
             "SELECT id, project_id, name, source_type, label, exclude_from_ai, "
-            "created_at, modified_at, "
-            "LENGTH(content) as content_length "
+            "created_at, modified_at "
             "FROM document WHERE project_id=? ORDER BY name",
             (project_id,),
         )

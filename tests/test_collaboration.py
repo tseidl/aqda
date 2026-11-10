@@ -315,3 +315,74 @@ async def test_substantive_resource_mutations_advance_project_revision(tmp_path,
     await codings.delete_coding(coding["id"])
 
     assert (await project_row(project_id))["revision"] == 7
+
+
+# A file that is not a database at all gets the prepared explanation, not a server error.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", [b"just some text, not a database" * 20, b"PK\x03\x04" + b"\0" * 300])
+async def test_importing_a_file_that_is_no_project_explains_itself(tmp_path, use_data_dir, content):
+    from fastapi import HTTPException
+
+    use_data_dir(tmp_path / "wrong-file")
+    await db_module.init_db()
+    with pytest.raises(HTTPException) as refused:
+        await projects.import_from_db(upload(content, "project.qdpx"), mode="auto")
+    assert refused.value.status_code == 400
+    assert "Not an AQDA project file" in refused.value.detail
+    assert await project_count() == 0
+
+
+# A collaborator's version re-creates every document; embeddings of unchanged text are kept.
+@pytest.mark.asyncio
+async def test_update_keeps_embeddings_of_unchanged_documents(tmp_path, use_data_dir):
+    from aqda.routers.ai import _chunk_id
+
+    data_dir = use_data_dir(tmp_path / "embeddings")
+    await db_module.init_db()
+    project = await projects.create_project(projects.ProjectCreate(name="Study"))
+    same = await documents.upload_document(
+        project_id=project["id"], file=upload(b"Unchanged interview text.", "same.txt")
+    )
+    gone = await documents.upload_document(
+        project_id=project["id"], file=upload(b"Text only the old version has.", "gone.txt")
+    )
+    con = sqlite3.connect(data_dir / "aqda.db")
+    for doc, text in [(same, "Unchanged interview text."), (gone, "Text only the old")]:
+        con.execute(
+            "INSERT INTO embedding_cache (id, document_id, project_id, model, start_pos, "
+            "end_pos, chunk_text, embedding) VALUES (?, ?, ?, 'm', 0, ?, ?, x'0000803f')",
+            (_chunk_id(doc["id"], 0, len(text), "m", text), doc["id"], project["id"],
+             len(text), text),
+        )
+    con.commit()
+
+    # The incoming version lacks one document and adds another.
+    await documents.delete_document(gone["id"])
+    await documents.upload_document(
+        project_id=project["id"], file=upload(b"A new interview.", "new.txt")
+    )
+    snapshot = await response_bytes(await export.export_aqda(project["id"]))
+    lineage_id = (await project_row(project["id"]))["lineage_id"]
+    con.execute(
+        "INSERT INTO embedding_cache (id, document_id, project_id, model, start_pos, end_pos, "
+        "chunk_text, embedding) VALUES ('other-model', ?, ?, 'm2', 0, 9, 'Unchanged', x'00')",
+        (same["id"], project["id"]),
+    )
+    con.commit()
+    result = await projects.import_from_db(
+        upload(snapshot), mode="replace", target_lineage_id=lineage_id
+    )
+    assert result["imported"][0]["action"] == "update"
+
+    rows = con.execute(
+        "SELECT e.id, e.document_id, e.model, e.chunk_text, e.embedding, d.name "
+        "FROM embedding_cache e JOIN document d ON d.id=e.document_id ORDER BY e.model"
+    ).fetchall()
+    con.close()
+    assert [(row[2], row[3], row[5]) for row in rows] == [
+        ("m", "Unchanged interview text.", "same.txt"), ("m2", "Unchanged", "same.txt"),
+    ]
+    new_id = rows[0][1]
+    assert new_id != same["id"]  # the document was re-created under a new ID
+    assert rows[0][0] == _chunk_id(new_id, 0, 25, "m", "Unchanged interview text.")
+    assert rows[0][4] == bytes.fromhex("0000803f")

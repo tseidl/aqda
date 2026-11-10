@@ -7,11 +7,16 @@ import {
 import {
   ai, settings as settingsApi, codings as codingsApi, documents as documentsApi,
   type Code, type SimilarResult, type ConsistencyResult, type HierarchySuggestion,
+  type GenerationTiming,
 } from '../api';
+import { AnswerTiming, GenerationProgress } from './GenerationProgress';
 
 interface Props {
   projectId: number;
   codes: Code[];
+  /** Whether the panel is the open tab. It stays mounted when hidden, so results and a
+   *  running task survive a visit to another tab. */
+  active: boolean;
   onNavigate: (docId: number, startPos?: number, endPos?: number) => void;
 }
 
@@ -152,7 +157,7 @@ function DocumentExclusions({ projectId, disabled }: { projectId: number; disabl
   );
 }
 
-export function AiPanel({ projectId, codes, onNavigate }: Props) {
+export function AiPanel({ projectId, codes, active, onNavigate }: Props) {
   const [mode, setMode] = useState<AiMode>('search');
   const [query, setQuery] = useState('');
   const [selectedCodeId, setSelectedCodeId] = useState<number | null>(null);
@@ -164,7 +169,7 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
   const [similarResults, setSimilarResults] = useState<SimilarResult[]>([]);
   const [consistencyResults, setConsistencyResults] = useState<ConsistencyResult[]>([]);
   const [hierarchyResult, setHierarchyResult] = useState<HierarchySuggestion | null>(null);
-  const [definitionResult, setDefinitionResult] = useState<{ definition: string; segment_count: number; total_segments: number } | null>(null);
+  const [definitionResult, setDefinitionResult] = useState<{ definition: string; segment_count: number; total_segments: number; timing?: GenerationTiming } | null>(null);
 
   // Model overrides
   const [llmOverride, setLlmOverride] = useState<string>('');
@@ -175,6 +180,9 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
     active: boolean; current: number; total: number; doc_name: string;
   } | null>(null);
 
+  // Search, suggestions, and the consistency check embed passages; the other tools ask the
+  // model to write, which has its own progress display.
+  const usesEmbeddings = ['search', 'autocode', 'consistency'].includes(mode);
   const abortRef = useRef<AbortController | null>(null);
   const progressRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const queryClient = useQueryClient();
@@ -188,7 +196,7 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
 
   // Poll embedding progress while loading
   useEffect(() => {
-    if (loading) {
+    if (loading && usesEmbeddings) {
       progressRef.current = setInterval(async () => {
         try {
           const p = await ai.embeddingProgress();
@@ -204,14 +212,16 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
     return () => {
       if (progressRef.current) clearInterval(progressRef.current);
     };
-  }, [loading]);
+  }, [loading, usesEmbeddings]);
 
   const { data: ollamaStatus, refetch: refreshStatus } = useQuery({
     queryKey: ['ollama-status'],
     queryFn: settingsApi.ollamaStatus,
-    refetchInterval: 15000,
+    refetchInterval: active ? 15000 : false,
     retry: false,
   });
+  // The status was not checked while the panel was hidden.
+  useEffect(() => { if (active) refreshStatus(); }, [active, refreshStatus]);
 
   const { data: ollamaModels, refetch: refreshModels } = useQuery({
     queryKey: ['ollama-models'],
@@ -224,6 +234,15 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
     queryFn: settingsApi.get,
     staleTime: 30000,
   });
+
+  // Models in Ollama's memory, checked after each task: one that only partly fits into
+  // graphics memory answers far more slowly, which is worth telling the researcher.
+  const { data: loadedModels, refetch: refreshLoaded } = useQuery({
+    queryKey: ['ollama-loaded'],
+    queryFn: settingsApi.ollamaLoaded,
+    retry: false,
+  });
+  const splitModels = (loadedModels?.models ?? []).filter((m) => m.cpu_share >= 0.05 && m.cpu_share < 1);
 
   const effectiveLlm = llmOverride || currentSettings?.llm_model || '';
   const effectiveEmbed = embedOverride || currentSettings?.embedding_model || '';
@@ -425,6 +444,7 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
     } finally {
       setLoading(false);
       abortRef.current = null;
+      refreshLoaded();
     }
   };
 
@@ -509,13 +529,14 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
           {searchModes.map((m) => (
             <button
               key={m.id}
+              disabled={loading}
               onClick={() => { setMode(m.id); clearResults(); }}
-              className={`py-1.5 px-1 text-[11px] rounded-md flex flex-col items-center gap-0.5 transition-colors ${
+              className={`py-1.5 px-1 text-[11px] rounded-md flex flex-col items-center gap-0.5 transition-colors disabled:opacity-60 disabled:cursor-not-allowed ${
                 mode === m.id
                   ? 'bg-purple-100 text-purple-700 font-medium'
                   : 'bg-gray-50 text-gray-500 hover:bg-gray-100 hover:text-gray-700'
               }`}
-              title={m.description}
+              title={loading ? 'Cancel the running task to use another tool' : m.description}
             >
               {m.icon}
               <span className="leading-tight text-center">{m.label}</span>
@@ -528,13 +549,14 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
           {codebookModes.map((m) => (
             <button
               key={m.id}
+              disabled={loading}
               onClick={() => { setMode(m.id); clearResults(); }}
-              className={`py-1.5 px-1 text-[11px] rounded-md flex flex-col items-center gap-0.5 transition-colors ${
+              className={`py-1.5 px-1 text-[11px] rounded-md flex flex-col items-center gap-0.5 transition-colors disabled:opacity-60 disabled:cursor-not-allowed ${
                 mode === m.id
                   ? 'bg-purple-100 text-purple-700 font-medium'
                   : 'bg-gray-50 text-gray-500 hover:bg-gray-100 hover:text-gray-700'
               }`}
-              title={m.description}
+              title={loading ? 'Cancel the running task to use another tool' : m.description}
             >
               {m.icon}
               <span className="leading-tight text-center">{m.label}</span>
@@ -544,7 +566,11 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
       </div>
 
       {/* Mode description */}
-      <p className="text-[11px] text-gray-400 px-1 mb-2">{currentMode.description}</p>
+      <p className="text-[11px] text-gray-400 px-1 mb-2">
+        {loading
+          ? `${currentMode.label} is running. Cancel it to use another tool; its result stays here while you work in other tabs.`
+          : currentMode.description}
+      </p>
 
       <DocumentExclusions projectId={projectId} disabled={loading} />
 
@@ -604,7 +630,8 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
               <p className="text-[10px] text-gray-400 mt-0.5 truncate">{embeddingProgress.doc_name}</p>
             </div>
           )}
-          {loading && !embeddingProgress && (
+          {!usesEmbeddings && <GenerationProgress className="px-1" />}
+          {usesEmbeddings && !embeddingProgress && (
             <p className="text-[10px] text-gray-400 text-center animate-pulse">Processing...</p>
           )}
         </div>
@@ -618,6 +645,13 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
           <span>Run {currentMode.label}</span>
         </button>
       )}
+
+      {splitModels.map((m) => (
+        <div key={m.name} className="mt-2 p-2 bg-amber-50 border border-amber-200 rounded-md text-[11px] leading-snug text-amber-800">
+          “{m.name}” does not fit into this computer's graphics memory: about {Math.round(m.cpu_share * 100)}% of it
+          runs on the processor, which makes answers much slower. A smaller model will be faster.
+        </div>
+      ))}
 
       {/* Error display */}
       {error && (
@@ -754,7 +788,7 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
                           <p className="text-[10px] text-gray-500 mt-0.5">{g.description}</p>
                         )}
                         <div className="flex flex-wrap gap-1 mt-1.5">
-                          {g.children.map((child) => (
+                          {(g.children ?? []).map((child) => (
                             <span key={child} className="px-1.5 py-0.5 bg-white border border-purple-200 rounded text-[10px] text-purple-700">
                               {child}
                             </span>
@@ -798,6 +832,7 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
                 <p className="text-[10px] text-gray-400 px-1 italic">
                   This is a suggestion — review and apply changes manually in the code tree.
                 </p>
+                <AnswerTiming timing={hierarchyResult.timing} className="px-1" />
               </>
             )}
           </div>
@@ -815,6 +850,7 @@ export function AiPanel({ projectId, codes, onNavigate }: Props) {
               <p className="text-sm text-gray-800 leading-relaxed whitespace-pre-wrap">
                 {definitionResult.definition}
               </p>
+              <AnswerTiming timing={definitionResult.timing} className="mt-1.5" />
             </div>
             <p className="text-[10px] text-gray-400 px-1 italic">
               Copy this definition to your code's description field if you'd like to keep it.

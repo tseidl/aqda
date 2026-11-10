@@ -118,8 +118,19 @@ export function ProjectList() {
   });
 
   const deletePermanentMut = useMutation({
-    mutationFn: projects.deletePermanent,
+    mutationFn: ({ id, force }: { id: number; force: boolean }) => projects.deletePermanent(id, force),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['projects-trash'] }),
+    onError: (error: Error, { id, force }) => {
+      const reason = error.message.replace(/^\d{3}:\s*/, '');
+      // A shared project whose collaboration folder cannot be reached.
+      if (!force && /^409:/.test(error.message)) {
+        if (confirm(`${reason}\n\nDelete the project anyway? If the folder comes back, the last version this computer saved there stays visible to your collaborators.`)) {
+          deletePermanentMut.mutate({ id, force: true });
+        }
+      } else {
+        alert(`The project could not be deleted. ${reason}`);
+      }
+    },
   });
 
   const importMut = useMutation({
@@ -569,7 +580,7 @@ export function ProjectList() {
                     <button
                       onClick={() => {
                         if (confirm('Permanently delete this project? This cannot be undone.')) {
-                          deletePermanentMut.mutate(p.id);
+                          deletePermanentMut.mutate({ id: p.id, force: false });
                         }
                       }}
                       className="p-2 text-gray-400 hover:text-red-500 rounded-lg hover:bg-red-50"

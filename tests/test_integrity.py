@@ -188,6 +188,9 @@ async def test_export_fidelity_and_api_404(tmp_path, use_data_dir):
     exported_json = json.loads(await response_bytes(await export.export_json(project["id"])))
     assert exported_json["documents"][0]["variables"] == {"group": "A"}
     assert "exclude source content" in exported_json["format"]
+    # Folder paths of this computer (collaboration state) are not part of the analysis data.
+    assert exported_json["project"]["name"] == "日本語 Projekt"
+    assert not [key for key in exported_json["project"] if key.startswith("shared_")]
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(

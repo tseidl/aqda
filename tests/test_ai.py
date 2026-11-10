@@ -205,6 +205,8 @@ async def test_generation_sets_the_context_window(monkeypatch):
     assert seen["options"] == {
         "num_ctx": ai.LLM_CONTEXT_TOKENS, "num_predict": ai.LLM_RESPONSE_TOKENS,
     }
+    # ... and the model is kept in memory beyond Ollama's five minutes.
+    assert seen["keep_alive"] == ai.OLLAMA_KEEP_ALIVE
 
 
 # An answer cut off at the length limit says so instead of looking complete.
@@ -259,7 +261,7 @@ async def test_excluded_documents_are_ignored_by_every_ai_feature(
     project, code = await _project_with_excluded_guide(tmp_path, use_data_dir)
     prompts = []
 
-    async def generate(prompt, model, ollama_url, system="", think=False):
+    async def generate(prompt, model, ollama_url, system="", think=False, task=None):
         prompts.append(system + prompt)
         return '{"groups": [], "standalone": ["Trust"]}'
 
@@ -288,6 +290,8 @@ async def test_excluded_documents_are_ignored_by_every_ai_feature(
         assert "Interview passage one." in prompt
         assert "Guide example" not in prompt
     assert '"Trust" (2 segments)' in prompts[2]
+    # A summary without a length limit runs to a thousand words and takes minutes.
+    assert f"Write at most {ai.SUMMARY_MAX_WORDS} words." in prompts[0]
     assert all("Guide example" not in text for text in embedded)
     assert any("Interview passage one." in text for text in embedded)
     assert (summary["segment_count"], summary["total_segments"]) == (2, 2)
@@ -320,7 +324,7 @@ async def test_summary_reports_the_passages_it_used(tmp_path, use_data_dir, monk
         ))
     prompts = []
 
-    async def generate(prompt, model, ollama_url, system="", think=False):
+    async def generate(prompt, model, ollama_url, system="", think=False, task=None):
         prompts.append(system + prompt)
         return "summary"
 
@@ -333,3 +337,193 @@ async def test_summary_reports_the_passages_it_used(tmp_path, use_data_dir, monk
     assert 0 < used < 60
     assert f"Here are {used} of 60 coded passages" in prompts[0]
     assert ai._estimate_tokens(prompts[0]) <= ai.LLM_CONTEXT_TOKENS - ai.LLM_RESPONSE_TOKENS
+
+
+def _stream_client(lines, status=200):
+    """An HTTP client whose Ollama answers with the given newline-delimited JSON objects."""
+    import json
+
+    body = "".join(json.dumps(line) + "\n" for line in lines).encode()
+    return httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(status, content=body)
+    ))
+
+
+# The answer is read as a stream, so long answers are not cut off by a total time limit.
+@pytest.mark.asyncio
+async def test_generation_joins_a_streamed_answer(monkeypatch):
+    lines = [
+        {"thinking": "Let me see", "done": False},
+        {"response": "Two wor", "done": False},
+        {"response": "ds here.", "done": False},
+        {"response": "", "done": True, "done_reason": "stop", "load_duration": 2_000_000_000,
+         "prompt_eval_count": 40, "prompt_eval_duration": 500_000_000, "eval_count": 9,
+         "eval_duration": 1_500_000_000, "total_duration": 4_000_000_000},
+    ]
+    async with _stream_client(lines) as client:
+        monkeypatch.setattr(ai, "_get_http_client", lambda: client)
+        answer = await ai._ollama_generate("prompt", "model", "http://ollama.test", think=True)
+    assert answer == "Two words here."
+    progress = await ai.generation_progress()
+    assert progress["active"] is False and progress["words"] == 3
+    assert ai._count_words("ds here.", *ai._count_words("Two wor", 0, False)) == (3, True)
+    # Where the time went, for the line under the answer.
+    assert ai._last_generation == {
+        "load_seconds": 2.0, "prompt_tokens": 40, "prompt_seconds": 0.5,
+        "answer_tokens": 9, "answer_seconds": 1.5, "total_seconds": 4.0, "reasoned": True,
+    }
+
+
+# Failures reach the researcher with a reason: Ollama's own message, or a named timeout.
+@pytest.mark.asyncio
+async def test_generation_failures_carry_a_reason(monkeypatch):
+    async with _stream_client([{"error": "model 'missing' not found"}], status=404) as client:
+        monkeypatch.setattr(ai, "_get_http_client", lambda: client)
+        with pytest.raises(HTTPException) as unknown_model:
+            await ai._generate_or_fail("prompt", "missing", "http://ollama.test", "", False, 10**9)
+    assert "model 'missing' not found" in unknown_model.value.detail
+
+    def silent(request):
+        raise httpx.ReadTimeout("")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(silent)) as client:
+        monkeypatch.setattr(ai, "_get_http_client", lambda: client)
+        with pytest.raises(HTTPException) as timed_out:
+            await ai._generate_or_fail("prompt", "model", "http://ollama.test", "", False, 10**9)
+    assert timed_out.value.status_code == 504
+    assert "did not respond" in timed_out.value.detail
+    assert (await ai.generation_progress())["active"] is False
+
+
+# Cancel stops a generation at the next word instead of letting the model finish unseen.
+@pytest.mark.asyncio
+async def test_cancel_stops_a_running_generation(monkeypatch):
+    task = ai._begin_cancellable_task()
+
+    async def answer():
+        yield b'{"response": "First", "done": false}\n'
+        await ai.cancel_ai_task()
+        yield b'{"response": " second", "done": false}\n'
+        yield b'{"response": "", "done": true}\n'
+
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, content=answer()))
+    async with httpx.AsyncClient(transport=transport) as client:
+        monkeypatch.setattr(ai, "_get_http_client", lambda: client)
+        with pytest.raises(HTTPException) as cancelled:
+            await ai._generate_or_fail("prompt", "model", "http://ollama.test", "", False, task)
+    assert cancelled.value.status_code == 409
+
+
+# Valid JSON in a slightly different shape must not reach the interface as it is.
+def test_hierarchy_answer_is_brought_into_shape():
+    from aqda.routers.ai import _normalise_hierarchy
+
+    answer = {
+        "groups": [
+            {"suggested_parent": "Institutions", "description": "d", "codes": ["Trust", 7, ""]},
+            {"suggested_parent": "No codes"},
+            {"children": ["Orphan"]},
+            "not a group",
+        ],
+        "standalone": "Trust",
+    }
+    assert _normalise_hierarchy(answer) == {
+        "groups": [
+            {"suggested_parent": "Institutions", "description": "d", "children": ["Trust", "7"]}
+        ],
+        "standalone": [],
+    }
+    assert _normalise_hierarchy({"groups": {"a": 1}}) is None
+    assert _normalise_hierarchy(["Trust"]) is None
+
+
+# Many short documents (spreadsheet rows) share embedding requests instead of one each.
+@pytest.mark.asyncio
+async def test_short_documents_are_embedded_in_shared_batches(tmp_path, use_data_dir, monkeypatch):
+    use_data_dir(tmp_path / "rows")
+    await db_module.init_db()
+    project = await projects.create_project(projects.ProjectCreate(name="Rows"))
+    for number in range(25):
+        await documents.upload_document(
+            project_id=project["id"],
+            file=UploadFile(filename=f"row-{number:02d}.txt", file=io.BytesIO(
+                f"Answer number {number}.".encode()
+            )),
+        )
+    batches = []
+
+    async def embed(text, model, ollama_url):
+        if isinstance(text, str):
+            return [1.0, 0.0]
+        batches.append(len(text))
+        return [[1.0, 0.0] for _ in text]
+
+    monkeypatch.setattr(ai, "_ollama_embed", embed)
+    request = ai.SimilarSearchRequest(
+        project_id=project["id"], query="answer", embedding_model="m", top_k=50,
+    )
+    assert len(await ai.find_similar(request)) == 25
+    assert batches == [10, 10, 5]
+    assert len(await ai.find_similar(request)) == 25
+    assert batches == [10, 10, 5]  # the second search finds every chunk in the cache
+
+
+# A model split between graphics memory and processor is reported, so the panel can warn.
+@pytest.mark.asyncio
+async def test_loaded_models_report_their_processor_share(tmp_path, use_data_dir, monkeypatch):
+    from aqda.routers import settings as settings_router
+
+    use_data_dir(tmp_path / "loaded")
+    await db_module.init_db()
+    ps = {"models": [
+        {"name": "fits:9b", "size": 6_000, "size_vram": 6_000, "context_length": 8192},
+        {"name": "split:27b", "size": 20_000, "size_vram": 12_000, "context_length": 8192},
+    ]}
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=ps))
+    monkeypatch.setattr(
+        settings_router.httpx, "AsyncClient", lambda **kwargs: real_client(transport=transport)
+    )
+    loaded = (await settings_router.loaded_ollama_models())["models"]
+    assert [(m["name"], m["cpu_share"]) for m in loaded] == [("fits:9b", 0.0), ("split:27b", 0.4)]
+
+
+# Reasoning counts towards the answer length; when it uses all of it, say so instead of
+# returning an empty answer with a note.
+@pytest.mark.asyncio
+async def test_reasoning_that_uses_the_whole_answer_length_is_reported(monkeypatch):
+    lines = [
+        {"thinking": "Still thinking", "done": False},
+        {"response": "", "done": True, "done_reason": "length"},
+    ]
+    async with _stream_client(lines) as client:
+        monkeypatch.setattr(ai, "_get_http_client", lambda: client)
+        with pytest.raises(HTTPException) as no_answer:
+            await ai._generate_or_fail("prompt", "model", "http://ollama.test", "", True, 10**9)
+    assert no_answer.value.detail == ai.REASONING_ONLY_MESSAGE
+
+
+# Before its first word the model sends nothing; a cancel must not wait for that word.
+@pytest.mark.asyncio
+async def test_cancel_does_not_wait_for_the_first_word(monkeypatch):
+    import asyncio
+
+    closed = []
+
+    async def silent_model(prompt, model, ollama_url, system="", think=False, task=None):
+        try:
+            await asyncio.sleep(60)
+        finally:
+            closed.append(True)
+
+    monkeypatch.setattr(ai, "_ollama_generate", silent_model)
+    task = ai._begin_cancellable_task()
+    running = asyncio.ensure_future(
+        ai._generate_or_fail("prompt", "model", "http://ollama.test", "", False, task)
+    )
+    await asyncio.sleep(0.1)
+    await ai.cancel_ai_task()
+    with pytest.raises(HTTPException) as cancelled:
+        await asyncio.wait_for(running, timeout=3)
+    assert cancelled.value.status_code == 409
+    assert closed == [True]

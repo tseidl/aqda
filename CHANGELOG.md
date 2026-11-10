@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased
+
+### Improvements
+- **Model answers show what is happening** — summaries, definitions, and hierarchy suggestions
+  now show a moving bar with the current stage (waiting for the model, reasoning, writing),
+  the time so far, and the words written. Answers are read as they are written, so a long
+  answer is no longer cut off after two minutes; AQDA only gives up after ten minutes of
+  silence and then says so. Cancel now stops the model itself, at once. When Ollama refuses
+  a request (unknown model, no reasoning support), its own explanation is shown.
+- **Where the time went** — each answer ends with a line such as "Took 0:40: loading the
+  model 0:02, reading the passages 0:06, writing 0:33", so a slow start can be told from
+  long reading or long writing.
+- **Summaries are at most 300 words** — Summarize Theme used to write 600 to 1,400 words,
+  and writing is what takes the time; a summary now arrives in less than half the time.
+- **Models stay loaded for 30 minutes** — Ollama unloads a model five minutes after its last
+  use; AQDA now asks it to keep the model, so coding between two AI tasks no longer means
+  waiting for the model to load again.
+- **Warning when a model is too large for the computer** — if Ollama has to split a model
+  between graphics memory and the processor, the AI panel says so and suggests a smaller
+  model, because such a model answers many times more slowly.
+- **Thinking mode says when it produced no answer** — a model can use its whole answer length
+  for reasoning; AQDA now reports that instead of showing an empty answer.
+- **AI results stay when you visit another tab** — suggestions, a generated definition, or a
+  hierarchy suggestion are still there when you return from the Codes or Docs tab, and a
+  running task keeps running. While a task runs the other tools are greyed out and the panel
+  says to cancel it first.
+- **Searching after a collaborator's update is fast again** — embeddings of documents whose
+  text did not change are kept when a collaborator's version arrives (before: the whole
+  project was embedded again).
+- **Faster first search over many short documents** — passages from several documents share
+  one request to the embedding model, which matters for imported spreadsheet rows.
+- **Faster document list in projects with audio** — the list no longer reads every recording.
+- **Font size and the Variables panel are remembered** across documents and reloads.
+- **Stop sharing when the shared folder is gone** — if the collaboration folder no longer
+  exists, AQDA asks whether to stop sharing (or delete the project) anyway instead of refusing.
+
+### Bug fixes
+- **A variable could be saved to the wrong document** — after editing a variable, the field
+  kept the typed value when another document was opened, and clicking into it saved that
+  value to the other document. Check variables you edited while switching between documents.
+- **Hierarchy Suggest could end in "Something went wrong"** — a model answer in a slightly
+  different format replaced the whole app with the error screen; such answers are now read
+  where possible and reported as unreadable otherwise.
+- **Importing a file that is not an AQDA project** now explains what is expected instead of
+  failing with a server error.
+- **Spreadsheets with very long cells** (a whole interview or report in one cell, above
+  131,072 characters) can be imported.
+- **The analysis export (.json) no longer contains folder paths** of the collaboration
+  folder on your computer.
+
 ## 0.6.0
 
 ### New features

@@ -12,6 +12,9 @@ from datetime import date, datetime, time
 TABLE_EXTENSIONS = {".csv", ".tsv", ".xlsx"}
 # The upload limit applies to the compressed .xlsx; the XML inside may be much larger.
 MAX_XLSX_XML_BYTES = 200 * 1024 * 1024
+# Python's CSV reader refuses cells above 131,072 characters by default; a whole interview
+# or report in one cell is longer. No cell can exceed the upload limit.
+csv.field_size_limit(50 * 1024 * 1024)
 # Rows used to suggest which column holds the text.
 SUGGESTION_SAMPLE_ROWS = 200
 

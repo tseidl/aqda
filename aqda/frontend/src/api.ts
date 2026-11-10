@@ -128,7 +128,6 @@ export interface Document {
   exclude_from_ai?: number;
   created_at: string;
   modified_at: string;
-  content_length?: number;
   variables?: Record<string, string>;
 }
 
@@ -247,6 +246,31 @@ export interface ConsistencyResult {
   outliers: ConsistencyOutlier[];
 }
 
+/** The running model answer: waiting for the first word, reasoning, or writing. */
+export interface GenerationProgress {
+  active: boolean;
+  phase: '' | 'waiting' | 'thinking' | 'writing';
+  words: number;
+  seconds: number;
+}
+
+/** Where the time of a finished model answer went, as reported by Ollama (seconds). */
+export interface GenerationTiming {
+  load_seconds?: number;
+  prompt_seconds?: number;
+  answer_seconds?: number;
+  total_seconds?: number;
+  /** The model reasoned before answering; that time is part of answer_seconds. */
+  reasoned?: boolean;
+}
+
+/** A model Ollama has in memory; cpu_share is the part running on the processor (0 to 1). */
+export interface LoadedModel {
+  name: string;
+  cpu_share: number;
+  context_length?: number | null;
+}
+
 export interface HierarchyGroup {
   suggested_parent: string;
   description: string;
@@ -265,6 +289,7 @@ export interface HierarchySuggestion {
   examples_included?: boolean;
   /** True when the model's answer stopped at the length limit. */
   answer_truncated?: boolean;
+  timing?: GenerationTiming;
 }
 
 // --- API functions ---
@@ -281,8 +306,9 @@ export const projects = {
   trash: () => request<Project[]>('/projects/trash/list'),
   restore: (id: number) =>
     request<Project>(`/projects/${id}/restore`, { method: 'POST' }),
-  deletePermanent: (id: number) =>
-    request<void>(`/projects/${id}/permanent`, { method: 'DELETE' }),
+  /** `force` also deletes a shared project whose collaboration folder cannot be reached. */
+  deletePermanent: (id: number, force = false) =>
+    request<void>(`/projects/${id}/permanent${force ? '?force=true' : ''}`, { method: 'DELETE' }),
   importDb: async ({
     file,
     mode = 'auto',
@@ -333,8 +359,9 @@ export const shared = {
         local_newer_choice: localNewerChoice,
       }),
     }),
-  unlinkProject: (projectId: number) =>
-    request<void>(`/shared/projects/${projectId}/link`, { method: 'DELETE' }),
+  /** `force` stops sharing also when the collaboration folder cannot be reached. */
+  unlinkProject: (projectId: number, force = false) =>
+    request<void>(`/shared/projects/${projectId}/link${force ? '?force=true' : ''}`, { method: 'DELETE' }),
   resolveConflict: (
     conflictProjectId: number,
     choice: 'use_reference' | 'keep_current',
@@ -496,6 +523,7 @@ export const settings = {
     request<Settings>('/settings', { method: 'PUT', body: JSON.stringify(items) }),
   ollamaModels: () => request<{ available: boolean; models: string[] }>('/settings/ollama/models'),
   ollamaStatus: () => request<{ running: boolean }>('/settings/ollama/status'),
+  ollamaLoaded: () => request<{ models: LoadedModel[] }>('/settings/ollama/loaded'),
   ollamaStart: () => request<{ started: boolean; message: string }>('/settings/ollama/start', { method: 'POST' }),
   dataDir: () => request<{ path: string; db_file: string }>('/settings/data-dir'),
 };
@@ -506,14 +534,15 @@ export const ai = {
   autoCode: (data: { project_id: number; code_id: number; top_k?: number; embedding_model?: string }, signal?: AbortSignal) =>
     request<SimilarResult[]>('/ai/autocode', { method: 'POST', body: JSON.stringify(data), signal }),
   summarizeCode: (data: { project_id: number; code_id: number; llm_model?: string }, signal?: AbortSignal) =>
-    request<{ summary: string; segment_count: number; total_segments: number }>('/ai/summarize-code', { method: 'POST', body: JSON.stringify(data), signal }),
+    request<{ summary: string; segment_count: number; total_segments: number; timing?: GenerationTiming }>('/ai/summarize-code', { method: 'POST', body: JSON.stringify(data), signal }),
   consistencyCheck: (data: { project_id: number; code_id?: number; similarity_threshold?: number; embedding_model?: string }, signal?: AbortSignal) =>
     request<{ results: ConsistencyResult[] }>('/ai/consistency-check', { method: 'POST', body: JSON.stringify(data), signal }),
   suggestHierarchy: (data: { project_id: number; llm_model?: string }, signal?: AbortSignal) =>
     request<HierarchySuggestion>('/ai/suggest-hierarchy', { method: 'POST', body: JSON.stringify(data), signal }),
   generateDefinition: (data: { project_id: number; code_id: number; llm_model?: string }, signal?: AbortSignal) =>
-    request<{ definition: string; segment_count: number; total_segments: number }>('/ai/generate-definition', { method: 'POST', body: JSON.stringify(data), signal }),
+    request<{ definition: string; segment_count: number; total_segments: number; timing?: GenerationTiming }>('/ai/generate-definition', { method: 'POST', body: JSON.stringify(data), signal }),
   embeddingProgress: () =>
     request<{ active: boolean; current: number; total: number; doc_name: string }>('/ai/embedding-progress'),
+  generationProgress: () => request<GenerationProgress>('/ai/generation-progress'),
   cancel: () => request<{ cancelled: boolean }>('/ai/cancel', { method: 'POST' }),
 };

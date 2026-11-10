@@ -363,3 +363,33 @@ async def test_background_sync_retries_after_transient_failure(
     health = shared_service.get_sync_health()
     assert health["sync_error"] is None
     assert health["last_checked_at"] is not None
+
+
+# A folder that is gone for good must not keep a project linked (or undeletable) forever.
+@pytest.mark.asyncio
+async def test_sharing_can_be_stopped_when_the_folder_is_gone(tmp_path, use_data_dir):
+    import shutil
+
+    use_data_dir(tmp_path / "vanished")
+    await db_module.init_db()
+    shared_root = tmp_path / "Cloud" / "Team"
+    await set_shared_root(str(shared_root))
+    kept = await projects.create_project(projects.ProjectCreate(name="Kept study"))
+    trashed = await projects.create_project(projects.ProjectCreate(name="Trashed study"))
+    await share_project(kept["id"])
+    await share_project(trashed["id"])
+    shutil.rmtree(shared_root)
+
+    with pytest.raises(HTTPException) as refused:
+        await unlink_shared_project(kept["id"])
+    assert refused.value.status_code == 409
+    assert (await project_row(kept["id"]))["shared_folder"] is not None
+    await unlink_shared_project(kept["id"], force=True)
+    assert (await project_row(kept["id"]))["shared_folder"] is None
+
+    await projects.delete_project(trashed["id"])
+    with pytest.raises(HTTPException) as refused:
+        await projects.delete_project_permanent(trashed["id"])
+    assert refused.value.status_code == 409
+    await projects.delete_project_permanent(trashed["id"], force=True)
+    assert await project_row(trashed["id"]) is None

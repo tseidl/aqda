@@ -141,6 +141,33 @@ async def ollama_status():
         return {"running": False}
 
 
+@router.get("/ollama/loaded")
+async def loaded_ollama_models():
+    """The models Ollama has in memory, with the share of each that runs on the processor.
+
+    A model that does not fit into graphics memory is split between graphics card and
+    processor and answers many times more slowly; the AI panel warns about that.
+    """
+    ollama_url = await _get_ollama_url()
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{ollama_url}/api/ps")
+            resp.raise_for_status()
+            models = resp.json().get("models", [])
+    except Exception:
+        return {"models": []}
+    loaded = []
+    for model in models:
+        size = model.get("size") or 0
+        in_graphics_memory = min(model.get("size_vram") or 0, size)
+        loaded.append({
+            "name": model.get("name", ""),
+            "cpu_share": round(1 - in_graphics_memory / size, 2) if size else 0.0,
+            "context_length": model.get("context_length"),
+        })
+    return {"models": loaded}
+
+
 @router.post("/ollama/start")
 async def start_ollama():
     """Attempt to start Ollama in the background."""

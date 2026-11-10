@@ -4,6 +4,7 @@ import { X, Tag, Sparkles, ChevronDown, ChevronRight, ChevronUp, Plus, Trash2, L
 import { codes as codesApi, documents as docsApi, type Document, type Coding, type Code, type Memo } from '../api';
 import { MentionTextarea } from './MentionTextarea';
 import { buildMentionCandidates } from './mentions';
+import { useStoredState } from './storedState';
 
 interface Props {
   document: Document;
@@ -162,7 +163,8 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
   const textContentRef = useRef<HTMLDivElement>(null);
   const queryClient = useQueryClient();
   const [selection, setSelection] = useState<TextSelection | null>(null);
-  const [docFontSize, setDocFontSize] = useState(14);
+  // Display preferences are remembered: the viewer is re-created for each newly opened document.
+  const [docFontSize, setDocFontSize] = useStoredState('aqda.docFontSize', 14);
   const [clickedCoding, setClickedCoding] = useState<{
     codings: Coding[]; rect: { top: number; left: number };
   } | null>(null);
@@ -170,7 +172,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
   const [newCodeName, setNewCodeName] = useState('');
   const [newCodeDesc, setNewCodeDesc] = useState('');
   const [codeFilter, setCodeFilter] = useState('');
-  const [showVariables, setShowVariables] = useState(false);
+  const [showVariables, setShowVariables] = useStoredState('aqda.showVariables', false);
   const [newVarKey, setNewVarKey] = useState('');
   const [newVarValue, setNewVarValue] = useState('');
   const [showAddVar, setShowAddVar] = useState(false);
@@ -711,8 +713,10 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
         {showVariables && (
           <div className="px-4 pb-3 border-t border-gray-100 bg-gray-50">
             <div className="pt-2 space-y-1.5">
+              {/* Keyed by document too: the field keeps what was typed, and must never
+                  carry one document's value over to the next document. */}
               {Object.entries(variables).map(([key, value]) => (
-                <div key={key} className="flex items-center gap-2 group">
+                <div key={`${doc.id}:${key}:${value}`} className="flex items-center gap-2 group">
                   <span className="text-xs font-medium text-gray-500 w-28 shrink-0 truncate">{key}</span>
                   <input
                     className="flex-1 text-xs px-2 py-1 border border-gray-200 rounded bg-white focus:outline-none focus:ring-1 focus:ring-indigo-500"

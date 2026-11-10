@@ -1,6 +1,7 @@
 """Project management routes."""
 
 import asyncio
+import hashlib
 import os
 import tempfile
 import uuid
@@ -167,8 +168,12 @@ async def restore_project(project_id: int):
 
 
 @router.delete("/{project_id}/permanent", status_code=204)
-async def delete_project_permanent(project_id: int):
-    """Permanently delete a project (no recovery)."""
+async def delete_project_permanent(project_id: int, force: bool = False):
+    """Permanently delete a project (no recovery).
+
+    ``force`` deletes a shared project even when its collaboration folder is unreachable
+    and this computer's snapshot therefore cannot be removed from it.
+    """
     db = await get_db()
     try:
         project = await (
@@ -179,7 +184,7 @@ async def delete_project_permanent(project_id: int):
     if project and project["shared_folder"]:
         from aqda.services.shared_projects import unlink_shared_project
 
-        await unlink_shared_project(project_id)
+        await unlink_shared_project(project_id, force=force)
 
     db = await get_db()
     try:
@@ -439,6 +444,84 @@ async def _copy_project_contents(
         )
 
 
+# The text AQDA embeds for a document: the transcript for audio, else the content.
+_EMBEDDED_TEXT_SQL = "CASE WHEN source_type='audio' THEN transcript ELSE content END"
+
+
+def _text_key(text: str | None) -> str:
+    """Identify a document text, to recognize it again under a new document ID."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+async def _set_embeddings_aside(dst, project_id: int) -> dict[str, int]:
+    """Keep a project's cached embeddings while a newer version replaces its documents.
+
+    Replacing a project re-creates every document under a new ID, and the cache is deleted
+    with the old documents. The rows are copied to a temporary table and the old document
+    IDs returned by text, so ``_restore_embeddings`` can hand them to the new documents
+    whose text is unchanged. Embeddings stay on this computer; snapshots never carry them.
+    """
+    await dst.execute("DROP TABLE IF EXISTS temp.aqda_kept_embedding")
+    rows = await (
+        await dst.execute(
+            f"SELECT id, {_EMBEDDED_TEXT_SQL} AS text FROM document WHERE project_id=? "
+            "AND id IN (SELECT DISTINCT document_id FROM embedding_cache WHERE project_id=?)",
+            (project_id, project_id),
+        )
+    ).fetchall()
+    if not rows:
+        return {}
+    await dst.execute(
+        "CREATE TEMP TABLE aqda_kept_embedding AS "
+        "SELECT * FROM embedding_cache WHERE project_id=?",
+        (project_id,),
+    )
+    return {_text_key(row["text"]): row["id"] for row in rows}
+
+
+async def _restore_embeddings(dst, project_id: int, kept: dict[str, int]) -> None:
+    """Give the embeddings set aside to the new documents that have the same text."""
+    if not kept:
+        return
+    from aqda.routers.ai import _chunk_id
+
+    documents = await (
+        await dst.execute(
+            f"SELECT id, {_EMBEDDED_TEXT_SQL} AS text FROM document WHERE project_id=?",
+            (project_id,),
+        )
+    ).fetchall()
+    for document in documents:
+        old_id = kept.get(_text_key(document["text"]))
+        if old_id is None:
+            continue
+        chunks = await (
+            await dst.execute(
+                "SELECT model, start_pos, end_pos, chunk_text, embedding "
+                "FROM temp.aqda_kept_embedding WHERE document_id=?",
+                (old_id,),
+            )
+        ).fetchall()
+        await dst.executemany(
+            "INSERT OR IGNORE INTO embedding_cache "
+            "(id, document_id, project_id, model, start_pos, end_pos, chunk_text, embedding) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    # The chunk ID includes the document ID, so it is derived again.
+                    _chunk_id(
+                        document["id"], chunk["start_pos"], chunk["end_pos"],
+                        chunk["model"], chunk["chunk_text"],
+                    ),
+                    document["id"], project_id, chunk["model"], chunk["start_pos"],
+                    chunk["end_pos"], chunk["chunk_text"], chunk["embedding"],
+                )
+                for chunk in chunks
+            ],
+        )
+    await dst.execute("DROP TABLE IF EXISTS temp.aqda_kept_embedding")
+
+
 @router.post("/import-db", status_code=201)
 async def import_from_db(
     file: UploadFile = File(...),
@@ -483,10 +566,10 @@ async def import_package_bytes(
         dst = await get_db()
 
         try:
-            check = await (await src.execute("PRAGMA quick_check")).fetchone()
-            if not check or check[0] != "ok":
-                raise HTTPException(400, "The project snapshot is incomplete or corrupted")
             try:
+                check = await (await src.execute("PRAGMA quick_check")).fetchone()
+                if not check or check[0] != "ok":
+                    raise HTTPException(400, "The project snapshot is incomplete or corrupted")
                 try:
                     cursor = await src.execute("SELECT * FROM project WHERE deleted_at IS NULL")
                 except aiosqlite.OperationalError as exc:
@@ -495,6 +578,7 @@ async def import_package_bytes(
                     cursor = await src.execute("SELECT * FROM project")
                 source_projects = await cursor.fetchall()
             except aiosqlite.DatabaseError:
+                # Raised by the very first statement when the file is not a database at all.
                 raise HTTPException(
                     400,
                     "Not an AQDA project file. Expected an .aqda file "
@@ -585,6 +669,7 @@ async def import_package_bytes(
 
                 if action == "update":
                     project_id = local_project["id"]
+                    kept_embeddings = await _set_embeddings_aside(dst, project_id)
                     await dst.execute("DELETE FROM memo WHERE project_id=?", (project_id,))
                     await dst.execute("DELETE FROM document WHERE project_id=?", (project_id,))
                     await dst.execute(
@@ -607,6 +692,7 @@ async def import_package_bytes(
                     await _copy_project_contents(
                         src, dst, source_project, project_id, snapshots
                     )
+                    await _restore_embeddings(dst, project_id, kept_embeddings)
                     name = source_project["name"]
                 else:
                     if action == "copy":
@@ -725,6 +811,7 @@ async def refresh_conflict_copy(
         if not target:
             raise HTTPException(404, "Conflict copy no longer exists")
 
+        kept_embeddings = await _set_embeddings_aside(dst, target_project_id)
         await dst.execute("DELETE FROM memo WHERE project_id=?", (target_project_id,))
         await dst.execute("DELETE FROM document WHERE project_id=?", (target_project_id,))
         await dst.execute(
@@ -745,6 +832,7 @@ async def refresh_conflict_copy(
             ),
         )
         await _copy_project_contents(src, dst, source_project, target_project_id, [])
+        await _restore_embeddings(dst, target_project_id, kept_embeddings)
 
         from aqda.services.offsets import repair_legacy_offsets
 

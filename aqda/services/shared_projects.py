@@ -1000,30 +1000,38 @@ def get_sync_health() -> dict[str, str | None]:
     }
 
 
-async def unlink_shared_project(project_id: int) -> None:
-    """Stop publishing this installation's writer snapshot, then clear the link."""
+async def unlink_shared_project(project_id: int, force: bool = False) -> None:
+    """Stop publishing this installation's writer snapshot, then clear the link.
+
+    When the collaboration folder cannot be reached, the snapshot cannot be removed from it.
+    That is refused unless ``force`` is set: the folder may be gone for good (deleted, or
+    the cloud drive reorganized), and the project must not stay linked to it forever.
+    """
     async with _sync_lock:
         project = await _project_row(project_id)
         if not project:
             raise HTTPException(404, "Project not found")
         if project["shared_folder"]:
             folder = Path(project["shared_folder"])
-            if not folder.is_dir():
-                raise HTTPException(
-                    409,
-                    "The collaboration folder is unavailable. Reconnect it before stopping "
-                    "sharing so AQDA can remove this computer's snapshot.",
-                )
             path = _writer_snapshot_path(folder, await _device_id())
-            try:
-                await asyncio.to_thread(path.unlink, missing_ok=True)
-                _snapshot_cache.pop(path, None)
-            except OSError as exc:
-                raise HTTPException(
-                    409,
-                    "AQDA could not remove this computer's shared snapshot. "
-                    "Reconnect the collaboration folder and try again.",
-                ) from exc
+            if not folder.is_dir():
+                if not force:
+                    raise HTTPException(
+                        409,
+                        "The collaboration folder is unavailable, so AQDA cannot remove this "
+                        "computer's snapshot from it.",
+                    )
+            else:
+                try:
+                    await asyncio.to_thread(path.unlink, missing_ok=True)
+                except OSError as exc:
+                    if not force:
+                        raise HTTPException(
+                            409,
+                            "AQDA could not remove this computer's snapshot from the "
+                            "collaboration folder.",
+                        ) from exc
+            _snapshot_cache.pop(path, None)
         db = await get_db()
         try:
             mirrors = await (

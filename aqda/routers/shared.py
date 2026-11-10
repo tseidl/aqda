@@ -202,5 +202,6 @@ async def resolve_conflict(conflict_project_id: int, data: ConflictResolution):
 
 
 @router.delete("/projects/{project_id}/link", status_code=204)
-async def unlink_project(project_id: int):
-    await unlink_shared_project(project_id)
+async def unlink_project(project_id: int, force: bool = False):
+    """Stop sharing; ``force`` also when the collaboration folder cannot be reached."""
+    await unlink_shared_project(project_id, force=force)
