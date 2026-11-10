@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.0
 
 ### Improvements
 - **Model answers show what is happening** — summaries, definitions, and hierarchy suggestions
