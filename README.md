@@ -1,58 +1,70 @@
 # AQDA — Augmented Qualitative Data Analysis
 
-**A free, open-source tool for qualitative researchers. AI-powered, local-first, privacy-respecting.**
+**A free, open-source tool for qualitative coding, with optional AI assistance that runs on your own computer.**
 
-AQDA gives you a modern coding interface with local AI assistance — without cloud subscriptions, and with your data staying on your machine (unless you deliberately connect it to an Ollama server elsewhere). It runs as a local web app in your browser.
+AQDA runs as a local web app in your browser. Your projects stay on your computer, and no cloud
+subscription is needed. Its AI tools use [Ollama](https://ollama.com) on your own machine; they
+send passages elsewhere only if you deliberately connect AQDA to an Ollama server on another
+computer.
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
+## Guides
+
+- [Your first project](https://github.com/tseidl/aqda/blob/main/docs/first-project.md) —
+  import documents, code, organize codes, write memos, export. Start here.
+- [AI tools](https://github.com/tseidl/aqda/blob/main/docs/ai-tools.md) — setting up Ollama and
+  using the six AI tools.
+- [Working together](https://github.com/tseidl/aqda/blob/main/docs/collaboration.md) — sharing
+  a project through Google Drive, Dropbox, or another shared folder.
+- [Letting language models suggest codes](https://github.com/tseidl/aqda/blob/main/docs/model-runs.md)
+  — advanced and optional; most projects never need it.
+
 ---
 
-## What Can AQDA Do?
+## What AQDA Does
 
-### Core Qualitative Coding
+- **Import** text (`.txt`), Word (`.docx`, formatting is dropped) and PDF documents, images
+  (JPG, PNG, GIF, WebP), audio (MP3, WAV, M4A) with optional local transcription, and
+  spreadsheets (`.csv`, `.tsv`, `.xlsx`) with one document per row. Images can be viewed but
+  not coded.
+- **Code** by selecting a passage and picking a code, or creating one on the spot. Click a
+  coded passage to see its codes or remove one.
+- **Build a codebook** of hierarchical codes with colors and definitions. Drag and drop to
+  reorder, merge two codes that mean the same, and restore deleted codes.
+- **Coding fields** (optional): answer a few questions each time you apply a code, for example
+  whether the speaker agrees.
+- **Memos** for the project, a document, a code, or a single passage, with `@` references to
+  codes and other memos.
+- **Document variables and tags** such as author, date, or source, which AQDA can read from
+  filenames on import.
+- **Several coders**: each coding records who made it, and you can show or hide each coder's
+  codings.
+- **Segments browser**: every coded segment across documents, filtered by code or coder.
+- **Export** to REFI-QDA for MAXQDA, ATLAS.ti, and NVivo, and to CSV and JSON.
 
-- **Text coding** — Select text (including audio transcripts), apply codes, build your codebook. Click on any coded passage to see applied codes or remove them.
-- **Hierarchical codes** — Organize codes in parent-child trees with colors and descriptions. Drag and drop in the sidebar to re-parent or reorder.
-- **Text, Word, PDF, image & audio files** — Import `.txt`, `.docx` (formatting is dropped), and `.pdf` documents, images (JPG, PNG, GIF, WebP), and audio files (MP3, WAV, M4A) with optional local transcription via Whisper.
-- **Memos** — Write analytical notes at the project, document, or code level. Anchor a memo to a specific passage and jump back to it, and reference codes or other memos inline by typing `@` — click a reference to jump straight to it.
-- **Spreadsheets** — Import a `.csv`, `.tsv`, or `.xlsx` table with one document per row: choose the column with the text to code, and keep the other columns as document variables.
-- **Document variables & tags** — Add metadata (author, date, source) to documents, auto-extracted from filenames on import. Give a document a short tag (e.g. `INT`) shown next to it in the sidebar.
-- **Coder identity** — Set your name in Settings; each coding records who made it, so collaborators show up as distinct coders in REFI-QDA exports.
-- **Segments browser** — Browse all coded segments across documents. Click to jump to the passage in context, or delete directly from the list.
-- **Export** — REFI-QDA (.qdpx) for MAXQDA/ATLAS.ti/NVivo, including document variables and memos linked to their codes and passages; codebook (.qdc), CSV, JSON.
+<img src="https://raw.githubusercontent.com/tseidl/aqda/main/docs/images/workspace.png" alt="A coded interview in AQDA" width="720">
 
-### AI-Powered Augmentation
+### AI Assistance (Optional)
 
-AQDA uses [Ollama](https://ollama.com) to run AI models locally on your computer. No internet connection required, no data shared with anyone. (If you point AQDA at an Ollama server on another machine, the AI features send passages to that machine.)
+AQDA uses [Ollama](https://ollama.com) to run AI models locally. With Ollama on your own
+computer (the default), no internet connection is needed and nothing is sent to any server.
+If you point AQDA at an Ollama server on another machine, the AI features send passages to
+that machine.
 
-| Feature | What it does |
-|---------|-------------|
-| **Topic Search** | Find passages across your documents that match a topic or theme you describe |
-| **Code Suggest** | Given a code, find uncoded passages that might belong to it (from its definition and coded examples); review each and **Apply** or **Dismiss** it |
-| **Consistency Check** | Flag coded segments whose meaning stands out from the other segments of the same code — a prompt to re-read them, not a measure of agreement |
-| **Hierarchy Suggest** | After inductive coding, get suggestions for grouping your codes into parent categories |
-| **Code Definition Generator** | Applied a code many times but haven't written a definition yet? Generate one from the actual coded passages |
+- **Topic Search** — find passages that match a topic or theme you describe.
+- **Code Suggest** — find uncoded passages that might belong to a code; **Apply** or
+  **Dismiss** each.
+- **Consistency Check** — flag coded segments that stand out from the other segments of the
+  same code, as a prompt to re-read them.
+- **Hierarchy Suggest** — get suggestions for grouping your codes into parent categories.
+- **Define Code** — draft a definition from a code's coded passages.
+- **Summarize Theme** — a summary of at most 300 words of what a code's passages say.
 
-When you click on an AI result, AQDA jumps to the passage in the document and highlights it, so you can immediately see the context and decide whether to code it.
-
-Topic Search and Code Suggest cover text, PDF, and transcribed audio. Use **Exclude documents…** in the AI panel for material that is not part of your data, such as interview guides, instructions, or documents collecting example quotes for your codebook. Excluded documents are ignored by every AI feature: they are not searched, and their coded segments are not used for suggestions, summaries, definitions, or the consistency check.
-
-Summaries, definitions, and hierarchy suggestions send the model only as many passages as fit into its context window, judged by a deliberately generous estimate of their length. When a code has more, AQDA sends a selection spread over all of its passages and says how many it sent (for example, 34 of 120). Answers that reach AQDA's length limit are marked as possibly incomplete.
-
-These tools are designed as a **methodological interlocutor** — they interrogate your coding rather than generate it. The researcher always has the final word.
-
-### Two Types of AI Models
-
-AQDA uses two types of models for different purposes:
-
-| Model type | What it does | Used by | Recommended model |
-|-----------|-------------|---------|-------------------|
-| **Embedding model** | Converts text into numerical representations so similar passages can be found | Topic Search, Code Suggest, Consistency Check | `nomic-embed-text` (fast, 274 MB) |
-| **LLM (language model)** | Reads text and generates structured output (definitions, groupings) | Hierarchy Suggest, Define Code, Summarize Theme | `qwen3.5:9b` (6 GB) |
-
-You need one of each. They are configured in **Settings**.
+The tools question your coding rather than do it for you; the researcher always has the final
+word. Documents you list under **Exclude documents…** in the AI panel, such as interview
+guides, are ignored by every AI feature.
 
 ---
 
@@ -72,22 +84,6 @@ Open a terminal and run:
 ```bash
 pipx install aqda
 ```
-
-Already installed? Refresh AQDA to the current version with:
-
-```bash
-pipx reinstall aqda
-```
-
-Then start AQDA:
-
-```bash
-aqda
-```
-
-This opens your browser at `http://127.0.0.1:8765`. To stop, click **Close AQDA** in the
-app. Pressing `Ctrl+C` once in the terminal is the equivalent safe shutdown.
-
 
 <details>
 <summary><strong>Don't have Python or pipx?</strong></summary>
@@ -120,7 +116,20 @@ Close and reopen Command Prompt, then install AQDA.
 Run `pipx ensurepath`, then **close and reopen your terminal**. This adds pipx's install directory to your PATH.
 </details>
 
-### Setting Up AI Features (Optional)
+### Start and Stop
+
+```bash
+aqda
+```
+
+This opens your browser at `http://127.0.0.1:8765`. To stop, click **Close AQDA** in the app,
+or press `Ctrl+C` once in the terminal. Closing only the browser tab leaves AQDA running, which
+is harmless; reopen `http://127.0.0.1:8765` to return.
+
+New to AQDA? [Your first project](https://github.com/tseidl/aqda/blob/main/docs/first-project.md)
+walks you through it.
+
+### AI Features (Optional)
 
 1. [Download and install Ollama](https://ollama.com/download)
 2. Open a terminal and pull the models:
@@ -131,7 +140,7 @@ Run `pipx ensurepath`, then **close and reopen your terminal**. This adds pipx's
 3. In AQDA, go to **Settings** and select your models under "Embedding Model" and "LLM Model"
 4. Open the **AI panel** (sparkle icon in the left sidebar)
 
-With Ollama running on your machine (the default), all AI processing happens locally and nothing is sent to any server.
+More in [AI tools](https://github.com/tseidl/aqda/blob/main/docs/ai-tools.md).
 
 ### Audio Transcription (Optional)
 
@@ -143,117 +152,62 @@ pipx inject aqda "aqda[audio]"
 
 Then import an audio file (MP3, WAV, M4A) and click the transcribe button.
 
-### Auto-Extract Metadata from Filenames (Optional)
-
-If your files follow a naming convention, AQDA can automatically extract variables on import. In **Settings → Filename Variable Parsing**, set a regex pattern with named groups.
-
-For example, files like `2025-03-10_guardian_from-border-crackdown.txt`:
-
-```
-(?P<date>\d{4}-\d{2}-\d{2})_(?P<source>[^_]+)_(?P<title>.+)
-```
-
-This extracts `date`, `source`, and `title` as document variables automatically when you import.
-
-### Updating
+### Updating and Uninstalling
 
 ```bash
 pipx upgrade aqda
 ```
 
-### Uninstalling
-
 ```bash
 pipx uninstall aqda
 ```
 
-This removes the app but keeps your data in `~/.aqda/`. To remove everything, also delete that folder.
+Uninstalling removes the app but keeps your data in `~/.aqda/`. To remove everything, also
+delete that folder.
 
 ---
 
 ## Your Data
 
-AQDA saves every change to your project as you work; you never need to save it. Its private working database
-lives at `~/.aqda/aqda.db`; normal users never need to open or move this file.
+AQDA saves every change as you work; there is no save button. All your projects live in one
+private working database, `~/.aqda/aqda.db`. You never need to open or move this file.
+On Windows, `~/.aqda/` is the folder `C:\Users\<name>\.aqda`.
 
-- **Automatic backups** — AQDA keeps seven verified daily backups in `~/.aqda/backups/`
-  and creates an extra backup before migrations or replacing a project from a collaborator
-  (the ten newest collaboration backups are kept; adjustable in Settings)
-- **Move or archive a project** with an `.aqda` snapshot from the Export menu
-- **Deleted projects** go to a trash bin and can be restored
-- **Deleted codes** go to *Deleted codes* at the bottom of the code list and can be restored
-  together with their child codes and coded segments
-- **Deleting a document** is permanent: its coded segments are removed, while memos linked to
-  it are kept, each with a note naming the deleted document (and the passage it was about)
+**Do not put the live `aqda.db` in Google Drive, Dropbox, OneDrive, or a network folder.** To
+work with others through such a folder, use AQDA's collaboration feature (below).
 
-Do not put the live `aqda.db` in Google Drive, Dropbox, OneDrive, or a network folder.
-AQDA's collaboration feature below provides the same convenient shared-folder experience
-without exposing a live SQLite database to cloud-sync races.
+- **Automatic backups** — AQDA keeps seven verified daily backups in `~/.aqda/backups/`. It
+  makes an extra backup before updating the database format, before merging codes, and before
+  replacing a project with a collaborator's version (the ten newest collaboration backups are
+  kept; adjustable in Settings).
+- **Restoring a backup** — close AQDA, keep the current `aqda.db` as an extra copy, and copy
+  the chosen backup into its place as `aqda.db`.
+- **Moving or archiving a project** — **Export → Save a copy to send (.aqda)** gives a
+  standalone copy; **Import Project** on the start page opens it.
+- **Deleted projects and codes** go to a trash and can be restored; codes come back together
+  with their child codes and coded segments.
+- **Deleting a document is permanent.** Its coded segments are removed. Memos linked to it are
+  kept, each with a note naming the deleted document.
 
-To restore a full backup, close AQDA, keep the current `aqda.db` as an extra copy, and copy
-the chosen backup into its place as `aqda.db`.
+---
 
-### Collaboration — Google Drive, Dropbox, or a Shared Folder
+## Working Together
 
-Collaboration is designed to feel like opening the same document from a shared folder.
-AQDA quietly uses a safe local working copy and syncs complete, closed snapshots in the
-background. The local working copy lives with all your other projects inside the hidden
-`~/.aqda/aqda.db` database; it is not another file you have to open or manage. You never
-need to save manually.
+Put a folder for the project in Google Drive, Dropbox, OneDrive, your university cloud, or
+another synced location. In AQDA, open the project, click **Collaborate**, and choose that
+folder. Your colleague adds the same folder under **Settings → Collaboration** and opens the
+project from **Shared projects available**. Each of you should set a name in Settings so that
+codings show who made them.
 
-**Set up a project:**
+AQDA works on a local copy and publishes complete snapshots to the shared folder after a short
+delay; you never save manually. Incoming changes appear automatically, after AQDA has made and
+verified a full backup.
 
-1. Make a folder for that project or team inside Google Drive, Dropbox, OneDrive, your
-   university cloud, or another synced location.
-2. Open the project in AQDA and click **Collaborate**.
-3. Choose a previously saved location, or click **Choose another shared folder…** and select
-   the folder from step 1.
-4. On the other researcher's computer, add that same folder under
-   **Settings → Collaboration**.
-5. The project appears under **Shared projects available**; click **Open project** once.
-
-AQDA remembers multiple collaboration locations. A project with one co-author can use a
-Google Drive folder, another can use a university-cloud folder, and a third can use Dropbox;
-clicking **Collaborate** lets you choose the appropriate location for each project. Each
-project connects to one location at a time.
-
-After that, both researchers open the project normally from AQDA's project list. Changes
-save locally immediately and complete snapshots are published to the shared folder after a
-short delay. Incoming changes appear automatically. Before replacing local project data,
-AQDA creates and verifies a full safety backup.
-
-If two people happen to work at the same time—or one computer was offline—AQDA detects the
-two histories and keeps neither person's work from overwriting the other. The original shared
-project remains your branch. AQDA creates exactly one clearly named **Collaborator reference**
-project for each other branch and updates that same reference as new work arrives; it does not
-make another copy or shared folder on every sync.
-
-Treat the collaborator reference as a comparison copy, not a new place to code. To resolve it:
-
-1. Compare the two projects and agree which branch everyone will continue from.
-2. On a computer where the current shared project is the chosen branch, open the collaborator
-   reference and click **Keep my current shared version**. The reference moves to Trash.
-3. On a computer where the collaborator reference is the chosen branch, open it and click
-   **Use this version for collaboration**. AQDA creates a full backup, switches the shared
-   project, and keeps the previous local branch as a clearly named local archive.
-
-This is an explicit choice rather than an automatic merge: qualitative coding decisions from
-two branches cannot safely be guessed together.
-
-Under the hood, the collaboration folder contains one `.aqda-project` folder with a complete
-snapshot file for each participating computer. These are managed by AQDA; collaborators should
-not rename or edit them manually. **Stop sharing** removes this computer's snapshot while keeping
-its local project intact; starting collaboration again reuses the same managed project folder.
-
-**Stopping AQDA:** use the **Close AQDA** button, or press Ctrl+C once in the terminal. Both
-perform a graceful final sync. Closing only the browser tab leaves the local AQDA server
-running, which is harmless; reopen `http://127.0.0.1:8765` to return. If the computer stops
-unexpectedly, the hidden local copy is retained and syncs on the next launch.
-
-> **Not supported:** automatically merging two independently edited versions into one.
-
-For one-person local work, nothing changes: create a project, work normally, and close AQDA.
-Everything autosaves; no files or caches need to be managed.
+AQDA does not merge two independently edited versions. If two people work at the same time, or
+one computer was offline, AQDA keeps both: your project, and a **Collaborator reference**
+project to compare it with. You then choose which version everyone continues from.
+[Working together](https://github.com/tseidl/aqda/blob/main/docs/collaboration.md) explains
+the steps.
 
 ---
 
@@ -265,10 +219,25 @@ Everything autosaves; no files or caches need to be managed.
 | `.qdpx` | REFI-QDA text exchange — import into MAXQDA, ATLAS.ti, NVivo |
 | `.qdc` | Codebook XML — share code hierarchies between projects |
 | `.csv` | Coded segments as a table — for further analysis in R, Excel, etc. |
+| Statements `.csv` | One row per coded segment with its document variables, coding fields, coder, and model run — for example to build discourse networks in R |
 | `.json` | Analysis data and document variables — for R, Python, or custom processing |
 
-QDPX currently exports text and audio transcripts as text sources. Original audio and image
-media are not embedded in the QDPX package; use `.aqda` when an exact AQDA round-trip is needed.
+QDPX exports text and audio transcripts as text sources, with document variables and with
+memos linked to their codes and passages. Original audio and image media are not included; use
+`.aqda` when an exact AQDA round-trip is needed.
+
+---
+
+## Letting a Language Model Suggest Codes (Advanced)
+
+Most projects never need this. AQDA's own AI tools do not code for you. If you want to
+develop codes inductively with the help of language models, a small program on your computer
+can let one or several models read your documents and suggest codes with the passages they
+rest on. This is a shortcut, not a substitute for reading: each suggestion is marked as the
+model's and sits in the text, where you accept or remove it. The program works with local
+Ollama models and with online services; with an online service, the text of your documents is
+sent to that service. See
+[Letting language models suggest codes](https://github.com/tseidl/aqda/blob/main/docs/model-runs.md).
 
 ---
 
