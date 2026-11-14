@@ -69,3 +69,25 @@ jobs:
           twine check dist/*
 
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # The notes of the GitHub release are the version's section of CHANGELOG.md, so the
+  # Releases page shows what changed. Runs after the upload, so a problem here can never
+  # hold back or half-finish the PyPI release.
+  github-release:
+    name: Create the GitHub release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create a release for the tag
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read the release notes from the changelog
+        run: python3 .github/scripts/release_notes.py "$GITHUB_REF_NAME" > release-notes.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "AQDA ${GITHUB_REF_NAME#v}" --notes-file release-notes.md
