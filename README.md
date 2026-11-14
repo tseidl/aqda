@@ -10,6 +10,10 @@ computer.
 ![Python](https://img.shields.io/badge/python-3.10+-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
+
+https://github.com/user-attachments/assets/fdbc8052-2ea4-4d6e-8c7e-6b4e7b1798e4
+
+
 ## Guides
 
 - [Your first project](https://github.com/tseidl/aqda/blob/main/docs/first-project.md) —
