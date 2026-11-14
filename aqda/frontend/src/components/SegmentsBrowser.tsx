@@ -1,7 +1,11 @@
-import { useState, useMemo } from 'react';
+import { useCallback, useState, useMemo } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Trash2 } from 'lucide-react';
 import { codings as codingsApi, type Code, type Coding } from '../api';
+import { CodingAnswers } from './CodingFieldsForm';
+import { useCodingFields } from './codingFields';
+import { CoderLabel } from './CoderLabel';
+import { NO_CODER_NAME, useModelRuns } from './coderLayers';
 
 interface Props {
   projectId: number;
@@ -21,6 +25,8 @@ export function SegmentsBrowser({ projectId, codes, onNavigate }: Props) {
   });
   const [filterCodeId, setFilterCodeId] = useState<number | null>(null);
   const [filterCoder, setFilterCoder] = useState<string>('');
+  // The project's coding fields, for showing and editing each segment's answers.
+  const codingFields = useCodingFields(projectId);
 
   const { data: allCodings = [] } = useQuery({
     queryKey: ['codings', 'project', projectId, filterCodeId],
@@ -32,21 +38,57 @@ export function SegmentsBrowser({ projectId, codes, onNavigate }: Props) {
       ),
   });
 
-  // Distinct coder names present in the (code-filtered) codings, for the coder dropdown.
-  const coders = useMemo(
-    () => Array.from(new Set(allCodings.map((c: Coding) => c.coder).filter(Boolean) as string[])).sort(),
-    [allCodings]
-  );
+  // Model runs by record ID, for keying the coder filter by run uuid (a collaborator's
+  // update re-creates record IDs, while uuids stay).
+  const { runs: runList, loaded: runsLoaded } = useModelRuns(projectId);
+  // The filter key of a model coding's run; a run not (yet) in the list gets a key by ID.
+  const runKeyOf = useCallback((runId: number) => {
+    const run = runList.find((r) => r.id === runId);
+    return run ? `run:${run.uuid}` : `run-id:${runId}`;
+  }, [runList]);
+
+  // Who coded the (code-filtered) codings, for the coder dropdown: hand coders by name
+  // ("hand:<name>") and model runs by their run ("run:<uuid>"), never by the label text.
+  const coderOptions = useMemo(() => {
+    const hand = new Set<string>();
+    const runLabels = new Map<number, string>();
+    for (const c of allCodings) {
+      if (c.run_id == null) hand.add(c.coder ?? '');
+      else runLabels.set(c.run_id, c.run_label ?? c.coder ?? 'Model run');
+    }
+    const named = [...hand].filter(Boolean).sort();
+    const handOptions = named.map((name) => ({ value: `hand:${name}`, label: name }));
+    // Codings without a coder name are a choice only next to other coders.
+    if (hand.has('') && (named.length > 0 || runLabels.size > 0)) {
+      handOptions.push({ value: 'hand:', label: NO_CODER_NAME });
+    }
+    const runOptions = [...runLabels.entries()]
+      .sort((a, b) => b[0] - a[0])
+      .map(([id, label]) => ({ value: runKeyOf(id), label }));
+    return { hand: handOptions, runs: runOptions };
+  }, [allCodings, runKeyOf]);
+
+  // A chosen run that no longer exists (removed, or no longer in the project) is dropped,
+  // so the dropdown shows "All coders" and the choice does not come back by itself.
+  if (filterCoder.startsWith('run') && runsLoaded &&
+      !runList.some((run) => !run.removed && `run:${run.uuid}` === filterCoder)) {
+    setFilterCoder('');
+  }
 
   // Ignore a stale coder selection that no longer appears under the current code
   // filter, so switching codes never leaves the list silently empty.
-  const effectiveCoder = filterCoder && coders.includes(filterCoder) ? filterCoder : '';
+  const effectiveCoder = filterCoder &&
+    [...coderOptions.hand, ...coderOptions.runs].some((o) => o.value === filterCoder) ? filterCoder : '';
 
   // Coder filtering is done client-side over the already-loaded codings.
-  const shownCodings = useMemo(
-    () => (effectiveCoder ? allCodings.filter((c: Coding) => c.coder === effectiveCoder) : allCodings),
-    [allCodings, effectiveCoder]
-  );
+  const shownCodings = useMemo(() => {
+    if (!effectiveCoder) return allCodings;
+    if (effectiveCoder.startsWith('run')) {
+      return allCodings.filter((c: Coding) => c.run_id != null && runKeyOf(c.run_id) === effectiveCoder);
+    }
+    const name = effectiveCoder.slice(5);
+    return allCodings.filter((c: Coding) => c.run_id == null && (c.coder ?? '') === name);
+  }, [allCodings, effectiveCoder, runKeyOf]);
 
   return (
     <div className="p-2">
@@ -70,17 +112,26 @@ export function SegmentsBrowser({ projectId, codes, onNavigate }: Props) {
         ))}
       </select>
 
-      {/* Filter by coder — shown only when codings carry coder attribution */}
-      {coders.length > 0 && (
+      {/* Filter by coder or model run — shown only when codings carry attribution */}
+      {coderOptions.hand.length + coderOptions.runs.length > 0 && (
         <select
           value={effectiveCoder}
           onChange={(e) => setFilterCoder(e.target.value)}
           className="w-full px-2 py-1.5 text-sm border border-gray-200 rounded-md mb-2 focus:outline-none focus:ring-1 focus:ring-indigo-500"
         >
           <option value="">All coders</option>
-          {coders.map((name) => (
-            <option key={name} value={name}>{name}</option>
-          ))}
+          {coderOptions.runs.length === 0 ? (
+            coderOptions.hand.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)
+          ) : (<>
+            {coderOptions.hand.length > 0 && (
+              <optgroup label="Coded by hand">
+                {coderOptions.hand.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+              </optgroup>
+            )}
+            <optgroup label="Model runs">
+              {coderOptions.runs.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </optgroup>
+          </>)}
         </select>
       )}
 
@@ -100,15 +151,13 @@ export function SegmentsBrowser({ projectId, codes, onNavigate }: Props) {
                   className="w-2.5 h-2.5 rounded-sm shrink-0"
                   style={{ backgroundColor: coding.code_color }}
                 />
-                <span className="text-xs font-medium text-gray-600 truncate">
+                <span className="text-xs font-medium text-gray-600 truncate min-w-[4rem]">
                   {coding.code_name}
                 </span>
-                <span className="text-xs text-gray-400 truncate shrink-0 max-w-[40%]">
+                <span className={`text-xs text-gray-400 truncate max-w-[40%] ${coding.run_id == null ? 'shrink-0' : 'min-w-0'}`}>
                   {coding.document_name}
                 </span>
-                {coding.coder && (
-                  <span className="text-[10px] text-gray-400 shrink-0" title="Coder">{coding.coder}</span>
-                )}
+                <CoderLabel coding={coding} />
                 {coding.repair_status?.startsWith('review_') && (
                   <span
                     className="text-amber-600 shrink-0"
@@ -135,6 +184,8 @@ export function SegmentsBrowser({ projectId, codes, onNavigate }: Props) {
                     : coding.selected_text}&rdquo;
                 </p>
               </button>
+              {/* Field answers (none in a project without coding fields) */}
+              <CodingAnswers coding={coding} fields={codingFields} projectId={projectId} />
             </div>
           ))}
           <p className="text-xs text-gray-400 text-center py-1">

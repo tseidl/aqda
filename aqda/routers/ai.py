@@ -279,6 +279,36 @@ async def _generate_or_fail(
             generation.cancel()
 
 
+# Asked of the model in every prompt whose answer the researcher reads as running text.
+PLAIN_TEXT_INSTRUCTION = (
+    "Write plain text in short paragraphs. Do not use Markdown: no asterisks, no headings, "
+    "no bullet points."
+)
+
+
+def _plain_text(answer: str) -> str:
+    """Remove the Markdown a model wrote anyway, so the researcher reads clean text.
+
+    Answers are shown as plain text and copied into plain-text fields (a code's definition,
+    a memo), so emphasis marks, heading marks, and rules are dropped; paragraphs, list items
+    (as "- " lines), and numbered lines stay. Marks inside words (snake_case, 2*3) are kept.
+    """
+    lines = []
+    for line in answer.replace("\r\n", "\n").split("\n"):
+        if re.fullmatch(r"\s*([-*_=]\s*){3,}", line):
+            continue  # a horizontal rule
+        line = re.sub(r"^(\s*)#{1,6}\s+", r"\1", line)  # heading
+        line = re.sub(r"^(\s*)[*+•]\s+", r"\1- ", line)  # list item
+        lines.append(line.rstrip())
+    text = "\n".join(lines)
+    text = re.sub(r"(\*\*|__)(?=\S)(.+?)(?<=\S)\1", r"\2", text)  # bold
+    text = re.sub(r"(?<![\w*])\*(?=[^\s*])([^*\n]*?)(?<=[^\s*])\*(?![\w*])", r"\1", text)  # italics
+    text = re.sub(r"(?<![\w_])_(?=[^\s_])([^_\n]*?)(?<=[^\s_])_(?![\w_])", r"\1", text)
+    text = re.sub(r"`([^`\n]+)`", r"\1", text)  # code
+    text = text.replace("**", "")  # an emphasis mark left open, as in an answer cut short
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
 def _estimate_tokens(text: str) -> int:
     """Deliberately high token estimate for fitting passages into the model's window.
 
@@ -372,10 +402,57 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+# What ends a sentence inside running text (used to cut chunks at readable places).
+_SENTENCE_BREAKS = (". ", "? ", "! ", ".\n", "?\n", "!\n")
+
+
+def _last_break(window: str, minimum: int) -> int:
+    """Length of the longest piece of ``window`` that ends with a sentence, else a line, else a word.
+
+    Only breaks beyond ``minimum`` characters count, so a chunk never becomes very short;
+    0 means the window has no such break (one very long word, or a script without spaces).
+    """
+    for separators in (_SENTENCE_BREAKS, ("\n",), (" ",)):
+        cuts = [window.rfind(sep) + len(sep) for sep in separators if window.rfind(sep) > minimum]
+        if cuts:
+            return max(cuts)
+    return 0
+
+
+def _starts_sentence(text: str, pos: int) -> bool:
+    """Whether a sentence or line starts at ``pos`` (the text before it ends one)."""
+    return pos == 0 or text[pos - 1] == "\n" or text[max(0, pos - 2):pos] in _SENTENCE_BREAKS
+
+
+def _next_chunk_start(text: str, start: int, end: int, overlap: int) -> int:
+    """Where the chunk after ``text[start:end]`` begins, never in the middle of a word.
+
+    The next chunk repeats at most ``overlap`` characters, and only whole sentences when the
+    overlap holds a sentence start. A chunk that ended with a sentence is followed by the next
+    sentence without overlap. A chunk cut inside a sentence is followed by one that repeats its
+    last whole words. Only text without any spaces keeps the plain character overlap.
+    """
+    earliest = max(end - overlap, start + 1)
+    candidates = [pos for pos in range(earliest, end) if not text[pos].isspace()]
+    for pos in candidates:
+        if _starts_sentence(text, pos):
+            return pos
+    if _starts_sentence(text, end):
+        return end
+    for pos in candidates:
+        if text[pos - 1].isspace():
+            return pos
+    return end if text[end - 1].isspace() else earliest
+
+
 def _chunk_text(
     text: str, chunk_size: int = 500, overlap: int = 50, mode: str = "fixed"
 ) -> list[dict]:
-    """Split text into overlapping chunks, returning offset info."""
+    """Split text into chunks that start and end at sentence or word boundaries.
+
+    Offsets are Unicode code points and enclose exactly the chunk's text (no surrounding
+    whitespace), so a search result marks the passage the researcher reads.
+    """
     if mode == "paragraph":
         return _chunk_paragraphs(text, chunk_size, overlap)
     if chunk_size <= overlap:
@@ -383,27 +460,23 @@ def _chunk_text(
     chunks = []
     start = 0
     while start < len(text):
+        if text[start].isspace():
+            start += 1  # a chunk begins with its first word
+            continue
         end = min(start + chunk_size, len(text))
         if end < len(text):
-            for sep in [". ", ".\n", "\n\n", "\n", " "]:
-                last_sep = text[start:end].rfind(sep)
-                if last_sep > chunk_size // 2:
-                    end = start + last_sep + len(sep)
-                    break
-        chunk_text = text[start:end].strip()
+            cut = _last_break(text[start:end], chunk_size // 2)
+            if cut:
+                end = start + cut
+        chunk_text = text[start:end].rstrip()
         if chunk_text:
-            chunks.append({
-                "text": chunk_text,
-                "start": start,
-                "end": end,
-            })
+            chunks.append({"text": chunk_text, "start": start, "end": start + len(chunk_text)})
         # Last chunk reached — no overlap needed
         if end >= len(text):
             break
-        # Always advance. When overlap is large relative to a short (sentence-snapped)
-        # chunk, `end - overlap` can land at or before `start`; force forward progress
-        # so the loop can never spin forever.
-        start = max(end - overlap, start + 1)
+        # Always advance. Whatever the overlap and the boundaries found, the next chunk
+        # starts after this one's start, so the loop can never spin forever.
+        start = max(_next_chunk_start(text, start, end, overlap), start + 1)
     return chunks
 
 
@@ -806,15 +879,18 @@ async def suggest_codings(req: AutoCodeRequest):
         if not code:
             raise HTTPException(404, "Code not found")
 
+        # Examples come from hand codings only (`run_id IS NULL`), so a model run's
+        # codings never feed back into suggestions as if the researcher had made them.
         cursor = await db.execute(
             "SELECT c.selected_text FROM coding c JOIN document d ON d.id=c.document_id "
-            f"WHERE c.code_id=? AND c.deleted_at IS NULL AND {_INCLUDED_DOCUMENT_SQL} "
-            "ORDER BY c.id LIMIT 5",
+            "WHERE c.code_id=? AND c.deleted_at IS NULL AND c.run_id IS NULL "
+            f"AND {_INCLUDED_DOCUMENT_SQL} ORDER BY c.id LIMIT 5",
             (req.code_id,),
         )
         examples = await cursor.fetchall()
 
-        # Get all existing codings for this code (to filter out already-coded passages)
+        # Get all existing codings for this code (to filter out already-coded passages);
+        # model codings count here too, since their passages are already coded.
         cursor = await db.execute(
             "SELECT c.document_id, c.start_pos, c.end_pos "
             "FROM coding c JOIN document d ON c.document_id = d.id "
@@ -914,7 +990,7 @@ async def summarize_code(req: SummarizeCodeRequest):
             raise HTTPException(404, "Code not found")
 
         cursor = await db.execute(
-            "SELECT c.selected_text FROM coding c "
+            "SELECT c.selected_text, d.name AS document_name FROM coding c "
             "JOIN document d ON c.document_id = d.id "
             "WHERE c.code_id=? AND d.project_id=? AND c.deleted_at IS NULL "
             f"AND {_INCLUDED_DOCUMENT_SQL} ORDER BY d.name, d.id, c.start_pos",
@@ -938,21 +1014,26 @@ async def summarize_code(req: SummarizeCodeRequest):
         f"coded under the code '{code_name}'. The code is defined as: '{code_description}'. "
         "Synthesize these passages into a thematic summary. Identify key patterns, variations, "
         "and notable aspects across all the passages. Be analytical, not just descriptive. "
-        f"Write at most {SUMMARY_MAX_WORDS} words."
+        f"Write at most {SUMMARY_MAX_WORDS} words. {PLAIN_TEXT_INSTRUCTION} "
+        "The passages have no numbers the researcher could look up: never refer to a passage "
+        "by a number or by its position in the list. To point to a passage, quote a few of "
+        "its words or name the document it comes from."
     )
     think = settings.get("think_mode", "off") == "on"
-    passages = [seg["selected_text"] for seg in segments]
+    # Each passage is labelled with its document's name, which the researcher knows.
+    passages = [
+        f'From the document "{seg["document_name"]}": "{seg["selected_text"]}"'
+        for seg in segments
+    ]
     header = f"Here are {len(segments)} of {len(segments)} coded passages:\n\n"
-    wrapper = f'Passage {len(segments)}: ""\n\n---\n\n'
-    chosen = _fit_passages(passages, _prompt_budget(think, system, header), wrapper)
-    segment_texts = "\n\n---\n\n".join(
-        f'Passage {number}: "{passages[index]}"' for number, index in enumerate(chosen, 1)
-    )
+    separator = "\n\n---\n\n"
+    chosen = _fit_passages(passages, _prompt_budget(think, system, header), separator)
+    segment_texts = separator.join(passages[index] for index in chosen)
     prompt = f"Here are {len(chosen)} of {len(segments)} coded passages:\n\n{segment_texts}"
 
     response = await _generate_or_fail(prompt, llm_model, ollama_url, system, think, task)
     return {
-        "summary": response,
+        "summary": _plain_text(response),
         "segment_count": len(chosen),
         "total_segments": len(segments),
         "timing": dict(_last_generation),
@@ -1134,8 +1215,8 @@ def _normalise_hierarchy(parsed) -> dict | None:
             continue
         description = group.get("description")
         groups.append({
-            "suggested_parent": parent.strip(),
-            "description": description if isinstance(description, str) else "",
+            "suggested_parent": _plain_text(parent),
+            "description": _plain_text(description) if isinstance(description, str) else "",
             "children": children,
         })
     standalone = names(parsed.get("standalone"))
@@ -1231,15 +1312,13 @@ async def suggest_hierarchy(req: HierarchySuggestRequest):
     )
     think = settings.get("think_mode", "off") == "on"
     budget = _prompt_budget(think, system, instructions, "Codes:\n\n\n", response_format)
-    wrapper = f"{len(codes)}. \n"
+    wrapper = "- \n"  # no numbering: a model would hand the numbers back in place of names
     lines = [code_line(code, with_examples=True) for code in codes]
     examples_included = sum(_estimate_tokens(line + wrapper) for line in lines) <= budget
     if not examples_included:
         lines = [code_line(code, with_examples=False) for code in codes]
     chosen = _fit_passages(lines, budget, wrapper)
-    codes_text = "\n".join(
-        f"{number}. {lines[index]}" for number, index in enumerate(chosen, 1)
-    )
+    codes_text = "\n".join(f"- {lines[index]}" for index in chosen)
     prompt = f"{instructions}Codes:\n{codes_text}\n\n{response_format}"
     coverage = {
         "code_count": len(codes),
@@ -1306,11 +1385,14 @@ async def generate_definition(req: GenerateDefinitionRequest):
         if not code:
             raise HTTPException(404, "Code not found")
 
+        # A definition is written from hand codings only (`run_id IS NULL`): a model's
+        # codings should not shape the definition the next model run is given.
         cursor = await db.execute(
             "SELECT c.selected_text FROM coding c "
             "JOIN document d ON c.document_id = d.id "
             "WHERE c.code_id=? AND d.project_id=? AND c.deleted_at IS NULL "
-            f"AND {_INCLUDED_DOCUMENT_SQL} ORDER BY d.name, d.id, c.start_pos",
+            f"AND c.run_id IS NULL AND {_INCLUDED_DOCUMENT_SQL} "
+            "ORDER BY d.name, d.id, c.start_pos",
             (req.code_id, req.project_id),
         )
         segments = await cursor.fetchall()
@@ -1319,7 +1401,10 @@ async def generate_definition(req: GenerateDefinitionRequest):
 
     if not segments:
         return {
-            "definition": "No coded segments found for this code.",
+            "definition": (
+                "No passages coded by hand for this code. Codings from model runs are not "
+                "used for definitions."
+            ),
             "segment_count": 0,
             "total_segments": 0,
         }
@@ -1343,24 +1428,24 @@ async def generate_definition(req: GenerateDefinitionRequest):
         "- Captures the core meaning across all passages\n"
         "- Is specific enough to guide future coding decisions\n"
         "- Notes any important variations or sub-themes\n"
-        "- Is 2-4 sentences long"
+        "- Is 2-4 sentences long\n"
+        "- Does not refer to individual passages by number or position\n\n"
+        f"{PLAIN_TEXT_INSTRUCTION} Answer with the definition only."
     )
     think = settings.get("think_mode", "off") == "on"
     passages = [seg["selected_text"] for seg in segments]
-    wrapper = f'{len(segments)}. ""\n'
+    wrapper = '- ""\n'
     chosen = _fit_passages(
         passages,
         _prompt_budget(think, system, intro, "Coded passages:\n\n\n", guidance),
         wrapper,
     )
-    passage_lines = "\n".join(
-        f'{number}. "{passages[index]}"' for number, index in enumerate(chosen, 1)
-    )
+    passage_lines = "\n".join(f'- "{passages[index]}"' for index in chosen)
     prompt = f"{intro}Coded passages:\n{passage_lines}\n\n{guidance}"
 
     response = await _generate_or_fail(prompt, llm_model, ollama_url, system, think, task)
     return {
-        "definition": response,
+        "definition": _plain_text(response),
         "segment_count": len(chosen),
         "total_segments": len(segments),
         "timing": dict(_last_generation),

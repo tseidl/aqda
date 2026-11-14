@@ -11,7 +11,14 @@ import aiosqlite
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 
-from aqda.db import create_shared_update_backup, get_db
+from aqda.db import (
+    SNAPSHOT_FORMAT,
+    create_shared_update_backup,
+    get_db,
+    read_snapshot_format_async,
+)
+from aqda.services.coding_fields import project_has_runs_or_fields
+from aqda.services.coding_runs import refuse_while_run_in_progress
 
 router = APIRouter()
 
@@ -194,6 +201,61 @@ async def delete_project_permanent(project_id: int, force: bool = False):
         await db.close()
 
 
+class SnapshotFormatError(HTTPException):
+    """A project file this AQDA must not apply because of its content format.
+
+    Shared-folder sync catches it, shows the message in the project's status, and carries
+    on with other work instead of failing the whole pass.
+    """
+
+    def __init__(self, detail: str):
+        super().__init__(409, detail)
+
+
+NEWER_FORMAT_MESSAGE = (
+    "This project was saved by a newer version of AQDA. Update AQDA to open it or to "
+    "receive these changes."
+)
+
+
+# Message for a project whose runs or fields an older AQDA's version would drop.
+def older_format_message(project_name: str) -> str:
+    return (
+        f"“{project_name}” has model coding runs or coding fields, but the incoming version "
+        "was saved by an older AQDA that cannot keep them. It was not applied, so nothing "
+        "was lost. The collaborator needs to update AQDA."
+    )
+
+
+# Refuse a package written in a content format newer than this AQDA understands.
+async def _check_newer_format(src) -> int:
+    incoming_format = await read_snapshot_format_async(src)
+    if incoming_format > SNAPSHOT_FORMAT:
+        raise SnapshotFormatError(NEWER_FORMAT_MESSAGE)
+    return incoming_format
+
+
+# Refuse to replace a project whose runs or fields an older-format package cannot carry.
+async def _check_older_format(dst, incoming_format: int, project) -> None:
+    if incoming_format < SNAPSHOT_FORMAT and await project_has_runs_or_fields(
+        dst, project["id"]
+    ):
+        raise SnapshotFormatError(older_format_message(project["name"]))
+
+
+# Delete a project's content before a newer version is copied in (rows only, not the
+# project itself). Every table holding project content must be named here.
+async def _delete_project_contents(dst, project_id: int) -> None:
+    await dst.execute("DELETE FROM memo WHERE project_id=?", (project_id,))
+    # Documents take their codings (and those codings' field answers), variables, and
+    # run records with them.
+    await dst.execute("DELETE FROM document WHERE project_id=?", (project_id,))
+    await dst.execute("DELETE FROM coding_field WHERE project_id=?", (project_id,))
+    await dst.execute("DELETE FROM coding_run WHERE project_id=?", (project_id,))
+    await dst.execute("DELETE FROM code_deletion_batch WHERE project_id=?", (project_id,))
+    await dst.execute("DELETE FROM code WHERE project_id=?", (project_id,))
+
+
 def _value(row, key: str, default=None):
     """Read an optional column from an aiosqlite.Row (for legacy packages)."""
     try:
@@ -268,6 +330,123 @@ async def _classify_same_lineage(
         if local_snapshots.get(snapshot_id) == local_project["revision"]:
             return "update"
     return "conflict"
+
+
+async def _rows_if_table(src, sql: str, params) -> list:
+    """Run a query on a source package; a table it predates yields no rows."""
+    try:
+        return await (await src.execute(sql, params)).fetchall()
+    except aiosqlite.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return []
+        raise
+
+
+async def _copy_runs(
+    src, dst, source_project_id: int, target_project_id: int, doc_map: dict, code_map: dict
+) -> dict[int, int]:
+    """Copy model coding runs and their read documents; return the run ID map.
+
+    The run's uuid stays the same (programs address a run by it). Its captured codebook
+    is a historical record and is copied unchanged, including any IDs inside it.
+    """
+    run_map: dict[int, int] = {}
+    runs = await _rows_if_table(
+        src, "SELECT * FROM coding_run WHERE project_id=? ORDER BY id", (source_project_id,)
+    )
+    for run in runs:
+        cursor = await dst.execute(
+            "INSERT INTO coding_run (project_id, uuid, label, model, instructions, settings, "
+            "codebook, allow_new_codes, proposed_parent_code_id, status, note, started_at, "
+            "last_activity_at, finished_at, deleted_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                target_project_id,
+                _value(run, "uuid") or str(uuid.uuid4()),
+                _value(run, "label", "") or "",
+                _value(run, "model", "") or "",
+                _value(run, "instructions", "") or "",
+                _value(run, "settings", "{}") or "{}",
+                _value(run, "codebook"),
+                _value(run, "allow_new_codes", 0) or 0,
+                code_map.get(_value(run, "proposed_parent_code_id")),
+                _value(run, "status", "finished") or "finished",
+                _value(run, "note", "") or "",
+                _value(run, "started_at"),
+                _value(run, "last_activity_at"),
+                _value(run, "finished_at"),
+                _value(run, "deleted_at"),
+            ),
+        )
+        run_map[run["id"]] = cursor.lastrowid
+
+    if run_map:
+        placeholders = ",".join("?" * len(run_map))
+        rows = await _rows_if_table(
+            src,
+            f"SELECT * FROM coding_run_document WHERE run_id IN ({placeholders})",
+            list(run_map),
+        )
+        for row in rows:
+            new_doc = doc_map.get(row["document_id"])
+            if new_doc is None:
+                continue
+            await dst.execute(
+                "INSERT INTO coding_run_document (run_id, document_id, text_hash, "
+                "processed_at, submitted, accepted, refused, raw_response) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_map[row["run_id"]],
+                    new_doc,
+                    _value(row, "text_hash"),
+                    _value(row, "processed_at"),
+                    _value(row, "submitted", 0) or 0,
+                    _value(row, "accepted", 0) or 0,
+                    _value(row, "refused", "[]") or "[]",
+                    _value(row, "raw_response"),
+                ),
+            )
+    return run_map
+
+
+async def _copy_coding_fields(
+    src, dst, source_project_id: int, target_project_id: int, coding_map: dict
+) -> None:
+    """Copy a project's coding fields and the answers of the copied codings."""
+    fields = await _rows_if_table(
+        src, "SELECT * FROM coding_field WHERE project_id=? ORDER BY id", (source_project_id,)
+    )
+    field_map: dict[int, int] = {}
+    for field in fields:
+        cursor = await dst.execute(
+            "INSERT INTO coding_field (project_id, name, kind, sort_order, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                target_project_id,
+                field["name"],
+                _value(field, "kind", "text") or "text",
+                _value(field, "sort_order", 0) or 0,
+                _value(field, "created_at"),
+            ),
+        )
+        field_map[field["id"]] = cursor.lastrowid
+    if not field_map:
+        return
+    placeholders = ",".join("?" * len(field_map))
+    rows = await _rows_if_table(
+        src,
+        f"SELECT coding_id, field_id, value FROM coding_field_value "
+        f"WHERE field_id IN ({placeholders})",
+        list(field_map),
+    )
+    await dst.executemany(
+        "INSERT INTO coding_field_value (coding_id, field_id, value) VALUES (?, ?, ?)",
+        [
+            (coding_map[row["coding_id"]], field_map[row["field_id"]], row["value"])
+            for row in rows
+            if row["coding_id"] in coding_map
+        ],
+    )
 
 
 async def _copy_project_contents(
@@ -370,6 +549,8 @@ async def _copy_project_contents(
                 ),
             )
 
+    run_map = await _copy_runs(src, dst, source_project_id, target_project_id, doc_map, code_map)
+
     coding_map: dict[int, int] = {}
     if doc_map:
         placeholders = ",".join("?" * len(doc_map))
@@ -384,8 +565,8 @@ async def _copy_project_contents(
                 continue
             cursor = await dst.execute(
                 "INSERT INTO coding (document_id, code_id, start_pos, end_pos, selected_text, "
-                "coder, created_at, deleted_at, deletion_batch_id, offset_unit, repair_status) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "coder, created_at, deleted_at, deletion_batch_id, offset_unit, repair_status, "
+                "run_id, accepted_from_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_doc,
                     new_code,
@@ -398,9 +579,13 @@ async def _copy_project_contents(
                     batch_map.get(_value(coding, "deletion_batch_id")),
                     _value(coding, "offset_unit", "legacy_utf16") or "legacy_utf16",
                     _value(coding, "repair_status"),
+                    run_map.get(_value(coding, "run_id")),
+                    run_map.get(_value(coding, "accepted_from_run_id")),
                 ),
             )
             coding_map[coding["id"]] = cursor.lastrowid
+
+    await _copy_coding_fields(src, dst, source_project_id, target_project_id, coding_map)
 
     try:
         cursor = await src.execute("SELECT * FROM memo WHERE project_id=?", (source_project_id,))
@@ -543,8 +728,14 @@ async def import_package_bytes(
     content: bytes,
     mode: str = "auto",
     target_lineage_id: str | None = None,
+    copy_label: str = "conflicting copy",
 ):
-    """Internal import entry point used by uploads and shared-folder sync."""
+    """Internal import entry point used by uploads and shared-folder sync.
+
+    ``copy_label`` names a project kept beside the local one (mode "copy"): a file the
+    researcher imported stays a "conflicting copy", while shared-folder sync passes the
+    name its copy carries in the interface, "collaborator reference".
+    """
     if mode not in {"auto", "copy", "replace"}:
         raise HTTPException(400, "Import mode must be 'auto', 'copy', or 'replace'")
     if mode in {"copy", "replace"} and not target_lineage_id:
@@ -584,6 +775,8 @@ async def import_package_bytes(
                     "Not an AQDA project file. Expected an .aqda file "
                     "(from Export → Save a copy to send) or an AQDA database.",
                 )
+
+            incoming_format = await _check_newer_format(src)
 
             # Reserve the write slot before inspecting local ancestry. This keeps
             # classification, the pre-update backup, and replacement atomic with
@@ -653,6 +846,17 @@ async def import_package_bytes(
                 else:
                     plans.append(("copy" if mode == "copy" else "create", source_project, None, snapshots))
 
+            # Checked before the backup, so a refused update leaves no trace at all.
+            # Replacing a project re-creates every record ID, which a model run in
+            # progress would not survive; a new project from the file is always fine.
+            for action, _, local_project, _ in plans:
+                if action == "update":
+                    await refuse_while_run_in_progress(
+                        dst, [local_project["id"]],
+                        f"replace the contents of “{local_project['name']}”",
+                    )
+                    await _check_older_format(dst, incoming_format, local_project)
+
             if any(action == "update" for action, *_ in plans):
                 keep_row = await (
                     await dst.execute(
@@ -670,12 +874,7 @@ async def import_package_bytes(
                 if action == "update":
                     project_id = local_project["id"]
                     kept_embeddings = await _set_embeddings_aside(dst, project_id)
-                    await dst.execute("DELETE FROM memo WHERE project_id=?", (project_id,))
-                    await dst.execute("DELETE FROM document WHERE project_id=?", (project_id,))
-                    await dst.execute(
-                        "DELETE FROM code_deletion_batch WHERE project_id=?", (project_id,)
-                    )
-                    await dst.execute("DELETE FROM code WHERE project_id=?", (project_id,))
+                    await _delete_project_contents(dst, project_id)
                     await dst.execute(
                         "UPDATE project SET name=?, description=?, created_at=?, modified_at=?, "
                         "deleted_at=NULL, revision=?, head_snapshot_id=? WHERE id=?",
@@ -707,7 +906,7 @@ async def import_package_bytes(
                         )
                         creator = head.get("created_by", "")
                         source = f" from {creator}" if creator else ""
-                        suffix = f" (conflicting copy{source}, {stamp})"
+                        suffix = f" ({copy_label}{source}, {stamp})"
                     else:
                         lineage_id = incoming_lineage or str(uuid.uuid4())
                         revision = incoming_revision
@@ -803,6 +1002,7 @@ async def refresh_conflict_copy(
             raise HTTPException(400, "The collaboration snapshot is missing lineage data") from exc
         if not source_project:
             raise HTTPException(400, "The expected project is missing from the collaboration snapshot")
+        incoming_format = await _check_newer_format(src)
 
         await dst.execute("BEGIN IMMEDIATE")
         target = await (
@@ -810,14 +1010,13 @@ async def refresh_conflict_copy(
         ).fetchone()
         if not target:
             raise HTTPException(404, "Conflict copy no longer exists")
+        await refuse_while_run_in_progress(
+            dst, [target_project_id], f"update the reference copy “{target['name']}”"
+        )
+        await _check_older_format(dst, incoming_format, target)
 
         kept_embeddings = await _set_embeddings_aside(dst, target_project_id)
-        await dst.execute("DELETE FROM memo WHERE project_id=?", (target_project_id,))
-        await dst.execute("DELETE FROM document WHERE project_id=?", (target_project_id,))
-        await dst.execute(
-            "DELETE FROM code_deletion_batch WHERE project_id=?", (target_project_id,)
-        )
-        await dst.execute("DELETE FROM code WHERE project_id=?", (target_project_id,))
+        await _delete_project_contents(dst, target_project_id)
         await dst.execute(
             "DELETE FROM project_snapshot WHERE project_id=?", (target_project_id,)
         )

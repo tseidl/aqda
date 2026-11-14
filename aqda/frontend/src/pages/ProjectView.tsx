@@ -20,6 +20,7 @@ import type { MentionCandidate } from '../components/mentions';
 import { useSelectionRepair } from '../components/selectionRepair';
 import { CloseAqdaButton } from '../components/CloseAqdaButton';
 import { TableImportDialog } from '../components/TableImportDialog';
+import { RUN_PAUSE_PREFIX } from '../components/coderLayers';
 
 type Tab = 'codes' | 'documents' | 'memos' | 'segments' | 'ai';
 
@@ -120,9 +121,19 @@ export function ProjectView() {
       queryClient.invalidateQueries({ queryKey: ['codes-trash', projectId] });
       queryClient.invalidateQueries({ queryKey: ['codings'] });
       queryClient.invalidateQueries({ queryKey: ['memos', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['coding-fields', projectId] });
+      // A model run's new codings change the revision too; its counts follow.
+      queryClient.invalidateQueries({ queryKey: ['model-runs', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['model-run'] });
+      // An open merge confirmation states counts that may have changed.
+      queryClient.invalidateQueries({ queryKey: ['merge-impact'] });
     }
     lastProjectRevision.current = project.revision;
   }, [project?.revision, projectId, queryClient]);
+
+  // Sync waits while a model run is coding; the server says so in the sync status, which
+  // is shown as a notice rather than a problem.
+  const syncPausedForRun = Boolean(project?.shared_sync_error?.startsWith(RUN_PAUSE_PREFIX));
 
   const { data: sharedStatus, isLoading: sharedStatusLoading } = useQuery({
     queryKey: ['shared-status'],
@@ -198,6 +209,7 @@ export function ProjectView() {
       queryClient.invalidateQueries({ queryKey: ['codes', result.project_id] });
       queryClient.invalidateQueries({ queryKey: ['codings'] });
       queryClient.invalidateQueries({ queryKey: ['memos', result.project_id] });
+      queryClient.invalidateQueries({ queryKey: ['coding-fields', result.project_id] });
       alert(result.message);
       navigate(`/project/${result.project_id}`);
     },
@@ -407,13 +419,24 @@ export function ProjectView() {
     queryClient.invalidateQueries({ queryKey: ['codes', projectId] });
   };
 
+  // A one-click coding; the document view may explain a refusal itself (`explainRefusal`
+  // returns true then), e.g. when the same coding exists but is hidden in that view.
   const createCodingMut = useMutation({
-    mutationFn: codings.create,
+    mutationFn: ({ data }: {
+      data: Parameters<typeof codings.create>[0];
+      explainRefusal?: (error: unknown) => boolean;
+    }) => codings.create(data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['codings'] });
       queryClient.invalidateQueries({ queryKey: ['codes', projectId] });
     },
-    onError: (error) => showInFlightSaveError(error, 'coding'),
+    onError: (error, { explainRefusal }) => {
+      if (explainRefusal?.(error)) {
+        queryClient.invalidateQueries({ queryKey: ['codings'] });
+        return;
+      }
+      showInFlightSaveError(error, 'coding');
+    },
   });
 
   const deleteCodingMut = useMutation({
@@ -482,14 +505,18 @@ export function ProjectView() {
   }, [uploadMut]);
 
   const handleApplyCode = useCallback(
-    (codeId: number, startPos: number, endPos: number, text: string) => {
+    (codeId: number, startPos: number, endPos: number, text: string,
+      explainRefusal?: (error: unknown) => boolean) => {
       if (!selectedDocId) return;
       createCodingMut.mutate({
-        document_id: selectedDocId,
-        code_id: codeId,
-        start_pos: startPos,
-        end_pos: endPos,
-        selected_text: text,
+        data: {
+          document_id: selectedDocId,
+          code_id: codeId,
+          start_pos: startPos,
+          end_pos: endPos,
+          selected_text: text,
+        },
+        explainRefusal,
       });
     },
     [selectedDocId, createCodingMut]
@@ -585,11 +612,13 @@ export function ProjectView() {
           ) : project?.shared_folder ? (
             <div className="flex items-center gap-1">
               <span className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium ${
-                project.shared_sync_error
+                syncPausedForRun
+                  ? 'bg-blue-50 text-blue-800'
+                  : project.shared_sync_error
                   ? 'bg-amber-50 text-amber-800'
                   : 'bg-green-50 text-green-700'
-              }`} title={project.shared_folder}>
-                <Cloud size={14} /> {project.shared_sync_error ? 'Shared · attention' : project.revision === project.shared_last_published_revision ? 'Shared · saved' : 'Shared · saving'}
+              }`} title={project.shared_sync_error ?? project.shared_folder}>
+                <Cloud size={14} /> {syncPausedForRun ? 'Shared · waiting for model run' : project.shared_sync_error ? 'Shared · attention' : project.revision === project.shared_last_published_revision ? 'Shared · saved' : 'Shared · saving'}
               </span>
               <button
                 onClick={() => {
@@ -645,6 +674,11 @@ export function ProjectView() {
                   { label: 'REFI-QDA (.qdpx)', path: 'qdpx' },
                   { label: 'Codebook (.qdc)', path: 'qdc' },
                   { label: 'Codings (.csv)', path: 'csv' },
+                  {
+                    label: 'Statements (.csv)',
+                    path: 'statements',
+                    note: 'One row per coded segment, with document variables and coding fields',
+                  },
                   { label: 'Analysis Data (.json)', path: 'json' },
                 ].map((fmt) => (
                   <a
@@ -654,6 +688,7 @@ export function ProjectView() {
                     onClick={() => setShowExportMenu(false)}
                   >
                     {fmt.label}
+                    {fmt.note && <span className="block text-[11px] leading-snug text-gray-400 max-w-[220px]">{fmt.note}</span>}
                   </a>
                 ))}
               </div>
@@ -775,10 +810,17 @@ export function ProjectView() {
       )}
 
       {project?.shared_sync_error && (
-        <div className="shrink-0 flex items-start gap-3 border-b border-amber-200 bg-amber-50 px-4 py-2.5 text-sm text-amber-900">
-          <AlertTriangle size={17} className="mt-0.5 shrink-0" />
-          <span>{project.shared_sync_error}</span>
-        </div>
+        syncPausedForRun ? (
+          <div className="shrink-0 flex items-start gap-3 border-b border-blue-200 bg-blue-50 px-4 py-2.5 text-sm text-blue-950" data-sync-paused>
+            <Cloud size={17} className="mt-0.5 shrink-0" />
+            <span>{project.shared_sync_error}</span>
+          </div>
+        ) : (
+          <div className="shrink-0 flex items-start gap-3 border-b border-amber-200 bg-amber-50 px-4 py-2.5 text-sm text-amber-900">
+            <AlertTriangle size={17} className="mt-0.5 shrink-0" />
+            <span>{project.shared_sync_error}</span>
+          </div>
+        )
       )}
 
       {Boolean(project?.is_conflict_mirror) && (
@@ -1284,6 +1326,7 @@ export function ProjectView() {
               onDeleteCoding={(id) => deleteCodingMut.mutate(id)}
               onSelectCode={(id) => { setSelectedCodeId(id); setActiveTab('codes'); }}
               onAddMemo={handleAddMemo}
+              onOpenMemo={(id) => { setSelectedMemoId(id); setActiveTab('memos'); }}
               highlightRange={highlight}
               onHighlightClear={clearHighlight}
             />

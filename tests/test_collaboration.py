@@ -125,6 +125,7 @@ async def test_divergent_snapshot_never_overwrites_and_can_be_kept_as_copy(
         target_lineage_id=lineage_id,
     )
     assert kept["imported"][0]["action"] == "copy"
+    # A copy kept from an imported file is not a collaborator reference (no badge, no updates).
     assert "conflicting copy" in kept["imported"][0]["name"]
     assert kept["imported"][0]["lineage_id"] != lineage_id
     assert await project_count() == 2
@@ -281,7 +282,8 @@ async def test_migration_assigns_lineage_to_legacy_projects(tmp_path, use_data_d
     migrated = await project_row(1)
     assert migrated["lineage_id"]
     assert migrated["revision"] == 0
-    assert list((data_dir / "backups").glob("aqda-before-migration-v11-*.db"))
+    version = db_module.LATEST_SCHEMA_VERSION
+    assert list((data_dir / "backups").glob(f"aqda-before-migration-v{version}-*.db"))
 
 
 @pytest.mark.asyncio

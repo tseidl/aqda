@@ -63,6 +63,83 @@ def test_paragraph_chunking_keeps_lines_intact():
         assert text[chunk["start"]:chunk["end"]].strip() == chunk["text"]
 
 
+# Topic Search shows chunks as they are: none may start or end inside a word.
+def test_chunks_start_and_end_at_word_or_sentence_boundaries():
+    from aqda.routers.ai import _chunk_text
+
+    sentences = [
+        "The plant has a future if the investment actually comes.",
+        "I am not sure it will, though!",
+        "Do you think the owners care?",
+        "Nobody in the works council believes the announcements any more, because we have "
+        "heard them three times before and each time the money went somewhere else instead.",
+        "Über die Zukunft 🙂 spricht hier niemand mehr.",
+    ]
+    text = " ".join(sentences * 8)
+    words = set(text.split())
+    for chunk_size, overlap in [(500, 50), (200, 50), (200, 150), (120, 100), (100, 0)]:
+        chunks = _chunk_text(text, chunk_size, overlap)
+        assert len(chunks) > 3
+        for chunk in chunks:
+            # Offsets are code points (Python string indices) and enclose the text exactly.
+            assert text[chunk["start"]:chunk["end"]] == chunk["text"]
+            assert len(chunk["text"]) <= chunk_size
+            pieces = chunk["text"].split()
+            assert pieces[0] in words and pieces[-1] in words, chunk["text"]
+        # Nothing is left out between two chunks, and every chunk moves forward.
+        for before, after in zip(chunks, chunks[1:]):
+            assert before["start"] < after["start"] <= before["end"] + 1
+        assert chunks[0]["start"] == 0 and chunks[-1]["end"] == len(text)
+
+    # With sentences shorter than the chunk, every chunk starts with a sentence.
+    starts = tuple(sentences)
+    assert all(chunk["text"].startswith(starts) for chunk in _chunk_text(text, 500, 50))
+    # An overlap that holds a whole sentence repeats that sentence, not a fragment of one.
+    overlapping = _chunk_text(text, 500, 200)
+    assert any(after["start"] < before["end"] for before, after in zip(overlapping, overlapping[1:]))
+    assert all(chunk["text"].startswith(starts) for chunk in overlapping)
+
+
+# The chunker once looped forever when the overlap reached back to the chunk's own start.
+@pytest.mark.parametrize("chunk_size, overlap", [(10, 9), (5, 50), (3, 2), (1, 0), (0, 0), (50, 49)])
+def test_chunker_always_moves_forward(chunk_size, overlap):
+    from aqda.routers.ai import _chunk_text
+
+    for text in ["word " * 40, "Short. " * 30, "a" * 120, "字" * 120, "x\n\n\n" * 20, " " * 50, ""]:
+        chunks = _chunk_text(text, chunk_size, overlap)
+        assert len(chunks) <= len(text)
+        starts = [chunk["start"] for chunk in chunks]
+        assert starts == sorted(set(starts))
+        for chunk in chunks:
+            assert text[chunk["start"]:chunk["end"]] == chunk["text"]
+
+
+# Models write Markdown whatever the prompt says; the researcher reads plain text.
+def test_markdown_is_removed_from_model_answers():
+    from aqda.routers.ai import LENGTH_LIMIT_NOTE, _plain_text
+
+    answer = (
+        "### **Key patterns**\n\n"
+        "Workers show **ritualistic engagement** with *formal* consultation and "
+        "__distrust__ of _management_.\n\n"
+        "* **Hollow promises:** announcements are `empty`.\n"
+        "- The variable works_council_role and 2 * 3 * 4 stay as they are.\n\n"
+        "---\n\n"
+        "1. A numbered line stays.\n\n\n\n"
+        "The answer was cut **short"
+    )
+    assert _plain_text(answer) == (
+        "Key patterns\n\n"
+        "Workers show ritualistic engagement with formal consultation and "
+        "distrust of management.\n\n"
+        "- Hollow promises: announcements are empty.\n"
+        "- The variable works_council_role and 2 * 3 * 4 stay as they are.\n\n"
+        "1. A numbered line stays.\n\n"
+        "The answer was cut short"
+    )
+    assert _plain_text("Plain answer." + LENGTH_LIMIT_NOTE) == "Plain answer." + LENGTH_LIMIT_NOTE
+
+
 @pytest.mark.asyncio
 async def test_cancel_flag_stops_the_next_embedding_batch():
     from fastapi import HTTPException
@@ -263,7 +340,9 @@ async def test_excluded_documents_are_ignored_by_every_ai_feature(
 
     async def generate(prompt, model, ollama_url, system="", think=False, task=None):
         prompts.append(system + prompt)
-        return '{"groups": [], "standalone": ["Trust"]}'
+        if "Return ONLY valid JSON" in prompt:
+            return '{"groups": [], "standalone": ["Trust"]}'
+        return "**Trust** is *earned*, as Passage 1 shows."
 
     embedded = []
 
@@ -292,6 +371,14 @@ async def test_excluded_documents_are_ignored_by_every_ai_feature(
     assert '"Trust" (2 segments)' in prompts[2]
     # A summary without a length limit runs to a thousand words and takes minutes.
     assert f"Write at most {ai.SUMMARY_MAX_WORDS} words." in prompts[0]
+    # Passages are labelled with their document, not with a number the researcher never
+    # sees, and Markdown the model writes anyway is removed from what the researcher reads.
+    assert 'From the document "interview.txt": "Interview passage one."' in prompts[0]
+    for prompt in prompts:
+        assert "Passage 1" not in prompt and '1. "' not in prompt
+    assert ai.PLAIN_TEXT_INSTRUCTION in prompts[0] and ai.PLAIN_TEXT_INSTRUCTION in prompts[1]
+    assert summary["summary"] == "Trust is earned, as Passage 1 shows."
+    assert definition["definition"] == "Trust is earned, as Passage 1 shows."
     assert all("Guide example" not in text for text in embedded)
     assert any("Interview passage one." in text for text in embedded)
     assert (summary["segment_count"], summary["total_segments"]) == (2, 2)
@@ -420,7 +507,7 @@ def test_hierarchy_answer_is_brought_into_shape():
 
     answer = {
         "groups": [
-            {"suggested_parent": "Institutions", "description": "d", "codes": ["Trust", 7, ""]},
+            {"suggested_parent": "**Institutions**", "description": "d", "codes": ["Trust", 7, ""]},
             {"suggested_parent": "No codes"},
             {"children": ["Orphan"]},
             "not a group",

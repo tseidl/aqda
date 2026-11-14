@@ -17,6 +17,15 @@ mark[data-color]:hover {
   filter: brightness(0.9);
 }
 
+/* A passage with a memo: a quiet dotted underline. It sits closer to the text than the
+   solid line under a coded passage, so both show when a passage carries a code and a memo. */
+.memo-passage {
+  text-decoration: underline dotted #6b7280;
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
 /* AI search highlight — pulse then settle */
 /* The passage whose coding popup is open (DocumentViewer). */
 ::highlight(aqda-pending-passage) {

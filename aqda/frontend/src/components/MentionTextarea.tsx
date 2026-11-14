@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ChangeEvent, type MouseEvent, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react';
 import type { MentionCandidate } from './mentions';
 
 /** Render text with `@Label` mentions underlined/coloured. Mention styling only
@@ -122,6 +122,9 @@ export function MentionTextarea({
   const taRef = useRef<HTMLTextAreaElement>(null);
   const backdropRef = useRef<HTMLDivElement>(null);
   const [mention, setMention] = useState<{ query: string; start: number } | null>(null);
+  // The entry of the reference list that Enter or Tab inserts; the arrow keys move it.
+  const [activeIdx, setActiveIdx] = useState(0);
+  const listRef = useRef<HTMLDivElement>(null);
   const labels = useMemo(() => candidates.map((c) => c.label).filter(Boolean), [candidates]);
 
   // Focus on mount without scrolling the page (the attribute would scroll the field into view).
@@ -130,6 +133,7 @@ export function MentionTextarea({
   const detect = (v: string, caret: number) => {
     const m = v.slice(0, caret).match(/(?:^|\s)@([^\s@]*)$/);
     setMention(m ? { query: m[1], start: caret - m[1].length - 1 } : null);
+    setActiveIdx(0);  // typing filters the list, so the first match is highlighted again
   };
 
   const handleChange = (e: ChangeEvent<HTMLTextAreaElement>) => {
@@ -155,6 +159,30 @@ export function MentionTextarea({
     ? candidates.filter((c) => c.label.toLowerCase().includes(mention.query.toLowerCase())).slice(0, 7)
     : [];
 
+  const active = Math.min(activeIdx, matches.length - 1);
+
+  // Keep the highlighted entry in view while the arrow keys move through a long list.
+  useEffect(() => {
+    listRef.current?.children[active]?.scrollIntoView?.({ block: 'nearest' });
+  }, [active]);
+
+  // While the reference list is open: arrows move through it, Enter or Tab inserts the
+  // highlighted entry, Escape closes it. Every other key types (and filters) as usual.
+  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (!mention || e.nativeEvent.isComposing) return;
+    if (e.key === 'Escape') { e.stopPropagation(); setMention(null); return; }
+    if (matches.length === 0) return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const step = e.key === 'ArrowDown' ? 1 : -1;
+      setActiveIdx((active + step + matches.length) % matches.length);
+    } else if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') {
+      e.preventDefault();
+      e.stopPropagation();
+      insert(matches[active]);
+    }
+  };
+
   const syncScroll = () => {
     if (backdropRef.current && taRef.current) {
       backdropRef.current.scrollTop = taRef.current.scrollTop;
@@ -179,21 +207,28 @@ export function MentionTextarea({
         onScroll={syncScroll}
         onMouseDown={onTextareaMouseDown}
         onBlur={onBlur}
-        onKeyDown={(e) => { if (e.key === 'Escape' && mention) { e.stopPropagation(); setMention(null); } }}
+        onKeyDown={handleKeyDown}
         placeholder={placeholder}
         rows={fill ? undefined : rows}
         className={`relative ${fill ? 'flex-1' : 'w-full'} bg-transparent resize-none focus:outline-none whitespace-pre-wrap break-words ${textClassName}`}
         style={{ color: 'transparent', caretColor: '#111827', scrollbarGutter: 'stable' }}
       />
       {mention && matches.length > 0 && (
-        <div className={`absolute left-1 right-1 z-50 max-h-44 overflow-auto bg-white border border-gray-200 rounded-md shadow-lg ${fill ? 'bottom-1' : 'top-full mt-1'}`}>
-          {matches.map((c) => (
+        <div
+          ref={listRef}
+          role="listbox"
+          className={`absolute left-1 right-1 z-50 max-h-44 overflow-auto bg-white border border-gray-200 rounded-md shadow-lg ${fill ? 'bottom-1' : 'top-full mt-1'}`}
+        >
+          {matches.map((c, i) => (
             <button
               key={c.id}
               type="button"
+              role="option"
+              aria-selected={i === active}
               onMouseDown={(e) => e.preventDefault()}
+              onMouseMove={() => setActiveIdx(i)}
               onClick={() => insert(c)}
-              className="w-full text-left px-2 py-1.5 text-sm hover:bg-indigo-50 flex items-center gap-2"
+              className={`w-full text-left px-2 py-1.5 text-sm flex items-center gap-2 ${i === active ? 'bg-indigo-50' : ''}`}
             >
               {c.kind === 'code' ? (
                 <span className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ backgroundColor: c.color ?? '#6366f1' }} />

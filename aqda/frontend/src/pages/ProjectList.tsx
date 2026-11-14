@@ -4,6 +4,7 @@ import { useNavigate, Link } from 'react-router-dom';
 import { Plus, FolderOpen, Trash2, Settings, FileText, Tags, Upload, RotateCcw, ChevronDown, X, AlertTriangle, Cloud, RefreshCw } from 'lucide-react';
 import { projects, shared, type Project, type ProjectImportConflict } from '../api';
 import { CloseAqdaButton } from '../components/CloseAqdaButton';
+import { RUN_PAUSE_PREFIX } from '../components/coderLayers';
 
 /** SQLite stores UTC timestamps as "YYYY-MM-DD HH:MM:SS"; Safari rejects that form
  *  and Chrome reads it as local time, so make the UTC marker explicit. Imported rows
@@ -503,14 +504,16 @@ export function ProjectList() {
                       </span>
                     ) : p.shared_folder && (
                       <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium ${
-                        p.shared_sync_error
+                        p.shared_sync_error?.startsWith(RUN_PAUSE_PREFIX)
+                          ? 'bg-blue-100 text-blue-700'
+                          : p.shared_sync_error
                           ? 'bg-amber-100 text-amber-800'
                           : p.revision === p.shared_last_published_revision
                             ? 'bg-green-100 text-green-700'
                             : 'bg-blue-100 text-blue-700'
                       }`}>
                         <Cloud size={11} />
-                        {p.shared_sync_error ? 'Needs attention' : p.revision === p.shared_last_published_revision ? 'Shared · saved' : 'Shared · saving'}
+                        {p.shared_sync_error?.startsWith(RUN_PAUSE_PREFIX) ? 'Waiting for model run' : p.shared_sync_error ? 'Needs attention' : p.revision === p.shared_last_published_revision ? 'Shared · saved' : 'Shared · saving'}
                       </span>
                     )}
                   </div>
@@ -518,7 +521,7 @@ export function ProjectList() {
                     <p className="text-sm text-gray-500 mt-0.5">{p.description}</p>
                   )}
                   {p.shared_sync_error && (
-                    <p className="text-xs text-amber-700 mt-1">{p.shared_sync_error}</p>
+                    <p className={`text-xs mt-1 ${p.shared_sync_error.startsWith(RUN_PAUSE_PREFIX) ? 'text-blue-700' : 'text-amber-700'}`}>{p.shared_sync_error}</p>
                   )}
                   <div className="flex gap-4 mt-2 text-xs text-gray-400">
                     <span className="flex items-center gap-1"><FileText size={12} /> {p.doc_count ?? 0} docs</span>

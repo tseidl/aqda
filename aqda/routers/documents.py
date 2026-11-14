@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 
 from aqda.db import get_db, MAX_UPLOAD_BYTES, touch_project, touch_projects
+from aqda.services.document_text import codeable_text, text_hash
 from aqda.services.tables import read_table, suggest_text_column, table_extension, xlsx_sheet_names
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
@@ -657,6 +658,38 @@ async def get_document(document_id: int):
         d = dict(row)
         d["variables"] = await _get_doc_variables(db, document_id)
         return d
+    finally:
+        await db.close()
+
+
+@router.get("/{document_id}/text")
+async def get_document_text(document_id: int):
+    """Return the text codings point into, with its length and a fingerprint.
+
+    Programs that code documents (model runs) read the text here and send the fingerprint
+    back, so AQDA can refuse their passages if the text has changed in between.
+    """
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute(
+                "SELECT id, project_id, name, content, transcript, source_type, "
+                "exclude_from_ai FROM document WHERE id=?",
+                (document_id,),
+            )
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Document not found")
+        text = codeable_text(row)
+        return {
+            "document_id": row["id"],
+            "project_id": row["project_id"],
+            "name": row["name"],
+            "exclude_from_ai": bool(row["exclude_from_ai"]),
+            "text": text,
+            "length": len(text),
+            "text_hash": text_hash(text),
+        }
     finally:
         await db.close()
 

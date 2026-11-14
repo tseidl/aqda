@@ -10,6 +10,7 @@ import {
   type GenerationTiming,
 } from '../api';
 import { AnswerTiming, GenerationProgress } from './GenerationProgress';
+import { ModelRunsEntry, ModelRunsPanel } from './ModelRunsPanel';
 
 interface Props {
   projectId: number;
@@ -164,6 +165,9 @@ export function AiPanel({ projectId, codes, active, onNavigate }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  // The list of model runs replaces the tools while open; the tools stay mounted (hidden),
+  // so a running task and its results are kept.
+  const [showRuns, setShowRuns] = useState(false);
 
   // Results (typed per mode)
   const [similarResults, setSimilarResults] = useState<SimilarResult[]>([]);
@@ -452,7 +456,11 @@ export function AiPanel({ projectId, codes, active, onNavigate }: Props) {
   const codebookModes = MODES.filter((m) => m.group === 'codebook');
 
   return (
-    <div className="p-2 flex flex-col h-full">
+    <div className="flex flex-col h-full">
+    {showRuns && (
+      <ModelRunsPanel projectId={projectId} onOpenDocument={(docId) => onNavigate(docId)} onClose={() => setShowRuns(false)} />
+    )}
+    <div className={`p-2 flex flex-col flex-1 min-h-0 ${showRuns ? 'hidden' : ''}`}>
       {/* Header with Ollama status */}
       <div className="px-1 mb-3 flex items-center justify-between">
         <span className="text-xs font-medium text-gray-500 uppercase tracking-wide flex items-center gap-1.5">
@@ -858,6 +866,8 @@ export function AiPanel({ projectId, codes, active, onNavigate }: Props) {
           </div>
         )}
       </div>
+    </div>
+    {!showRuns && <ModelRunsEntry projectId={projectId} onOpen={() => setShowRuns(true)} />}
     </div>
   );
 }

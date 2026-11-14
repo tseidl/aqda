@@ -17,7 +17,8 @@ from xml.etree.ElementTree import Element, SubElement, tostring
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
-from aqda.db import get_db, SCHEMA
+from aqda.db import SCHEMA, SNAPSHOT_FORMAT, get_db
+from aqda.services.coding_fields import field_answers_by_id, project_fields
 
 router = APIRouter()
 
@@ -471,6 +472,124 @@ async def export_csv(project_id: int):
     )
 
 
+STATEMENT_COLUMNS = [
+    "document", "code", "code_path", "coder", "run", "model", "accepted_from_run",
+    "start_pos", "end_pos", "text", "created_at",
+]
+
+
+# Make column headers unique, ignoring case, by numbering later repeats deterministically.
+def _unique_headers(headers: list[str]) -> list[str]:
+    """Collapse whitespace in each header; a repeat becomes ``name_2``, ``name_3``, ..."""
+    used: set[str] = set()
+    unique = []
+    for header in headers:
+        base = " ".join(header.split())
+        candidate, number = base, 1
+        while candidate.casefold() in used:
+            number += 1
+            candidate = f"{base}_{number}"
+        used.add(candidate.casefold())
+        unique.append(candidate)
+    return unique
+
+
+# Join a code's name with its ancestors' names from the top, as the code tree shows it.
+def _code_path(code_id: int, codes: dict[int, dict]) -> str:
+    """A code whose parent is in the trash is shown at the top level, so its path starts there."""
+    names: list[str] = []
+    seen: set[int] = set()
+    current = codes.get(code_id)
+    while current is not None and current["id"] not in seen:
+        seen.add(current["id"])
+        names.append(current["name"])
+        parent = codes.get(current["parent_id"])
+        current = parent if parent is not None and parent["deleted_at"] is None else None
+    return " > ".join(reversed(names))
+
+
+@router.get("/{project_id}/statements")
+async def export_statements(project_id: int):
+    """Export one row per active coding with document variables and coding field answers.
+
+    Meant for analysis elsewhere (for example discourse networks): each coding is one
+    statement. Yes/no answers are 1 or 0; an unanswered field is empty.
+    """
+    db = await get_db()
+    try:
+        project = await (
+            await db.execute("SELECT id, name FROM project WHERE id=?", (project_id,))
+        ).fetchone()
+        if not project:
+            raise HTTPException(404, "Project not found")
+        codes = {
+            row["id"]: dict(row)
+            for row in await (
+                await db.execute(
+                    "SELECT id, parent_id, name, deleted_at FROM code WHERE project_id=?",
+                    (project_id,),
+                )
+            ).fetchall()
+        }
+        # Active: not removed itself, its code not in the trash, its run not removed.
+        codings = await (
+            await db.execute(
+                "SELECT cg.id, cg.document_id, cg.code_id, cg.coder, cg.start_pos, cg.end_pos, "
+                "cg.selected_text, cg.created_at, d.name AS document_name, "
+                "c.name AS code_name, r.label AS run_label, r.model AS run_model, "
+                "ar.label AS accepted_from_run_label "
+                "FROM coding cg JOIN code c ON c.id=cg.code_id "
+                "JOIN document d ON d.id=cg.document_id "
+                "LEFT JOIN coding_run r ON r.id=cg.run_id "
+                "LEFT JOIN coding_run ar ON ar.id=cg.accepted_from_run_id "
+                "WHERE d.project_id=? AND cg.deleted_at IS NULL AND c.deleted_at IS NULL "
+                "AND r.deleted_at IS NULL "
+                "ORDER BY d.name, d.id, cg.start_pos, cg.id",
+                (project_id,),
+            )
+        ).fetchall()
+        fields = await project_fields(db, project_id)
+        answers = await field_answers_by_id(db, [row["id"] for row in codings])
+    finally:
+        await db.close()
+    variables = await _load_document_variables(project_id)
+    keys = sorted({key for document_variables in variables.values() for key in document_variables})
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(_unique_headers(
+        STATEMENT_COLUMNS
+        + [f"var_{key}" for key in keys]
+        + [f"field_{field['name']}" for field in fields]
+    ))
+    for coding in codings:
+        document_variables = variables.get(coding["document_id"], {})
+        coding_answers = answers.get(coding["id"], {})
+        writer.writerow([
+            coding["document_name"],
+            coding["code_name"],
+            _code_path(coding["code_id"], codes),
+            coding["coder"] or "",
+            coding["run_label"] or "",
+            coding["run_model"] or "",
+            coding["accepted_from_run_label"] or "",
+            coding["start_pos"],
+            coding["end_pos"],
+            coding["selected_text"],
+            coding["created_at"],
+            *(document_variables.get(key, "") for key in keys),
+            *(coding_answers.get(field["id"], "") for field in fields),
+        ])
+
+    content = buf.getvalue().encode("utf-8-sig")
+    filename = f"{project['name'].replace(' ', '_')}_statements.csv"
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="text/csv",
+        headers=_download_headers(filename),
+    )
+
+
 @router.get("/{project_id}/json")
 async def export_json(project_id: int):
     """Export analysis-oriented project data as JSON (not an archive format)."""
@@ -577,6 +696,7 @@ async def build_aqda_snapshot(project_id: int) -> tuple[bytes, dict, str]:
             (project_id,),
         )
         deletion_batches = [dict(row) for row in await cursor.fetchall()]
+        run_content = await _load_run_and_field_content(db, project_id)
         await db.commit()
     except Exception:
         if db.in_transaction:
@@ -591,9 +711,43 @@ async def build_aqda_snapshot(project_id: int) -> tuple[bytes, dict, str]:
     data = await asyncio.to_thread(
         _write_standalone_snapshot,
         project, documents, codes, codings, memos,
-        doc_vars, snapshot_history, deletion_batches,
+        doc_vars, snapshot_history, deletion_batches, run_content,
     )
     return data, project, snapshot_id
+
+
+async def _load_run_and_field_content(db, project_id: int) -> dict[str, list[dict]]:
+    """Load a project's model coding runs, their read documents, fields, and answers."""
+    runs = await (
+        await db.execute("SELECT * FROM coding_run WHERE project_id=? ORDER BY id", (project_id,))
+    ).fetchall()
+    run_documents = await (
+        await db.execute(
+            "SELECT rd.* FROM coding_run_document rd JOIN coding_run r ON r.id=rd.run_id "
+            "WHERE r.project_id=? ORDER BY rd.run_id, rd.document_id",
+            (project_id,),
+        )
+    ).fetchall()
+    fields = await (
+        await db.execute(
+            "SELECT * FROM coding_field WHERE project_id=? ORDER BY sort_order, id",
+            (project_id,),
+        )
+    ).fetchall()
+    field_values = await (
+        await db.execute(
+            "SELECT v.coding_id, v.field_id, v.value FROM coding_field_value v "
+            "JOIN coding_field f ON f.id=v.field_id WHERE f.project_id=? "
+            "ORDER BY v.coding_id, v.field_id",
+            (project_id,),
+        )
+    ).fetchall()
+    return {
+        "runs": [dict(row) for row in runs],
+        "run_documents": [dict(row) for row in run_documents],
+        "fields": [dict(row) for row in fields],
+        "field_values": [dict(row) for row in field_values],
+    }
 
 
 def _write_standalone_snapshot(
@@ -605,14 +759,21 @@ def _write_standalone_snapshot(
     doc_vars: list[dict],
     snapshot_history: list[dict],
     deletion_batches: list[dict],
+    run_content: dict[str, list[dict]] | None = None,
 ) -> bytes:
     """Write one project into a fresh single-project database and return its bytes."""
+    run_content = run_content or {}
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
     tmp.close()
     con = None
     try:
         con = sqlite3.connect(tmp.name)
         con.executescript(SCHEMA)
+        # The content format tells an importing AQDA what this file can carry.
+        con.execute(
+            "INSERT OR REPLACE INTO setting (key, value) VALUES ('snapshot_format', ?)",
+            (str(SNAPSHOT_FORMAT),),
+        )
 
         # Insert project with id=1
         con.execute(
@@ -687,6 +848,34 @@ def _write_standalone_snapshot(
                  code.get("deletion_batch_id")),
             )
 
+        # Model coding runs and the documents each one read; the uuid and the captured
+        # codebook are kept as they are.
+        run_map: dict[int, int] = {}
+        for i, run in enumerate(run_content.get("runs", []), 1):
+            run_map[run["id"]] = i
+            con.execute(
+                "INSERT INTO coding_run (id, project_id, uuid, label, model, instructions, "
+                "settings, codebook, allow_new_codes, proposed_parent_code_id, status, note, "
+                "started_at, last_activity_at, finished_at, deleted_at) "
+                "VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (i, run["uuid"], run["label"], run["model"], run["instructions"],
+                 run["settings"], run["codebook"], run["allow_new_codes"],
+                 code_map.get(run["proposed_parent_code_id"]), run["status"], run["note"],
+                 run["started_at"], run["last_activity_at"], run["finished_at"],
+                 run["deleted_at"]),
+            )
+        for row in run_content.get("run_documents", []):
+            new_run = run_map.get(row["run_id"])
+            new_doc = doc_map.get(row["document_id"])
+            if new_run and new_doc:
+                con.execute(
+                    "INSERT INTO coding_run_document (run_id, document_id, text_hash, "
+                    "processed_at, submitted, accepted, refused, raw_response) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (new_run, new_doc, row["text_hash"], row["processed_at"],
+                     row["submitted"], row["accepted"], row["refused"], row["raw_response"]),
+                )
+
         # Codings
         coding_map: dict[int, int] = {}
         for cg in codings:
@@ -695,14 +884,34 @@ def _write_standalone_snapshot(
             if new_doc and new_code:
                 cursor = con.execute(
                     "INSERT INTO coding (document_id, code_id, start_pos, end_pos, selected_text, "
-                    "coder, created_at, deleted_at, deletion_batch_id, offset_unit, repair_status) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "coder, created_at, deleted_at, deletion_batch_id, offset_unit, repair_status, "
+                    "run_id, accepted_from_run_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (new_doc, new_code, cg["start_pos"], cg["end_pos"], cg["selected_text"],
                      cg.get("coder", ""), cg["created_at"], cg.get("deleted_at"),
                      cg.get("deletion_batch_id"), cg.get("offset_unit", "codepoint"),
-                     cg.get("repair_status")),
+                     cg.get("repair_status"), run_map.get(cg.get("run_id")),
+                     run_map.get(cg.get("accepted_from_run_id"))),
                 )
                 coding_map[cg["id"]] = cursor.lastrowid
+
+        # Coding fields and the answers of the exported codings
+        field_map: dict[int, int] = {}
+        for i, field in enumerate(run_content.get("fields", []), 1):
+            field_map[field["id"]] = i
+            con.execute(
+                "INSERT INTO coding_field (id, project_id, name, kind, sort_order, created_at) "
+                "VALUES (?, 1, ?, ?, ?, ?)",
+                (i, field["name"], field["kind"], field["sort_order"], field["created_at"]),
+            )
+        for value in run_content.get("field_values", []):
+            new_coding = coding_map.get(value["coding_id"])
+            new_field = field_map.get(value["field_id"])
+            if new_coding and new_field:
+                con.execute(
+                    "INSERT INTO coding_field_value (coding_id, field_id, value) VALUES (?, ?, ?)",
+                    (new_coding, new_field, value["value"]),
+                )
 
         # Memos
         for memo in memos:

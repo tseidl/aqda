@@ -47,6 +47,26 @@ async def project_rows():
         await db.close()
 
 
+# Settings says what its backup count holds: a new installation has a daily backup, which
+# is not a backup made before a collaborator update.
+@pytest.mark.asyncio
+async def test_backups_are_counted_by_purpose(tmp_path, use_data_dir):
+    use_data_dir(tmp_path / "fresh")
+    await db_module.init_db()
+    assert (await shared_router.shared_status())["backup_count"] == 0
+
+    db_module.create_daily_backup()
+    status = await shared_router.shared_status()
+    assert status["backup_count"] == 1
+    assert status["backup_counts"] == {"daily": 1, "before_collaborator_update": 0, "other": 0}
+
+    db_module.create_shared_update_backup(keep=10)
+    db_module.create_merge_backup()
+    status = await shared_router.shared_status()
+    assert status["backup_count"] == 3
+    assert status["backup_counts"] == {"daily": 1, "before_collaborator_update": 1, "other": 1}
+
+
 @pytest.mark.asyncio
 async def test_shared_folder_opens_once_then_syncs_both_directions(tmp_path, use_data_dir):
     shared_root = tmp_path / "Google Drive" / "AQDA"
@@ -279,6 +299,10 @@ async def test_simultaneous_shared_edits_keep_both_versions(tmp_path, use_data_d
     assert original["description"] == "Bob branch"
     assert "single local reference copy" in original["shared_sync_error"]
     assert len(list(shared_root.glob("*.aqda-project"))) == 1
+    # The copy is named like its badge in the interface, a collaborator reference.
+    reference = result["conflicts"][0]["name"]
+    assert reference.startswith("Parallel study (collaborator reference")
+    assert "conflicting copy" not in reference
 
     # One collaborator can keep publishing while the other remains divergent.
     # The existing reference copy advances; neither local projects nor shared
@@ -393,3 +417,61 @@ async def test_sharing_can_be_stopped_when_the_folder_is_gone(tmp_path, use_data
     assert refused.value.status_code == 409
     await projects.delete_project_permanent(trashed["id"], force=True)
     assert await project_row(trashed["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_a_refused_reference_copy_refresh_is_retried(tmp_path, use_data_dir):
+    import uuid
+
+    shared_root = tmp_path / "Drive"
+    alice_data = use_data_dir(tmp_path / "alice")
+    await db_module.init_db()
+    await set_shared_root(str(shared_root))
+    alice = await projects.create_project(projects.ProjectCreate(name="Parallel study"))
+    folder = Path((await share_project(alice["id"]))["folder"])
+
+    bob_data = use_data_dir(tmp_path / "bob")
+    await db_module.init_db()
+    await set_shared_root(str(shared_root))
+    bob = (await open_shared_project(str(folder)))["project_id"]
+
+    use_data_dir(alice_data)
+    await projects.update_project(alice["id"], projects.ProjectUpdate(description="Alice 1"))
+    await sync_project(alice["id"])
+    use_data_dir(bob_data)
+    await projects.update_project(bob, projects.ProjectUpdate(description="Bob branch"))
+    assert len((await sync_project(bob))["conflicts"]) == 1
+    mirror = next(row for row in await project_rows() if row["id"] != bob)
+
+    # A program runs in Bob's reference copy while Alice publishes a newer version.
+    db = await db_module.get_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO coding_run (project_id, uuid, label, status, last_activity_at) "
+            "VALUES (?, ?, 'Copy run', 'running', datetime('now'))",
+            (mirror["id"], str(uuid.uuid4())),
+        )
+        run_id = cursor.lastrowid
+        await db.commit()
+    finally:
+        await db.close()
+    use_data_dir(alice_data)
+    await projects.update_project(alice["id"], projects.ProjectUpdate(description="Alice 2"))
+    await sync_project(alice["id"])
+
+    use_data_dir(bob_data)
+    for _ in range(2):
+        await sync_project(bob)
+        assert "Copy run" in (await project_row(bob))["shared_sync_error"]
+        assert (await project_row(mirror["id"]))["description"] == "Alice 1"
+
+    # Once the run has ended, the next pass brings the reference copy up to date.
+    db = await db_module.get_db()
+    try:
+        await db.execute("UPDATE coding_run SET status='finished' WHERE id=?", (run_id,))
+        await db.commit()
+    finally:
+        await db.close()
+    await sync_project(bob)
+    assert (await project_row(mirror["id"]))["description"] == "Alice 2"
+    assert "Copy run" not in (await project_row(bob))["shared_sync_error"]

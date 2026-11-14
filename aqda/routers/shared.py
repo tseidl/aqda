@@ -93,6 +93,18 @@ def _choose_folder_native() -> str | None:
     return selected or None
 
 
+# Counts the backups by what they were made for, so Settings can say what it counted:
+# a fresh instance holds a daily backup long before any collaborator update happens.
+def _backup_counts(backups: list[Path]) -> dict:
+    daily = sum(1 for path in backups if path.name.startswith("aqda-daily-"))
+    updates = sum(1 for path in backups if path.name.startswith("aqda-before-shared-update-"))
+    return {
+        "daily": daily,
+        "before_collaborator_update": updates,
+        "other": len(backups) - daily - updates,
+    }
+
+
 @router.get("")
 async def shared_status():
     root = await get_shared_root()
@@ -145,6 +157,7 @@ async def shared_status():
         ),
         "backup_folder": str(backup_dir),
         "backup_count": len(backups),
+        "backup_counts": _backup_counts(backups),
         "latest_backup": str(backups[0]) if backups else None,
         **get_sync_health(),
     }

@@ -74,6 +74,8 @@ export interface SharedStatus {
   standalone_aqda_count: number;
   backup_folder: string;
   backup_count: number;
+  /** The same backups by purpose; "other" covers code merges and database format updates. */
+  backup_counts?: { daily: number; before_collaborator_update: number; other: number };
   latest_backup?: string | null;
   sync_error?: string | null;
   last_checked_at?: string | null;
@@ -165,6 +167,111 @@ export interface Coding {
   code_name?: string;
   code_color?: string;
   document_name?: string;
+  /** Answers to the project's coding fields, by field name (yes/no as "1"/"0"); a field
+   *  left out is not answered. */
+  fields?: Record<string, string>;
+  /** The model coding run that made this coding; null for a coding made by hand. */
+  run_id?: number | null;
+  run_label?: string | null;
+  run_model?: string | null;
+  /** For a model coding the researcher accepted (a hand coding from then on): the run it
+   *  came from. */
+  accepted_from_run_id?: number | null;
+  accepted_from_run_label?: string | null;
+  accepted_from_run_model?: string | null;
+}
+
+/** The kinds of answer a coding field takes. */
+export type CodingFieldKind = 'yes_no' | 'number' | 'text';
+
+/** A per-project question answered for each coding, e.g. "agreement" (yes/no). */
+export interface CodingField {
+  id: number;
+  project_id: number;
+  name: string;
+  kind: CodingFieldKind;
+  sort_order: number;
+  created_at?: string;
+  /** How many active codings answer this field. */
+  value_count: number;
+}
+
+/** The statuses of a model run: still coding, done, or ended early. */
+export type ModelRunStatus = 'running' | 'finished' | 'stopped';
+
+/** A model coding run: a program on this computer let a language model code passages. */
+export interface ModelRun {
+  id: number;
+  project_id: number;
+  /** Stable across collaborator updates (record IDs are re-created then). */
+  uuid: string;
+  label: string;
+  model: string;
+  instructions: string;
+  settings: Record<string, unknown>;
+  allow_new_codes: boolean;
+  status: ModelRunStatus;
+  note: string;
+  started_at: string;
+  last_activity_at: string | null;
+  finished_at: string | null;
+  deleted_at: string | null;
+  removed: boolean;
+  documents_read: number;
+  /** Active codings of this run that nobody accepted yet. */
+  codings: number;
+  /** Codings of this run that a researcher accepted; they are hand codings now. */
+  codings_accepted: number;
+  /** Quotes the run sent that AQDA could not place or accept. */
+  refused: number;
+  passages_submitted: number;
+  /** Codings that restoring a removed run brings back. */
+  codings_removed_with_run: number;
+}
+
+/** A quote a run sent for a document that AQDA did not accept, with the reason. */
+export interface RefusedQuote {
+  index: number;
+  quote: string | null;
+  reason: string;
+}
+
+/** One document a run read. */
+export interface ModelRunDocument {
+  document_id: number;
+  document_name: string;
+  processed_at: string;
+  submitted: number;
+  accepted: number;
+  refused: RefusedQuote[];
+  codings: number;
+}
+
+export interface ModelRunDetails extends ModelRun {
+  documents: ModelRunDocument[];
+}
+
+/** What merging one code into another would do (and, after the merge, did). */
+export interface CodeMergeImpact {
+  source: { id: number; name: string; description: string };
+  target: { id: number; name: string; description: string };
+  codings_moved: number;
+  trashed_codings_moved: number;
+  duplicates_dropped: number;
+  memos_moved: number;
+  passage_memos_relinked: number;
+  children_moved: number;
+  trashed_children_moved: number;
+  /** What happens to the merged code's definition. */
+  description: 'none' | 'carried_over' | 'same' | 'saved_as_memo';
+}
+
+export interface CodeMergeResult extends Omit<CodeMergeImpact, 'target'> {
+  /** The code merged into, with its new coding count. */
+  code: Code;
+  description_memo_id: number | null;
+  /** File name of the backup taken before the merge. */
+  backup: string;
 }
 
 export interface Memo {
@@ -485,6 +592,31 @@ export const codes = {
     ),
   trash: (projectId: number) => request<DeletedCode[]>(`/codes/trash?project_id=${projectId}`),
   restore: (id: number) => request<Code>(`/codes/${id}/restore`, { method: 'POST' }),
+  mergeImpact: (id: number, targetId: number) =>
+    request<CodeMergeImpact>(`/codes/${id}/merge-impact?target_id=${targetId}`),
+  /** Merge code `id` into `targetId`; the server takes a backup first. */
+  merge: (id: number, targetId: number) =>
+    request<CodeMergeResult>(`/codes/${id}/merge`, {
+      method: 'POST', body: JSON.stringify({ target_id: targetId }),
+    }),
+};
+
+/** Model runs, addressed by uuid; every call names the project, because a copy of a
+ *  project in the same database shares its runs' uuids. */
+export const runs = {
+  list: (projectId: number, includeRemoved = true) =>
+    request<ModelRun[]>(`/runs?project_id=${projectId}${includeRemoved ? '&include_removed=true' : ''}`),
+  get: (uuid: string, projectId: number) =>
+    request<ModelRunDetails>(`/runs/${encodeURIComponent(uuid)}?project_id=${projectId}`),
+  /** Mark a running run as finished or stopped. */
+  finish: (uuid: string, projectId: number, status: 'finished' | 'stopped') =>
+    request<ModelRun>(`/runs/${encodeURIComponent(uuid)}/finish?project_id=${projectId}`, {
+      method: 'POST', body: JSON.stringify({ status }),
+    }),
+  remove: (uuid: string, projectId: number) =>
+    request<ModelRun>(`/runs/${encodeURIComponent(uuid)}?project_id=${projectId}`, { method: 'DELETE' }),
+  restore: (uuid: string, projectId: number) =>
+    request<ModelRun>(`/runs/${encodeURIComponent(uuid)}/restore?project_id=${projectId}`, { method: 'POST' }),
 };
 
 export const codings = {
@@ -495,10 +627,33 @@ export const codings = {
     if (params.project_id) qs.set('project_id', String(params.project_id));
     return request<Coding[]>(`/codings?${qs}`);
   },
-  create: (data: { document_id: number; code_id: number; start_pos: number; end_pos: number; selected_text: string }) =>
+  /** `fields`: answers by field name, saved together with the coding. */
+  create: (data: {
+    document_id: number; code_id: number; start_pos: number; end_pos: number; selected_text: string;
+    fields?: Record<string, string>;
+  }) =>
     request<Coding>('/codings', { method: 'POST', body: JSON.stringify(data) }),
+  /** Replace the answers of a hand coding; fields left out become unanswered. */
+  setFields: (id: number, fields: Record<string, string>) =>
+    request<Coding>(`/codings/${id}/fields`, { method: 'PUT', body: JSON.stringify({ fields }) }),
+  /** Accept a model coding: it becomes the researcher's own coding and leaves its run. */
+  accept: (id: number) =>
+    request<Coding>(`/codings/${id}/accept`, { method: 'POST' }),
   delete: (id: number) =>
     request<void>(`/codings/${id}`, { method: 'DELETE' }),
+};
+
+export const codingFields = {
+  list: (projectId: number) => request<CodingField[]>(`/coding-fields?project_id=${projectId}`),
+  create: (data: { project_id: number; name: string; kind: CodingFieldKind }) =>
+    request<CodingField>('/coding-fields', { method: 'POST', body: JSON.stringify(data) }),
+  update: (id: number, data: { name?: string; kind?: CodingFieldKind; sort_order?: number }) =>
+    request<CodingField>(`/coding-fields/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  delete: (id: number) =>
+    request<void>(`/coding-fields/${id}`, { method: 'DELETE' }),
+  /** Earlier answers of a text field, most used first, optionally containing `q`. */
+  suggestions: (id: number, q: string) =>
+    request<string[]>(`/coding-fields/${id}/suggestions?q=${encodeURIComponent(q)}`),
 };
 
 export const memos = {

@@ -66,7 +66,9 @@ CREATE TABLE IF NOT EXISTS coding (
     deleted_at TEXT DEFAULT NULL,
     deletion_batch_id TEXT DEFAULT NULL,
     offset_unit TEXT NOT NULL DEFAULT 'codepoint',
-    repair_status TEXT DEFAULT NULL
+    repair_status TEXT DEFAULT NULL,
+    run_id INTEGER DEFAULT NULL REFERENCES coding_run(id),
+    accepted_from_run_id INTEGER DEFAULT NULL REFERENCES coding_run(id)
 );
 
 CREATE TABLE IF NOT EXISTS memo (
@@ -169,6 +171,114 @@ CREATE INDEX IF NOT EXISTS idx_embedding_project ON embedding_cache(project_id, 
 CREATE INDEX IF NOT EXISTS idx_embedding_document ON embedding_cache(document_id, model);
 """
 
+# Tables of schema version 12: model coding runs and coding fields. They are written once
+# and used by both the fresh schema and migration 12, so both create identical objects.
+# `coding.run_id` (NULL = coded by hand) is in the `coding` table above and added by the
+# migration; its index is created after the migrations (see `_run_migrations`), because
+# the fresh schema script also runs on older databases whose `coding` table lacks it.
+_V12_STATEMENTS = [
+    """CREATE TABLE IF NOT EXISTS coding_run (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+    uuid TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    instructions TEXT NOT NULL DEFAULT '',
+    settings TEXT NOT NULL DEFAULT '{}',
+    codebook TEXT DEFAULT NULL,
+    allow_new_codes INTEGER NOT NULL DEFAULT 0,
+    proposed_parent_code_id INTEGER DEFAULT NULL REFERENCES code(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    note TEXT NOT NULL DEFAULT '',
+    started_at TEXT DEFAULT (datetime('now')),
+    last_activity_at TEXT DEFAULT (datetime('now')),
+    finished_at TEXT DEFAULT NULL,
+    deleted_at TEXT DEFAULT NULL,
+    UNIQUE(project_id, uuid)
+)""",
+    "CREATE INDEX IF NOT EXISTS idx_coding_run_uuid ON coding_run(uuid)",
+    """CREATE TABLE IF NOT EXISTS coding_run_document (
+    run_id INTEGER NOT NULL REFERENCES coding_run(id) ON DELETE CASCADE,
+    document_id INTEGER NOT NULL REFERENCES document(id) ON DELETE CASCADE,
+    text_hash TEXT DEFAULT NULL,
+    processed_at TEXT DEFAULT (datetime('now')),
+    submitted INTEGER NOT NULL DEFAULT 0,
+    accepted INTEGER NOT NULL DEFAULT 0,
+    refused TEXT NOT NULL DEFAULT '[]',
+    raw_response TEXT DEFAULT NULL,
+    UNIQUE(run_id, document_id)
+)""",
+    "CREATE INDEX IF NOT EXISTS idx_coding_run_document_document "
+    "ON coding_run_document(document_id)",
+    """CREATE TABLE IF NOT EXISTS coding_field (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'text',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(project_id, name)
+)""",
+    """CREATE TABLE IF NOT EXISTS coding_field_value (
+    coding_id INTEGER NOT NULL REFERENCES coding(id) ON DELETE CASCADE,
+    field_id INTEGER NOT NULL REFERENCES coding_field(id) ON DELETE CASCADE,
+    value TEXT NOT NULL,
+    UNIQUE(coding_id, field_id)
+)""",
+    "CREATE INDEX IF NOT EXISTS idx_coding_field_value_field ON coding_field_value(field_id)",
+]
+_SCHEMA_TEMPLATE += "".join(f"\n{statement};\n" for statement in _V12_STATEMENTS)
+_POST_MIGRATION_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_coding_run_id ON coding(run_id)",
+]
+
+# Version of the project content carried by `.aqda` snapshots, independent of
+# `schema_version`. Raise it only when project content tables change, so an older AQDA can
+# tell that it would drop content. 2 = model coding runs and coding fields. A snapshot
+# without the setting was written by an older AQDA (format 1).
+SNAPSHOT_FORMAT = 2
+
+
+def _format_from_parts(setting_value: str | None, tables: set[str]) -> int:
+    """Decide a snapshot's format from its setting row and its tables."""
+    if setting_value is None:
+        # Older AQDA versions never wrote the setting. A full AQDA database (not a
+        # snapshot) has no setting either, but it carries the new tables when it can.
+        return 2 if {"coding_run", "coding_field"} <= tables else 1
+    try:
+        return int(setting_value)
+    except ValueError:
+        # An unreadable marker is treated as unknown and newer, so nothing is imported.
+        return SNAPSHOT_FORMAT + 1
+
+
+def read_snapshot_format(connection: sqlite3.Connection) -> int:
+    """Return the snapshot format of an open (synchronous) SQLite snapshot file."""
+    tables = {
+        row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    value = None
+    if "setting" in tables:
+        row = connection.execute(
+            "SELECT value FROM setting WHERE key='snapshot_format'"
+        ).fetchone()
+        value = row[0] if row else None
+    return _format_from_parts(value, tables)
+
+
+async def read_snapshot_format_async(connection: aiosqlite.Connection) -> int:
+    """Return the snapshot format of an open aiosqlite snapshot file."""
+    cursor = await connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = {row[0] for row in await cursor.fetchall()}
+    value = None
+    if "setting" in tables:
+        row = await (
+            await connection.execute("SELECT value FROM setting WHERE key='snapshot_format'")
+        ).fetchone()
+        value = row[0] if row else None
+    return _format_from_parts(value, tables)
+
+
 # Migrations keyed by target version. Each runs if schema_version < target.
 MIGRATIONS = {
     2: [
@@ -266,6 +376,16 @@ MIGRATIONS = {
         "ALTER TABLE project ADD COLUMN shared_previous_folder TEXT DEFAULT NULL",
         "INSERT OR IGNORE INTO setting (key, value) VALUES ('shared_folders', '[]')",
     ],
+    12: [
+        *_V12_STATEMENTS,
+        "ALTER TABLE coding ADD COLUMN run_id INTEGER DEFAULT NULL REFERENCES coding_run(id)",
+    ],
+    # A model coding the researcher accepted becomes a hand coding (run_id NULL) that
+    # remembers the run it came from.
+    13: [
+        "ALTER TABLE coding ADD COLUMN accepted_from_run_id INTEGER DEFAULT NULL "
+        "REFERENCES coding_run(id)",
+    ],
 }
 
 LATEST_SCHEMA_VERSION = max(MIGRATIONS)
@@ -329,6 +449,8 @@ async def _run_migrations(db: aiosqlite.Connection):
     await db.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_project_lineage ON project(lineage_id)"
     )
+    for sql in _POST_MIGRATION_INDEXES:
+        await db.execute(sql)
     cursor = await db.execute("SELECT value FROM setting WHERE key='device_id'")
     device = await cursor.fetchone()
     if not device or not device["value"].strip():
@@ -423,6 +545,17 @@ def create_shared_update_backup(keep: int) -> Path:
     """
     path = create_backup("before-shared-update")
     _prune_backups("before-shared-update", keep=max(1, keep))
+    return path
+
+
+# How many backups taken before merging codes are kept.
+MERGE_BACKUPS_KEPT = 10
+
+
+def create_merge_backup() -> Path:
+    """Back up before merging codes (no undo in the app), keeping the newest ten."""
+    path = create_backup("before-merge")
+    _prune_backups("before-merge", keep=MERGE_BACKUPS_KEPT)
     return path
 
 

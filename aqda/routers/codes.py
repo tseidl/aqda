@@ -1,12 +1,15 @@
 """Code management routes — hierarchical qualitative codes."""
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from aqda import db as db_module
 from aqda.db import get_db, touch_project
+from aqda.services.coding_fields import field_answers_by_id, find_duplicate_coding
 
 router = APIRouter()
 
@@ -186,6 +189,9 @@ async def delete_code(code_id: int):
             f"WHERE id IN ({placeholders}) AND deleted_at IS NULL",
             [deleted_at, batch_id, *code_ids],
         )
+        # Only active codings join the batch. Codings already removed (one by one, or
+        # with their model run) keep their own stamp, so restoring this code cannot bring
+        # them back; a removed run hands its codings to this batch when it is restored.
         await db.execute(
             f"UPDATE coding SET deleted_at=?, deletion_batch_id=? "
             f"WHERE code_id IN ({placeholders}) AND deleted_at IS NULL",
@@ -195,6 +201,15 @@ async def delete_code(code_id: int):
         await db.commit()
     finally:
         await db.close()
+
+
+# The deletion stamp a restored code's coding takes: NULL (active) for a hand coding or a
+# coding of a model run that is in place, the run's own removal stamp when that run is
+# removed. Codings removed with a code keep that code's batch even if their run is removed
+# later, so the run's state is only settled here.
+_RUN_REMOVAL_STAMP_SQL = (
+    "(SELECT r.deleted_at FROM coding_run r WHERE r.id=coding.run_id)"
+)
 
 
 @router.post("/{code_id}/restore", status_code=200)
@@ -219,8 +234,12 @@ async def restore_code(code_id: int):
                 "WHERE deletion_batch_id=? AND project_id=?",
                 (batch_id, code["project_id"]),
             )
+            # A coding from a model run that was removed meanwhile stays removed with
+            # its run: it takes the run's removal stamp, so restoring the run brings it
+            # back (see `_RUN_REMOVAL_STAMP_SQL`).
             await db.execute(
-                "UPDATE coding SET deleted_at=NULL, deletion_batch_id=NULL "
+                f"UPDATE coding SET deleted_at={_RUN_REMOVAL_STAMP_SQL}, "
+                "deletion_batch_id=NULL "
                 "WHERE deletion_batch_id=? AND code_id IN "
                 "(SELECT id FROM code WHERE project_id=?)",
                 (batch_id, code["project_id"]),
@@ -233,7 +252,8 @@ async def restore_code(code_id: int):
             # Legacy deletion: restore only codings stamped at the same moment.
             await db.execute("UPDATE code SET deleted_at=NULL WHERE id=?", (code_id,))
             await db.execute(
-                "UPDATE coding SET deleted_at=NULL WHERE code_id=? AND deleted_at=?",
+                f"UPDATE coding SET deleted_at={_RUN_REMOVAL_STAMP_SQL} "
+                "WHERE code_id=? AND deleted_at=?",
                 (code_id, code["deleted_at"]),
             )
         await touch_project(db, code["project_id"])
@@ -282,14 +302,20 @@ async def code_delete_impact(code_id: int):
 
 @router.get("/trash")
 async def list_deleted_codes(project_id: int):
-    """List each code deletion once, with what restoring it brings back."""
+    """List each code deletion once, with what restoring it brings back.
+
+    A coding whose model run is removed stays out of use when its code is restored
+    (`_RUN_REMOVAL_STAMP_SQL`), so it is not counted.
+    """
     db = await get_db()
     try:
         cursor = await db.execute(
             "SELECT c.*, parent.name AS parent_name, "
             "CASE WHEN c.deletion_batch_id IS NULL "
-            "THEN (SELECT COUNT(*) FROM coding WHERE code_id=c.id AND deleted_at=c.deleted_at) "
-            "ELSE (SELECT COUNT(*) FROM coding WHERE deletion_batch_id=c.deletion_batch_id) "
+            "THEN (SELECT COUNT(*) FROM coding WHERE code_id=c.id AND deleted_at=c.deleted_at "
+            f"AND {_RUN_REMOVAL_STAMP_SQL} IS NULL) "
+            "ELSE (SELECT COUNT(*) FROM coding WHERE deletion_batch_id=c.deletion_batch_id "
+            f"AND {_RUN_REMOVAL_STAMP_SQL} IS NULL) "
             "END AS coding_count, "
             "CASE WHEN c.deletion_batch_id IS NULL THEN 0 "
             "ELSE (SELECT COUNT(*) FROM code WHERE deletion_batch_id=c.deletion_batch_id "
@@ -303,5 +329,254 @@ async def list_deleted_codes(project_id: int):
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+    finally:
+        await db.close()
+
+
+# --- Merging codes ---
+
+
+class CodeMerge(BaseModel):
+    target_id: int
+
+
+# Describe one code for merge responses.
+def _code_summary(code) -> dict:
+    return {"id": code["id"], "name": code["name"], "description": code["description"] or ""}
+
+
+# Decide what happens to the source code's definition when it is merged into the target.
+def _description_outcome(source, target) -> str:
+    """Return "none", "carried_over", "same", or "saved_as_memo".
+
+    A definition is never discarded: when both codes have different definitions, the
+    target keeps its own and the source's definition is kept as a memo on the target.
+    """
+    source_text = (source["description"] or "").strip()
+    target_text = (target["description"] or "").strip()
+    if not source_text:
+        return "none"
+    if not target_text:
+        return "carried_over"
+    if source_text == target_text:
+        return "same"
+    return "saved_as_memo"
+
+
+# Check that a merge is possible and work out everything it would do, without changing data.
+async def _plan_merge(db, source_id: int, target_id: int) -> dict:
+    """Return the merge plan; refuse impossible merges with a message for the researcher.
+
+    Merge impact and the merge itself both use this plan, so the confirmation shows
+    exactly what the merge then does.
+    """
+    if source_id == target_id:
+        raise HTTPException(400, "A code cannot be merged into itself.")
+    source = await (await db.execute("SELECT * FROM code WHERE id=?", (source_id,))).fetchone()
+    target = await (await db.execute("SELECT * FROM code WHERE id=?", (target_id,))).fetchone()
+    if not source or source["deleted_at"] is not None:
+        raise HTTPException(404, "The code to merge was not found or is in the trash.")
+    if not target or target["deleted_at"] is not None:
+        raise HTTPException(404, "The code to merge into was not found or is in the trash.")
+    if source["project_id"] != target["project_id"]:
+        raise HTTPException(400, "Only codes of the same project can be merged.")
+    if await _would_create_cycle(db, source_id, target_id):
+        raise HTTPException(
+            400,
+            f"“{source['name']}” cannot be merged into one of its own child codes. "
+            "Merge the child code into it instead, or move the child code first.",
+        )
+
+    source_codings = await (
+        await db.execute(
+            "SELECT id, document_id, start_pos, end_pos, run_id, coder, deleted_at, "
+            "deletion_batch_id FROM coding WHERE code_id=? ORDER BY id",
+            (source_id,),
+        )
+    ).fetchall()
+    active = [row for row in source_codings if row["deleted_at"] is None]
+    answers = await field_answers_by_id(db, [row["id"] for row in source_codings])
+    # A source coding is a duplicate when the target already holds an equal coding
+    # (shared rule: same document, span, run or hand coder, and field answers) in the same
+    # state: both active, or both out of use with the same stamp and deletion batch, so
+    # that a later restore of a run or code cannot bring back two equal codings. Other
+    # codings move unchanged and come back as they were when restored.
+    dropped: dict[int, int] = {}
+    dropped_out_of_use = 0
+    for row in source_codings:
+        kept_id = await find_duplicate_coding(
+            db,
+            document_id=row["document_id"],
+            code_id=target_id,
+            start_pos=row["start_pos"],
+            end_pos=row["end_pos"],
+            run_id=row["run_id"],
+            coder=row["coder"],
+            answers=answers.get(row["id"], {}),
+            deletion_state=(row["deleted_at"], row["deletion_batch_id"]),
+        )
+        if kept_id is not None:
+            dropped[row["id"]] = kept_id
+            dropped_out_of_use += row["deleted_at"] is not None
+
+    relinked_memos = 0
+    dropped_ids = list(dropped)
+    for start in range(0, len(dropped_ids), 500):
+        chunk = dropped_ids[start:start + 500]
+        placeholders = ",".join("?" * len(chunk))
+        row = await (
+            await db.execute(
+                f"SELECT COUNT(*) FROM memo WHERE coding_id IN ({placeholders})", chunk
+            )
+        ).fetchone()
+        relinked_memos += row[0]
+    code_memos = (
+        await (
+            await db.execute("SELECT COUNT(*) FROM memo WHERE code_id=?", (source_id,))
+        ).fetchone()
+    )[0]
+    children = await (
+        await db.execute(
+            "SELECT id, deleted_at FROM code WHERE parent_id=? ORDER BY sort_order, name, id",
+            (source_id,),
+        )
+    ).fetchall()
+    return {
+        "source": source,
+        "target": target,
+        "dropped": dropped,
+        "child_ids": [row["id"] for row in children],
+        "counts": {
+            "codings_moved": len(active) - (len(dropped) - dropped_out_of_use),
+            "trashed_codings_moved": len(source_codings) - len(active) - dropped_out_of_use,
+            "duplicates_dropped": len(dropped),
+            "memos_moved": code_memos,
+            "passage_memos_relinked": relinked_memos,
+            "children_moved": sum(1 for row in children if row["deleted_at"] is None),
+            "trashed_children_moved": sum(1 for row in children if row["deleted_at"] is not None),
+        },
+        "description": _description_outcome(source, target),
+    }
+
+
+@router.get("/{code_id}/merge-impact")
+async def code_merge_impact(code_id: int, target_id: int):
+    """Report what merging this code into ``target_id`` would do, for the confirmation."""
+    db = await get_db()
+    try:
+        plan = await _plan_merge(db, code_id, target_id)
+        return {
+            "source": _code_summary(plan["source"]),
+            "target": _code_summary(plan["target"]),
+            **plan["counts"],
+            "description": plan["description"],
+        }
+    finally:
+        await db.close()
+
+
+@router.post("/{code_id}/merge")
+async def merge_code(code_id: int, data: CodeMerge):
+    """Merge this code into another one, after a verified backup; the source code is removed.
+
+    Codings (also trashed ones, with their field answers), memos, and child codes (also
+    trashed ones) move to the target. Only exact duplicates of a coding on the target
+    that is in the same state (active, or out of use in the same way) are dropped; their
+    memos move to the coding that is kept. There is no undo in the app, hence the backup
+    (the newest merge backups are kept, see `db.create_merge_backup`).
+    """
+    target_id = data.target_id
+    db = await get_db()
+    try:
+        # Refuse impossible merges before spending time on a backup.
+        await _plan_merge(db, code_id, target_id)
+        try:
+            backup_path = await asyncio.to_thread(db_module.create_merge_backup)
+        except Exception as exc:
+            raise HTTPException(
+                500, "AQDA could not make a backup before merging, so nothing was changed."
+            ) from exc
+
+        await db.execute("BEGIN IMMEDIATE")
+        # Plan again under the write lock, so the merge matches the data as it is now.
+        plan = await _plan_merge(db, code_id, target_id)
+        source, target = plan["source"], plan["target"]
+        project_id = target["project_id"]
+
+        # Exact duplicates go; memos written on them move to the coding that is kept.
+        await db.executemany(
+            "UPDATE memo SET coding_id=? WHERE coding_id=?",
+            [(kept_id, dropped_id) for dropped_id, kept_id in plan["dropped"].items()],
+        )
+        await db.executemany(
+            "DELETE FROM coding WHERE id=?", [(dropped_id,) for dropped_id in plan["dropped"]]
+        )
+        # Every other coding moves as it is: deletion state, coder, run, answers, dates.
+        await db.execute("UPDATE coding SET code_id=? WHERE code_id=?", (target_id, code_id))
+        await db.execute("UPDATE memo SET code_id=? WHERE code_id=?", (target_id, code_id))
+
+        # Child codes keep their order and follow the target's existing children.
+        last = await (
+            await db.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) FROM code WHERE parent_id=?", (target_id,)
+            )
+        ).fetchone()
+        await db.executemany(
+            "UPDATE code SET parent_id=?, sort_order=? WHERE id=?",
+            [
+                (target_id, last[0] + position, child_id)
+                for position, child_id in enumerate(plan["child_ids"], start=1)
+            ],
+        )
+
+        description_memo_id = None
+        if plan["description"] == "carried_over":
+            await db.execute(
+                "UPDATE code SET description=? WHERE id=?", (source["description"], target_id)
+            )
+        elif plan["description"] == "saved_as_memo":
+            cursor = await db.execute(
+                "INSERT INTO memo (project_id, code_id, title, content) VALUES (?, ?, ?, ?)",
+                (
+                    project_id,
+                    target_id,
+                    f"Definition of the merged code “{source['name']}”",
+                    source["description"],
+                ),
+            )
+            description_memo_id = cursor.lastrowid
+
+        # Nothing may keep pointing at the source code once it is gone.
+        await db.execute(
+            "UPDATE code_deletion_batch SET root_code_id=? WHERE root_code_id=?",
+            (target_id, code_id),
+        )
+        await db.execute(
+            "UPDATE coding_run SET proposed_parent_code_id=? WHERE proposed_parent_code_id=?",
+            (target_id, code_id),
+        )
+        await db.execute("DELETE FROM code WHERE id=?", (code_id,))
+        await touch_project(db, project_id)
+        await db.commit()
+
+        merged = await (
+            await db.execute(
+                "SELECT c.*, (SELECT COUNT(*) FROM coding WHERE code_id=c.id "
+                "AND deleted_at IS NULL) AS coding_count FROM code c WHERE c.id=?",
+                (target_id,),
+            )
+        ).fetchone()
+        return {
+            "code": dict(merged),
+            "source": _code_summary(source),
+            **plan["counts"],
+            "description": plan["description"],
+            "description_memo_id": description_memo_id,
+            "backup": backup_path.name,
+        }
+    except Exception:
+        if db.in_transaction:
+            await db.rollback()
+        raise
     finally:
         await db.close()

@@ -10,7 +10,20 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from aqda import __version__
 from aqda.db import init_db
-from aqda.routers import projects, documents, codes, codings, memos, settings, ai, export, shared, system
+from aqda.routers import (
+    ai,
+    codes,
+    coding_fields,
+    codings,
+    documents,
+    export,
+    memos,
+    projects,
+    runs,
+    settings,
+    shared,
+    system,
+)
 from aqda.services.shared_projects import start_sync_service, stop_sync_service
 
 
@@ -110,7 +123,11 @@ app.include_router(projects.router, prefix="/api/projects", tags=["projects"])
 app.include_router(documents.router, prefix="/api/documents", tags=["documents"])
 app.include_router(codes.router, prefix="/api/codes", tags=["codes"])
 app.include_router(codings.router, prefix="/api/codings", tags=["codings"])
+app.include_router(
+    coding_fields.router, prefix="/api/coding-fields", tags=["coding-fields"]
+)
 app.include_router(memos.router, prefix="/api/memos", tags=["memos"])
+app.include_router(runs.router, prefix="/api/runs", tags=["runs"])
 app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
 app.include_router(ai.router, prefix="/api/ai", tags=["ai"])
 app.include_router(export.router, prefix="/api/export", tags=["export"])

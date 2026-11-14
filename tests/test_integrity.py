@@ -383,6 +383,7 @@ async def test_same_code_on_the_same_span_is_refused_once(tmp_path, use_data_dir
     with pytest.raises(HTTPException) as refused:
         await codings.create_coding(codings.CodingCreate(code_id=theme["id"], **span))
     assert refused.value.status_code == 409
+    assert refused.value.detail == "This code is already applied to exactly this passage."
     # A different code on the same passage is ordinary qualitative coding.
     second = await codings.create_coding(codings.CodingCreate(code_id=other["id"], **span))
     assert second["code_id"] == other["id"]

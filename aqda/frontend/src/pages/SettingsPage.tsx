@@ -1,11 +1,12 @@
 import { useState, useEffect } from 'react';
-import { useQuery, useMutation } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { ArrowLeft, RefreshCw, Check, FolderOpen, Power, AlertTriangle, Trash2 } from 'lucide-react';
 import { settings as settingsApi, shared } from '../api';
 import { CloseAqdaButton } from '../components/CloseAqdaButton';
 
 export function SettingsPage() {
+  const queryClient = useQueryClient();
   const [form, setForm] = useState<Record<string, string>>({});
   const [saved, setSaved] = useState(false);
   const [saveError, setSaveError] = useState<Record<string, string> | null>(null);
@@ -72,6 +73,8 @@ export function SettingsPage() {
         Object.entries(form).map(([key, value]) => ({ key, value }))
       ),
     onSuccess: () => {
+      // The coder name and model choices are read elsewhere from this query.
+      queryClient.invalidateQueries({ queryKey: ['settings'] });
       setSaved(true);
       setSaveError(null);
       setTimeout(() => setSaved(false), 2000);
@@ -107,6 +110,15 @@ export function SettingsPage() {
   const selectedSharedRoot = sharedStatus?.roots.find(
     (root) => root.path === sharedPath.trim()
   );
+
+  // What the backups were made for: a new installation already holds a daily backup,
+  // which is not one made before a collaborator update.
+  const counts = sharedStatus?.backup_counts;
+  const backupKinds = counts && [
+    `Daily: ${counts.daily}`,
+    `Before collaborator updates: ${counts.before_collaborator_update}`,
+    ...(counts.other > 0 ? [`Before code merges or format updates: ${counts.other}`] : []),
+  ].join(' · ');
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -280,8 +292,9 @@ export function SettingsPage() {
                 </p>
               </div>
               <div className="rounded-md bg-gray-50 border border-gray-200 p-3">
-                <p className="font-medium text-gray-700">Safety backups</p>
+                <p className="font-medium text-gray-700">Backups</p>
                 <p className="text-gray-500 mt-1">{sharedStatus?.backup_count ?? 0} in {sharedStatus?.backup_folder ?? 'the AQDA data folder'}</p>
+                {backupKinds && <p className="text-gray-500 mt-1" data-backup-kinds>{backupKinds}</p>}
               </div>
             </div>
             <div>
@@ -380,7 +393,7 @@ export function SettingsPage() {
           <div className="bg-white rounded-lg border border-gray-200 p-4 space-y-4">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">
-                LLM Model <span className="text-gray-400 font-normal">(for analysis & chat)</span>
+                LLM Model <span className="text-gray-400 font-normal">(for definitions, summaries, and grouping suggestions)</span>
               </label>
               {ollamaStatus?.available ? (
                 <select
@@ -468,7 +481,7 @@ export function SettingsPage() {
               </div>
             </div>
             <p className="text-xs text-gray-400">
-              Documents are split into overlapping chunks for embedding search. 500 characters ≈ 100 words. Smaller chunks are more precise, larger chunks capture more context.
+              Documents are split into chunks for embedding search. 500 characters ≈ 100 words. Smaller chunks are more precise, larger chunks capture more context. Chunks begin and end with whole sentences where possible, otherwise with whole words; the overlap is the most a chunk repeats from the end of the one before.
             </p>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Chunk boundaries</label>
@@ -499,6 +512,7 @@ export function SettingsPage() {
             <div className="space-y-3">
               {[
                 { name: 'Default', colors: ['#6366f1','#ec4899','#f59e0b','#10b981','#3b82f6','#8b5cf6','#ef4444','#14b8a6','#f97316','#06b6d4'] },
+                { name: 'Color-blind safe', colors: ['#3D649E','#E8772E','#1E452F','#029581','#982F5D','#E8CB48','#DF97AA','#A1CCF1'] },
                 { name: 'Pastel', colors: ['#a5b4fc','#f9a8d4','#fcd34d','#6ee7b7','#93c5fd','#c4b5fd','#fca5a5','#5eead4','#fdba74','#67e8f9'] },
                 { name: 'Earthy', colors: ['#92400e','#78350f','#365314','#1e3a5f','#4c1d95','#831843','#6b7280','#b45309','#166534','#1e40af'] },
                 { name: 'Vivid', colors: ['#dc2626','#2563eb','#16a34a','#d97706','#9333ea','#0891b2','#e11d48','#4f46e5','#059669','#ea580c'] },
@@ -510,7 +524,7 @@ export function SettingsPage() {
                   }`}
                   onClick={() => update('color_scheme', scheme.name)}
                 >
-                  <span className="text-sm font-medium text-gray-700 w-16">{scheme.name}</span>
+                  <span className="text-sm font-medium text-gray-700 w-32">{scheme.name}</span>
                   <div className="flex gap-1">
                     {scheme.colors.map((c) => (
                       <span key={c} className="w-5 h-5 rounded-sm" style={{ backgroundColor: c }} />

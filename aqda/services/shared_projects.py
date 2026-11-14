@@ -16,7 +16,14 @@ from urllib.parse import quote
 
 from fastapi import HTTPException
 
-from aqda.db import create_daily_backup, get_db
+from aqda.db import SNAPSHOT_FORMAT, create_daily_backup, get_db, read_snapshot_format
+from aqda.services.coding_runs import (
+    RUN_PAUSE_PREFIX,
+    RunInProgressError,
+    refuse_while_run_in_progress,
+    run_in_progress_label,
+    run_pause_message,
+)
 
 SYNC_INTERVAL_SECONDS = 3
 PUBLISH_IDLE_SECONDS = 5
@@ -33,6 +40,7 @@ class SnapshotInfo:
     created_by: str
     parent_by_id: dict[str, str | None]
     mtime_ns: int
+    snapshot_format: int = 1
 
 
 _sync_lock = asyncio.Lock()
@@ -82,6 +90,7 @@ def _inspect_snapshot(path: Path) -> SnapshotInfo:
             created_by=head["created_by"] or "",
             parent_by_id=parent_by_id,
             mtime_ns=path.stat().st_mtime_ns,
+            snapshot_format=read_snapshot_format(connection),
         )
     finally:
         connection.close()
@@ -432,6 +441,8 @@ async def share_project(project_id: int, root_path: str | None = None) -> dict:
                     (project_id,),
                 )
             ).fetchone()
+            # Sharing publishes at once, and a half-finished run should not go out.
+            await refuse_while_run_in_progress(db, [project_id], "share this project")
         finally:
             await db.close()
         if mirror:
@@ -573,7 +584,8 @@ async def _refresh_known_conflict_branch(
     if branch is None:
         return None
 
-    await _mark_ignored(project_id, info.head_snapshot_id)
+    # The head is marked as handled only once it is: a refused refresh (an older AQDA's
+    # version, a model run in the copy) is retried and its message shown on every pass.
     common_updates = {
         "latest_snapshot_id": info.head_snapshot_id,
         "latest_snapshot_path": str(info.path),
@@ -584,6 +596,7 @@ async def _refresh_known_conflict_branch(
             "Concurrent work still exists in the shared folder. Its local reference "
             "copy was removed, so AQDA is no longer recreating it automatically."
         )
+        await _mark_ignored(project_id, info.head_snapshot_id)
         await _update_conflict_branch(branch["id"], **common_updates)
         await _update_sync_state(project_id, shared_sync_error=message)
         return {
@@ -598,6 +611,7 @@ async def _refresh_known_conflict_branch(
             f'Concurrent work continues, but “{branch["conflict_name"]}” was edited '
             "locally. AQDA will not overwrite those edits; agree which version to keep."
         )
+        await _mark_ignored(project_id, info.head_snapshot_id)
         await _update_conflict_branch(branch["id"], **common_updates)
         await _update_sync_state(project_id, shared_sync_error=message)
         return {
@@ -614,6 +628,7 @@ async def _refresh_known_conflict_branch(
         conflict_id,
         info.lineage_id,
     )
+    await _mark_ignored(project_id, info.head_snapshot_id)
     mirror_message = (
         "Reference copy of concurrent collaborator work. It updates automatically; "
         "agree which version to keep before coding here."
@@ -635,12 +650,15 @@ async def _refresh_known_conflict_branch(
 
 
 async def _create_conflict_copy(project_id: int, info: SnapshotInfo) -> dict | None:
+    """Keep a collaborator's diverged version beside the local project, as its reference."""
     from aqda.routers.projects import import_package_bytes
 
+    # Named like its badge and the documentation: "… (collaborator reference from Ben, date)".
     result = await import_package_bytes(
         await asyncio.to_thread(info.path.read_bytes),
         mode="copy",
         target_lineage_id=info.lineage_id,
+        copy_label="collaborator reference",
     )
     if not result["imported"]:
         return None
@@ -692,6 +710,66 @@ def _ready_to_publish(project, force: bool) -> bool:
         return True
 
 
+async def _older_writer_warning(
+    project_id: int, folder: Path, infos: list[SnapshotInfo]
+) -> str | None:
+    """Warn when a collaborator's latest version in the folder came from an older AQDA.
+
+    Such an AQDA drops model coding runs and coding fields when it saves, so the warning
+    is shown only for a project that has them. A collaborator who has since updated but
+    not saved again still leaves an older file behind, hence the cautious wording.
+    """
+    project = await _project_row(project_id)
+    if not project:
+        return None
+    own_path = _writer_snapshot_path(folder, await _device_id())
+    older = any(
+        info.snapshot_format < SNAPSHOT_FORMAT
+        and info.lineage_id == project["lineage_id"]
+        and info.path != own_path
+        for info in infos
+    )
+    if not older:
+        return None
+    from aqda.services.coding_fields import project_has_runs_or_fields
+
+    db = await get_db()
+    try:
+        if not await project_has_runs_or_fields(db, project_id):
+            return None
+    finally:
+        await db.close()
+    return (
+        "The shared folder holds a version saved by an older AQDA. An older AQDA cannot "
+        "keep model coding runs or coding fields; ask collaborators to update AQDA before "
+        "they edit this project."
+    )
+
+
+# Return the label of a model run in progress in this project, or None.
+async def _run_in_progress(project_id: int) -> str | None:
+    db = await get_db()
+    try:
+        return await run_in_progress_label(db, project_id)
+    finally:
+        await db.close()
+
+
+# Show that sync waits for a model run and report the pass as paused.
+async def _pause_for_run(
+    project_id: int, label: str, imported: list | None = None, conflicts: list | None = None
+) -> dict:
+    await _update_sync_state(project_id, shared_sync_error=run_pause_message(label))
+    return {
+        "project_id": project_id,
+        "linked": True,
+        "paused_for_run": label,
+        "imported": imported or [],
+        "conflicts": conflicts or [],
+        "published": None,
+    }
+
+
 async def _sync_project(
     project_id: int,
     publish: bool = True,
@@ -700,6 +778,14 @@ async def _sync_project(
     project = await _project_row(project_id)
     if not project or not project["shared_folder"]:
         return {"project_id": project_id, "linked": False}
+    waiting_for = await _run_in_progress(project_id)
+    if waiting_for is not None:
+        # A collaborator's version would re-create every ID under the running program,
+        # and a half-finished run should not be published: wait until it ends.
+        return await _pause_for_run(project_id, waiting_for)
+    if (project["shared_sync_error"] or "").startswith(RUN_PAUSE_PREFIX):
+        # The run has ended or gone quiet; later steps set a new status if needed.
+        await _update_sync_state(project_id, shared_sync_error=None)
     folder = Path(project["shared_folder"])
     if not folder.is_dir():
         await _update_sync_state(project_id, shared_sync_error="Collaboration folder is unavailable")
@@ -712,21 +798,36 @@ async def _sync_project(
     conflicts = []
     branch_errors: list[str] = []
 
-    from aqda.routers.projects import import_package_bytes
+    from aqda.routers.projects import (
+        NEWER_FORMAT_MESSAGE,
+        SnapshotFormatError,
+        import_package_bytes,
+    )
 
     for info in heads:
         if info.head_snapshot_id in ignored or info.head_snapshot_id == project["head_snapshot_id"]:
             continue
-        handled_branch = await _refresh_known_conflict_branch(project_id, info)
-        if handled_branch is not None:
-            if handled_branch.get("updated"):
-                conflicts.append(handled_branch["project"])
-            if handled_branch.get("sync_error"):
-                branch_errors.append(handled_branch["sync_error"])
+        if info.snapshot_format > SNAPSHOT_FORMAT:
+            # Nothing of it can be applied; say so instead of failing every sync pass.
+            branch_errors.append(NEWER_FORMAT_MESSAGE)
             continue
-        result = await import_package_bytes(
-            await asyncio.to_thread(info.path.read_bytes), mode="auto"
-        )
+        try:
+            handled_branch = await _refresh_known_conflict_branch(project_id, info)
+            if handled_branch is not None:
+                if handled_branch.get("updated"):
+                    conflicts.append(handled_branch["project"])
+                if handled_branch.get("sync_error"):
+                    branch_errors.append(handled_branch["sync_error"])
+                continue
+            result = await import_package_bytes(
+                await asyncio.to_thread(info.path.read_bytes), mode="auto"
+            )
+        except (SnapshotFormatError, RunInProgressError) as exc:
+            # An older AQDA's version would drop runs or fields, or a model run started
+            # meanwhile (here or in a reference copy): keep the local project, report it,
+            # and try again on the next pass.
+            branch_errors.append(exc.detail)
+            continue
         if result["conflicts"]:
             copied = await _create_conflict_copy(project_id, info)
             if copied:
@@ -750,6 +851,10 @@ async def _sync_project(
             and project["revision"] != project["shared_last_published_revision"]
             and _ready_to_publish(project, force_publish)
         ):
+            # A program may have started a run since the check at the top of this pass.
+            waiting_for = await _run_in_progress(project_id)
+            if waiting_for is not None:
+                return await _pause_for_run(project_id, waiting_for, imported, conflicts)
             published = await _publish_project(project_id)
     if conflicts:
         await _update_sync_state(
@@ -761,6 +866,10 @@ async def _sync_project(
         )
     elif branch_errors:
         await _update_sync_state(project_id, shared_sync_error=branch_errors[-1])
+    else:
+        warning = await _older_writer_warning(project_id, folder, infos)
+        if warning:
+            await _update_sync_state(project_id, shared_sync_error=warning)
     return {
         "project_id": project_id,
         "linked": True,
@@ -1124,6 +1233,14 @@ async def resolve_conflict_copy(conflict_project_id: int, choice: str) -> dict:
             raise HTTPException(404, "This collaborator reference is no longer active")
 
         original_id = branch["project_id"]
+        # Either choice publishes the original, and taking the reference also replaces it.
+        db = await get_db()
+        try:
+            await refuse_while_run_in_progress(
+                db, [original_id, conflict_project_id], "resolve this concurrent version"
+            )
+        finally:
+            await db.close()
         if choice == "keep_current":
             await _publish_project(original_id, force=True)
             db = await get_db()

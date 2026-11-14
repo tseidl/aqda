@@ -1,10 +1,12 @@
 import { useState, useMemo, useRef, useEffect, type DragEvent } from 'react';
 import { useMutation, useQueryClient, useQuery } from '@tanstack/react-query';
-import { ChevronRight, ChevronDown, Plus, Trash2, Pencil, Sparkles, Copy, GripVertical, RotateCcw } from 'lucide-react';
+import { ChevronRight, ChevronDown, Plus, Trash2, Pencil, Sparkles, Copy, GripVertical, RotateCcw, ListChecks, Merge } from 'lucide-react';
 import { codes as codesApi, settings as settingsApi, ai, type Code, type DeletedCode, type GenerationTiming, type Memo } from '../api';
 import { MentionTextarea, MentionView } from './MentionTextarea';
 import { buildMentionCandidates, type MentionCandidate } from './mentions';
 import { AnswerTiming, GenerationProgress } from './GenerationProgress';
+import { CodingFieldsDialog } from './CodingFieldsDialog';
+import { MergeCodeDialog } from './MergeCodeDialog';
 
 interface Props {
   projectId: number;
@@ -17,6 +19,8 @@ interface Props {
 
 const COLOR_SCHEMES: Record<string, string[]> = {
   Default: ['#6366f1','#ec4899','#f59e0b','#10b981','#3b82f6','#8b5cf6','#ef4444','#14b8a6','#f97316','#06b6d4'],
+  // seidlpal's categorical colours (github.com/tseidl/seidlpal), safe for colour-blind readers
+  'Color-blind safe': ['#3D649E','#E8772E','#1E452F','#029581','#982F5D','#E8CB48','#DF97AA','#A1CCF1'],
   Pastel: ['#a5b4fc','#f9a8d4','#fcd34d','#6ee7b7','#93c5fd','#c4b5fd','#fca5a5','#5eead4','#fdba74','#67e8f9'],
   Earthy: ['#92400e','#78350f','#365314','#1e3a5f','#4c1d95','#831843','#6b7280','#b45309','#166534','#1e40af'],
   Vivid: ['#dc2626','#2563eb','#16a34a','#d97706','#9333ea','#0891b2','#e11d48','#4f46e5','#059669','#ea580c'],
@@ -79,6 +83,7 @@ function CodeNode({
   projectId,
   colors,
   dnd,
+  onMerge,
 }: {
   code: Code & { children?: Code[] };
   depth: number;
@@ -87,6 +92,8 @@ function CodeNode({
   projectId: number;
   colors: string[];
   dnd: DndCtx;
+  /** Open the merge dialog for a code. */
+  onMerge: (code: Code) => void;
 }) {
   const [expanded, setExpanded] = useState(true);
   const [editing, setEditing] = useState(false);
@@ -245,6 +252,13 @@ function CodeNode({
             <Pencil size={12} />
           </button>
           <button
+            onClick={(e) => { e.stopPropagation(); onMerge(code); }}
+            className="p-0.5 text-gray-400 hover:text-indigo-600"
+            title="Merge into…"
+          >
+            <Merge size={12} />
+          </button>
+          <button
             onClick={(e) => {
               e.stopPropagation();
               confirmDelete();
@@ -268,6 +282,7 @@ function CodeNode({
               projectId={projectId}
               colors={colors}
               dnd={dnd}
+              onMerge={onMerge}
             />
           ))}
         </div>
@@ -352,7 +367,7 @@ function CodeDescriptionEditor({ code, projectId, codes, memos, onJumpToMention 
   };
 
   return (
-    <div className="border-t border-gray-200 bg-gray-50 p-3 shrink-0 max-h-[50%] overflow-auto">
+    <div className={`border-t border-gray-200 bg-gray-50 p-3 shrink-0 overflow-auto ${summaryText && !summaryLoading ? 'max-h-[75%]' : 'max-h-[50%]'}`}>
       <div className="flex items-center gap-2 mb-1.5">
         <span
           className="w-3 h-3 rounded-sm shrink-0"
@@ -413,12 +428,22 @@ function CodeDescriptionEditor({ code, projectId, codes, memos, onJumpToMention 
                 ? `Based on ${summarySegments.used} of ${summarySegments.total} coded segments, spread over all of them; the rest did not fit the model's context window`
                 : `Based on ${summarySegments.total} coded segment${summarySegments.total !== 1 ? 's' : ''}`}
             </span>
-            <button
-              onClick={handleCopy}
-              className="text-[10px] text-purple-500 hover:text-purple-700 flex items-center gap-0.5"
-            >
-              <Copy size={10} /> {copied ? 'Copied!' : 'Copy'}
-            </button>
+            <span className="flex items-center gap-2 shrink-0">
+              <button
+                onClick={handleCopy}
+                className="text-[10px] text-purple-500 hover:text-purple-700 flex items-center gap-0.5"
+              >
+                <Copy size={10} /> {copied ? 'Copied!' : 'Copy'}
+              </button>
+              {/* The summary takes room from the code list while it is shown. */}
+              <button
+                onClick={() => setSummaryText(null)}
+                className="text-[10px] text-purple-500 hover:text-purple-700"
+                title="Close the summary"
+              >
+                Close
+              </button>
+            </span>
           </div>
           <p className="text-xs text-purple-900 leading-relaxed whitespace-pre-wrap">{summaryText}</p>
           <AnswerTiming timing={summaryTiming} className="mt-1.5" />
@@ -499,6 +524,10 @@ export function CodeTree({ projectId, codes, memos, selectedCodeId, onSelectCode
   const [showNew, setShowNew] = useState(false);
   const [newName, setNewName] = useState('');
   const [newDesc, setNewDesc] = useState('');
+  // The dialog that defines the project's coding fields.
+  const [showFields, setShowFields] = useState(false);
+  // The code being merged into another one (merge dialog open).
+  const [mergeSource, setMergeSource] = useState<Code | null>(null);
   const queryClient = useQueryClient();
   const tree = useMemo(() => buildTree(codes), [codes]);
   const mentionCandidates = useMemo(() => buildMentionCandidates(codes, memos), [codes, memos]);
@@ -608,13 +637,33 @@ export function CodeTree({ projectId, codes, memos, selectedCodeId, onSelectCode
       >
         <div className="px-3 mb-2 flex items-center justify-between">
           <span className="text-xs font-medium text-gray-500 uppercase tracking-wide">Codes</span>
-          <button
-            onClick={() => setShowNew(true)}
-            className="p-1 text-gray-400 hover:text-indigo-600 rounded hover:bg-gray-100"
-          >
-            <Plus size={14} />
-          </button>
+          <div className="flex items-center gap-0.5">
+            <button
+              onClick={() => setShowFields(true)}
+              className="flex items-center gap-1 px-1.5 py-1 text-xs text-gray-400 hover:text-indigo-600 rounded hover:bg-gray-100"
+              title="Coding fields: questions answered each time a code is applied"
+            >
+              <ListChecks size={13} /> Fields
+            </button>
+            <button
+              onClick={() => setShowNew(true)}
+              className="p-1 text-gray-400 hover:text-indigo-600 rounded hover:bg-gray-100"
+            >
+              <Plus size={14} />
+            </button>
+          </div>
         </div>
+        {showFields && <CodingFieldsDialog projectId={projectId} onClose={() => setShowFields(false)} />}
+        {mergeSource && (
+          <MergeCodeDialog
+            projectId={projectId}
+            source={mergeSource}
+            codes={codes}
+            selectedCodeId={selectedCodeId}
+            onSelectCode={onSelectCode}
+            onClose={() => setMergeSource(null)}
+          />
+        )}
 
         {showNew && (
           <div className="mx-2 mb-2 space-y-1.5">
@@ -670,6 +719,7 @@ export function CodeTree({ projectId, codes, memos, selectedCodeId, onSelectCode
               projectId={projectId}
               colors={colors}
               dnd={dnd}
+              onMerge={setMergeSource}
             />
           ))
         )}

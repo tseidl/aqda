@@ -1,10 +1,15 @@
 import { useState, useRef, useCallback, useMemo, useEffect, useLayoutEffect } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { X, Tag, Sparkles, ChevronDown, ChevronRight, ChevronUp, Plus, Trash2, Loader2, StickyNote, EyeOff, Search, Minus as MinusIcon, Plus as PlusIcon } from 'lucide-react';
-import { codes as codesApi, documents as docsApi, type Document, type Coding, type Code, type Memo } from '../api';
+import { X, Tag, Sparkles, ChevronDown, ChevronRight, ChevronUp, Plus, Trash2, Loader2, StickyNote, EyeOff, Search, Check, Minus as MinusIcon, Plus as PlusIcon } from 'lucide-react';
+import { codes as codesApi, codings as codingsApi, documents as docsApi, type Document, type Coding, type Code, type Memo } from '../api';
 import { MentionTextarea } from './MentionTextarea';
+import { CodingAnswers, CodingFieldsForm } from './CodingFieldsForm';
+import { ActionError, invalidateAnswers, readableError, useCodingFieldsState } from './codingFields';
 import { buildMentionCandidates } from './mentions';
 import { useStoredState } from './storedState';
+import { CoderLabel } from './CoderLabel';
+import { CoderVisibilityControl } from './CoderVisibilityControl';
+import { codingLayerKey, sameAnswers, useCoderLayers, useCoderName, useHiddenLayers, useModelRuns } from './coderLayers';
 
 interface Props {
   document: Document;
@@ -12,10 +17,17 @@ interface Props {
   codes: Code[];
   memos: Memo[];
   selectedCodeId: number | null;
-  onApplyCode: (codeId: number, startPos: number, endPos: number, text: string) => void;
+  /** Apply a code with one click. `explainRefusal` may take over the message when the server
+   *  refuses the coding; it returns true when it did. */
+  onApplyCode: (
+    codeId: number, startPos: number, endPos: number, text: string,
+    explainRefusal?: (error: unknown) => boolean,
+  ) => void;
   onDeleteCoding: (id: number) => void;
   onSelectCode: (id: number) => void;
   onAddMemo?: (documentId: number, startPos: number, endPos: number, text: string, title?: string, content?: string) => void;
+  /** Open a memo (from the mark its passage carries in the text). */
+  onOpenMemo?: (memoId: number) => void;
   highlightRange?: { start: number; end: number } | null;
   onHighlightClear?: () => void;
 }
@@ -117,6 +129,9 @@ function rangeFromOffsets(root: HTMLElement, start: number, end: number): Range 
 // runs once when the field appears).
 const focusWithoutScroll = (el: HTMLElement | null) => el?.focus({ preventScroll: true });
 
+// Whether the server refused a coding because the same coding already exists.
+const isDuplicateRefusal = (error: unknown) => error instanceof Error && /^409:/.test(error.message);
+
 // Name of the CSS highlight that keeps the passage being coded marked (see index.css).
 const PENDING_HIGHLIGHT = 'aqda-pending-passage';
 
@@ -158,15 +173,16 @@ function foldCase(text: string): {
   };
 }
 
-export function DocumentViewer({ document: doc, codings, codes, memos, selectedCodeId, onApplyCode, onDeleteCoding, onAddMemo, highlightRange, onHighlightClear }: Props) {
+export function DocumentViewer({ document: doc, codings: allCodings, codes, memos, selectedCodeId, onApplyCode, onDeleteCoding, onAddMemo, onOpenMemo, highlightRange, onHighlightClear }: Props) {
   const contentRef = useRef<HTMLDivElement>(null);
   const textContentRef = useRef<HTMLDivElement>(null);
   const queryClient = useQueryClient();
   const [selection, setSelection] = useState<TextSelection | null>(null);
   // Display preferences are remembered: the viewer is re-created for each newly opened document.
   const [docFontSize, setDocFontSize] = useStoredState('aqda.docFontSize', 14);
+  // What a click on a passage found there: its codings and the memos written on it.
   const [clickedCoding, setClickedCoding] = useState<{
-    codings: Coding[]; rect: { top: number; left: number };
+    codings: Coding[]; memos: Memo[]; rect: { top: number; left: number };
   } | null>(null);
   const [showNewCodeInput, setShowNewCodeInput] = useState(false);
   const [newCodeName, setNewCodeName] = useState('');
@@ -182,6 +198,13 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
   const [tagValue, setTagValue] = useState('');
   const [memoDraft, setMemoDraft] = useState<{ title: string; content: string } | null>(null);
   const [newCodeError, setNewCodeError] = useState<string | null>(null);
+  // Coding fields: when the project defines any, choosing a code opens a step that asks for
+  // the answers (pendingCode) before the coding is saved; otherwise one click applies it. No
+  // code is applied before the list is known (`fieldsReady`), so the step is never skipped.
+  const {
+    fields: codingFields, ready: fieldsReady, error: fieldsError, retry: retryFields,
+  } = useCodingFieldsState(doc.project_id);
+  const [pendingCode, setPendingCode] = useState<{ id: number; name: string; color: string } | null>(null);
   const highlightRef = useRef<HTMLElement | null>(null);
   const popupClickRef = useRef(false);
   // In-document find (Cmd/Ctrl+F)
@@ -255,6 +278,85 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
   }, [codes]);
 
   const mentionCandidates = useMemo(() => buildMentionCandidates(codes, memos), [codes, memos]);
+
+  // Who coded what: hand coders and model runs, each of which can be hidden in this view.
+  const { runs: runList, loaded: runsLoaded } = useModelRuns(doc.project_id);
+  const layers = useCoderLayers(doc.project_id, runList);
+  const { hidden: hiddenLayers, toggle: toggleLayer, showAll: showAllLayers } = useHiddenLayers(doc.project_id);
+  const cachedCoderName = useCoderName();
+  // The coder name the server stamped on this viewer's last new coding. It counts as the
+  // current name until the cached settings change, so nothing rests on a stale name.
+  const [stampedCoder, setStampedCoder] = useState<{ cached: string; server: string } | null>(null);
+  const coderName = stampedCoder && stampedCoder.cached === cachedCoderName ? stampedCoder.server : cachedCoderName;
+  // Remember the coder name of a coding the server just created; refresh the settings if
+  // they were out of date.
+  const noteCreatedCoder = useCallback((created: Coding) => {
+    const server = created.coder ?? '';
+    setStampedCoder({ cached: cachedCoderName, server });
+    if (server !== cachedCoderName) queryClient.invalidateQueries({ queryKey: ['settings'] });
+  }, [cachedCoderName, queryClient]);
+  const runUuids = useMemo(() => new Map(runList.map((run) => [run.id, run.uuid])), [runList]);
+  // The codings drawn and listed here: those of hidden coders and runs are left out. Until
+  // the runs are known, model codings stay out if any run is hidden, so they never flash up.
+  const codings = useMemo(() => {
+    if (!hiddenLayers.size) return allCodings;
+    const runHidden = [...hiddenLayers].some((key) => key.startsWith('run:'));
+    return allCodings.filter((c) =>
+      (runsLoaded || c.run_id == null || !runHidden) && !hiddenLayers.has(codingLayerKey(c, runUuids)));
+  }, [allCodings, hiddenLayers, runUuids, runsLoaded]);
+  const hiddenInDocument = allCodings.length - codings.length;
+
+  // Whether the researcher's own coding with this code, passage, and answers exists but is
+  // hidden in this view: then the server's duplicate refusal needs explaining.
+  const hiddenOwnDuplicate = useCallback(
+    (codeId: number, start: number, end: number, answers: Record<string, string>) => {
+      const shown = new Set(codings.map((c) => c.id));
+      return allCodings.some((c) =>
+        !shown.has(c.id) && c.run_id == null && c.code_id === codeId && c.start_pos === start &&
+        c.end_pos === end && (c.coder ?? '') === coderName && sameAnswers(c.fields, answers));
+    },
+    [allCodings, codings, coderName],
+  );
+  const hiddenDuplicateMessage = codingFields.length > 0
+    ? 'This code is already applied to this passage with these answers; it is there but hidden in this view.'
+    : 'This code is already applied to exactly this passage; it is there but hidden in this view.';
+  // Such an explanation after a one-click coding, shown above the text while anything is hidden.
+  const [hiddenRefusal, setHiddenRefusal] = useState<string | null>(null);
+  const aliveRef = useRef(true);
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => { aliveRef.current = false; };
+  }, []);
+
+  // "Accept" a model coding: it becomes the researcher's own coding (one coding, not two)
+  // and remembers the run it came from. Not offered when the researcher already coded the
+  // passage the same way independently.
+  const [acceptingId, setAcceptingId] = useState<number | null>(null);
+  const [acceptError, setAcceptError] = useState<{ id: number; message: string } | null>(null);
+  const codedItMyself = useCallback(
+    (model: Coding) => allCodings.some((c) =>
+      c.run_id == null && c.code_id === model.code_id && c.start_pos === model.start_pos &&
+      c.end_pos === model.end_pos && (c.coder ?? '') === coderName && sameAnswers(c.fields, model.fields)),
+    [allCodings, coderName],
+  );
+  const acceptCoding = useCallback(async (model: Coding) => {
+    setAcceptingId(model.id);
+    setAcceptError(null);
+    try {
+      noteCreatedCoder(await codingsApi.accept(model.id));
+    } catch (error) {
+      setAcceptError({ id: model.id, message: readableError(error) });
+    }
+    // The button stays busy until the list shows the change, so it cannot be sent twice.
+    try {
+      await Promise.all([
+        invalidateAnswers(queryClient, doc.project_id),
+        queryClient.invalidateQueries({ queryKey: ['model-runs', doc.project_id] }),
+      ]);
+    } finally {
+      setAcceptingId(null);
+    }
+  }, [queryClient, doc.project_id, noteCreatedCoder]);
 
   // For audio docs with transcript, coding operates on the transcript text
   const codeableText = (doc.source_type === 'audio' && doc.transcript) ? doc.transcript : (doc.content ?? '');
@@ -344,16 +446,31 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     return () => cancelAnimationFrame(raf);
   }, [findOpen, safeFindIdx, findMatches]);
 
-  // Build rendered content with highlight spans
+  // Memos written on a passage of this document. Their passages are marked in the text.
+  const passageMemos = useMemo(
+    () => (hasSearchableText
+      ? memos.filter((m) => m.document_id === doc.id && m.start_pos != null && m.end_pos != null && m.end_pos > m.start_pos)
+      : []),
+    [memos, doc.id, hasSearchableText],
+  );
+
+  // Build rendered content with highlight spans. Memo passages only add segment boundaries
+  // and a CSS class: the text itself stays as it is, so offsets are computed as before.
   const renderedContent = useMemo(() => {
     const text = codeableText;
-    if (codings.length === 0 && !activeHighlight) return [{ text, codings: [] as Coding[], highlighted: false }];
+    if (codings.length === 0 && !activeHighlight && passageMemos.length === 0) {
+      return [{ text, codings: [] as Coding[], memos: [] as Memo[], highlighted: false }];
+    }
 
-    type Event = { pos: number; type: 'start' | 'end'; coding?: Coding; highlight?: boolean };
+    type Event = { pos: number; type: 'start' | 'end'; coding?: Coding; memo?: Memo; highlight?: boolean };
     const events: Event[] = [];
     for (const c of codings) {
       events.push({ pos: c.start_pos, type: 'start', coding: c });
       events.push({ pos: c.end_pos, type: 'end', coding: c });
+    }
+    for (const m of passageMemos) {
+      events.push({ pos: m.start_pos!, type: 'start', memo: m });
+      events.push({ pos: m.end_pos!, type: 'end', memo: m });
     }
     if (activeHighlight) {
       events.push({ pos: activeHighlight.start, type: 'start', highlight: true });
@@ -361,30 +478,34 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     }
     events.sort((a, b) => a.pos - b.pos || (a.type === 'end' ? -1 : 1));
 
-    const segments: { text: string; codings: Coding[]; highlighted: boolean }[] = [];
+    const segments: { text: string; codings: Coding[]; memos: Memo[]; highlighted: boolean }[] = [];
     const active = new Set<Coding>();
+    const activeMemos = new Set<Memo>();
     let isHighlighted = false;
     let lastPos = 0;
 
     for (const ev of events) {
       const jsPos = codePointToUtf16(offsetIndex, ev.pos);
       if (jsPos > lastPos) {
-        segments.push({ text: text.slice(lastPos, jsPos), codings: [...active], highlighted: isHighlighted });
+        segments.push({ text: text.slice(lastPos, jsPos), codings: [...active], memos: [...activeMemos], highlighted: isHighlighted });
       }
       if (ev.highlight) {
         isHighlighted = ev.type === 'start';
       } else if (ev.coding) {
         if (ev.type === 'start') active.add(ev.coding);
         else active.delete(ev.coding);
+      } else if (ev.memo) {
+        if (ev.type === 'start') activeMemos.add(ev.memo);
+        else activeMemos.delete(ev.memo);
       }
       lastPos = jsPos;
     }
     if (lastPos < text.length) {
-      segments.push({ text: text.slice(lastPos), codings: [], highlighted: false });
+      segments.push({ text: text.slice(lastPos), codings: [], memos: [], highlighted: false });
     }
 
     return segments;
-  }, [codeableText, codings, activeHighlight, offsetIndex]);
+  }, [codeableText, codings, passageMemos, activeHighlight, offsetIndex]);
 
   const firstHighlightIdx = useMemo(
     () => renderedContent.findIndex((seg) => seg.highlighted),
@@ -420,6 +541,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     setSelection(null);
     setMemoDraft(null);
     setShowNewCodeInput(false);
+    setPendingCode(null);
   }, [doc.id]);
 
   // Handle text selection or click on coded passage
@@ -460,12 +582,13 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
       return;
     }
 
-    // No selection — check if clicked on a coded passage
+    // No selection — check if clicked on a coded passage or on a passage with a memo
     if (sel.anchorNode && textContentRef.current.contains(sel.anchorNode)) {
       const rawClickPos = textOffset(textContentRef.current, sel.anchorNode, sel.anchorOffset);
       const clickPos = utf16ToCodePoint(offsetIndex, rawClickPos);
       const overlapping = codings.filter(c => c.start_pos <= clickPos && c.end_pos > clickPos);
-      if (overlapping.length > 0) {
+      const memosHere = passageMemos.filter(m => m.start_pos! <= clickPos && m.end_pos! > clickPos);
+      if (overlapping.length > 0 || memosHere.length > 0) {
         const range = document.createRange();
         range.setStart(sel.anchorNode, sel.anchorOffset);
         range.setEnd(sel.anchorNode, sel.anchorOffset);
@@ -473,6 +596,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
         const containerRect = contentRef.current.getBoundingClientRect();
         setClickedCoding({
           codings: overlapping,
+          memos: memosHere,
           rect: {
             top: rect.top - containerRect.top + contentRef.current.scrollTop,
             left: Math.max(10, rect.left - containerRect.left),
@@ -489,10 +613,10 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     setClickedCoding(null);
     setSelection(null);
     setShowNewCodeInput(false);
-  }, [codings, codeableText, offsetIndex, closeMemoDraft]);
+  }, [codings, passageMemos, codeableText, offsetIndex, closeMemoDraft]);
 
   // The popup's code filter and any earlier error start empty for every new selection.
-  useEffect(() => { setCodeFilter(''); setNewCodeError(null); }, [selection]);
+  useEffect(() => { setCodeFilter(''); setNewCodeError(null); setPendingCode(null); }, [selection]);
 
   // Keep the passage marked while its popup is open: focusing the popup's fields removes the
   // browser's own selection. A CSS highlight paints the range without changing the text.
@@ -522,17 +646,62 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     const roomAbove = selection.rect.top - box.scrollTop - 10;
     const roomBelow = box.scrollTop + box.clientHeight - selection.rect.bottom - 8;
     setPopupAbove(roomAbove >= height || (roomBelow < height && roomAbove > roomBelow));
-  }, [selection, memoOpen, showNewCodeInput]);
+  }, [selection, memoOpen, showNewCodeInput, pendingCode]);
 
-  // Apply code to selection
+  // Apply code to selection; with coding fields, first ask for the answers.
   const applyCode = useCallback(
-    (codeId: number) => {
-      if (!selection) return;
-      onApplyCode(codeId, selection.start, selection.end, selection.text);
+    (codeId: number, known?: Code) => {
+      if (!selection || !fieldsReady) return;
+      if (codingFields.length > 0) {
+        const code = known ?? codeMap.get(codeId);
+        setPendingCode({ id: codeId, name: code?.name ?? '', color: code?.color ?? '#6366f1' });
+        setShowNewCodeInput(false);
+        return;
+      }
+      const { start, end } = selection;
+      // A refusal because the same coding exists, hidden in this view, is explained here.
+      const explainRefusal = (error: unknown) => {
+        if (!aliveRef.current || !isDuplicateRefusal(error) || !hiddenOwnDuplicate(codeId, start, end, {})) {
+          return false;
+        }
+        setHiddenRefusal(hiddenDuplicateMessage);
+        return true;
+      };
+      setHiddenRefusal(null);
+      onApplyCode(codeId, start, end, selection.text, explainRefusal);
       setSelection(null);
       window.getSelection()?.removeAllRanges();
     },
-    [selection, onApplyCode]
+    [selection, onApplyCode, codingFields.length, codeMap, fieldsReady, hiddenOwnDuplicate, hiddenDuplicateMessage]
+  );
+
+  // Save the pending code with its answers in one request. A refusal (the same coding
+  // already exists, an answer of the wrong kind) rejects and is shown in the popup.
+  const saveCodingWithAnswers = useCallback(
+    async (answers: Record<string, string>) => {
+      if (!selection || !pendingCode) return;
+      let created: Coding;
+      try {
+        created = await codingsApi.create({
+          document_id: doc.id,
+          code_id: pendingCode.id,
+          start_pos: selection.start,
+          end_pos: selection.end,
+          selected_text: selection.text,
+          fields: answers,
+        });
+      } catch (error) {
+        if (isDuplicateRefusal(error) && hiddenOwnDuplicate(pendingCode.id, selection.start, selection.end, answers)) {
+          throw new ActionError(hiddenDuplicateMessage, { label: 'Show all', run: showAllLayers });
+        }
+        throw error;
+      }
+      noteCreatedCoder(created);
+      invalidateAnswers(queryClient, doc.project_id);
+      setSelection(null);
+      window.getSelection()?.removeAllRanges();
+    },
+    [selection, pendingCode, doc.id, doc.project_id, queryClient, hiddenOwnDuplicate, hiddenDuplicateMessage, showAllLayers, noteCreatedCoder]
   );
 
   // Save the memo drafted in the selection popup
@@ -560,7 +729,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     }
     setNewCodeError(null);
     queryClient.invalidateQueries({ queryKey: ['codes', doc.project_id] });
-    applyCode(newCode.id);
+    applyCode(newCode.id, newCode);
     setNewCodeName('');
     setNewCodeDesc('');
     setShowNewCodeInput(false);
@@ -571,37 +740,52 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
     <div ref={textContentRef} className="p-6 max-w-4xl mx-auto text-gray-800 whitespace-pre-wrap select-text" style={{ fontSize: `${docFontSize}px`, lineHeight: 1.8 }}>
       {renderedContent.map((seg, i) => {
         const isFirstHighlight = i === firstHighlightIdx;
+        // A passage with a memo carries a dotted grey underline (see index.css).
+        const hasMemo = seg.memos.length > 0;
+        const memoNote = hasMemo
+          ? `Memo: ${seg.memos.map((m) => m.title || 'Untitled memo').join(', ')}`
+          : undefined;
         if (seg.codings.length === 0 && !seg.highlighted) {
-          return <span key={i}>{seg.text}</span>;
+          return hasMemo
+            ? <span key={i} className="memo-passage" title={memoNote}>{seg.text}</span>
+            : <span key={i}>{seg.text}</span>;
         }
         if (seg.codings.length === 0 && seg.highlighted) {
           return (
             <mark
               key={i}
               ref={isFirstHighlight ? (el) => { highlightRef.current = el; } : undefined}
-              className="ai-search-highlight"
+              className={`ai-search-highlight${hasMemo ? ' memo-passage' : ''}`}
+              title={memoNote}
               style={{ backgroundColor: 'rgba(120, 120, 120, 0.2)', borderBottom: '2px solid #9ca3af' }}
             >
               {seg.text}
             </mark>
           );
         }
-        // Use the first coding's color as primary, show all on hover
-        const primary = seg.codings[0];
+        // A hand coding's colour leads where there is one; a passage coded only by model
+        // runs gets a lighter fill and a dashed underline in its code's colour. All codings
+        // show on hover.
+        const hand = seg.codings.find((c) => c.run_id == null);
+        const primary = hand ?? seg.codings[0];
+        const modelOnly = !hand;
         const color = primary.code_color ?? '#6366f1';
         return (
           <mark
             key={i}
             ref={isFirstHighlight ? (el) => { highlightRef.current = el; } : undefined}
             data-color={color}
-            className={seg.highlighted ? 'ai-search-highlight' : undefined}
+            data-model={modelOnly ? '' : undefined}
+            className={[seg.highlighted ? 'ai-search-highlight' : '', hasMemo ? 'memo-passage' : ''].join(' ').trim() || undefined}
             style={{
               backgroundColor: seg.highlighted
                 ? 'rgba(120, 120, 120, 0.25)'
-                : color + '30',
-              borderBottom: `2px solid ${seg.highlighted ? '#9ca3af' : color}`,
+                : color + (modelOnly ? '14' : '30'),
+              borderBottom: `2px ${modelOnly && !seg.highlighted ? 'dashed' : 'solid'} ${seg.highlighted ? '#9ca3af' : color}`,
             }}
-            title={seg.codings.map((c) => c.code_name).join(', ')}
+            title={seg.codings
+              .map((c) => (c.run_id == null ? c.code_name : `${c.code_name} (model run “${c.run_label ?? c.coder}”)`))
+              .join(', ') + (memoNote ? `\n${memoNote}` : '')}
           >
             {seg.text}
           </mark>
@@ -667,6 +851,13 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
                 <EyeOff size={13} /> Excluded from AI
               </span>
             ) : null}
+            <CoderVisibilityControl
+              layers={layers}
+              hidden={hiddenLayers}
+              onToggle={toggleLayer}
+              onShowAll={showAllLayers}
+              hiddenInDocument={hiddenInDocument}
+            />
             {Object.keys(variables).length > 0 && !showVariables && (
               <span className="text-xs text-gray-400">
                 {Object.keys(variables).length} variable{Object.keys(variables).length !== 1 ? 's' : ''}
@@ -833,6 +1024,27 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
             </div>
           </div>
         )}
+        {/* A one-click coding refused because the same coding is hidden in this view */}
+        {hiddenRefusal && hiddenLayers.size > 0 && (
+          <div className="sticky top-0 z-40 flex justify-center pointer-events-none">
+            <div
+              className="pointer-events-auto m-2 flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs text-amber-900 shadow-sm"
+              role="alert"
+              data-hidden-refusal
+            >
+              <span>{hiddenRefusal}</span>
+              <button
+                onClick={() => { showAllLayers(); setHiddenRefusal(null); }}
+                className="font-medium text-indigo-600 hover:text-indigo-700 shrink-0"
+              >
+                Show all
+              </button>
+              <button onClick={() => setHiddenRefusal(null)} className="text-amber-700 hover:text-amber-900 shrink-0" title="Close">
+                <X size={12} />
+              </button>
+            </div>
+          </div>
+        )}
         {doc.source_type === 'image' ? (
           <div className="p-6 flex items-center justify-center">
             <img
@@ -939,16 +1151,41 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
                   <button onClick={() => setMemoDraft(null)} className="px-2 py-1 text-sm rounded bg-gray-100 text-gray-500 hover:bg-gray-200">Cancel</button>
                 </div>
               </div>
+            ) : pendingCode ? (
+              <div onMouseDown={(e) => { e.stopPropagation(); popupClickRef.current = true; }}>
+                <div className="text-xs text-gray-500 mb-2 flex items-center justify-between">
+                  <span className="flex items-center gap-1"><Tag size={12} /> Apply code</span>
+                  <button onClick={() => setSelection(null)} className="text-gray-400 hover:text-gray-600" title="Close">
+                    <X size={14} />
+                  </button>
+                </div>
+                <CodingFieldsForm
+                  key={pendingCode.id}
+                  fields={codingFields}
+                  heading={
+                    <div className="flex items-center gap-2 px-2 py-1 mb-2 rounded bg-gray-50">
+                      <span className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ backgroundColor: pendingCode.color }} />
+                      <span className="text-sm font-medium text-gray-700 truncate">{pendingCode.name}</span>
+                    </div>
+                  }
+                  saveLabel="Save coding"
+                  backLabel="Back"
+                  autoFocus
+                  onSave={saveCodingWithAnswers}
+                  onBack={() => setPendingCode(null)}
+                />
+              </div>
             ) : (<>
             {/* Existing codings on this selection — with delete */}
             {overlapping.length > 0 && (
               <div className="mb-2 pb-2 border-b border-gray-100">
                 <p className="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Active codings</p>
                 {overlapping.map((c) => (
-                  <div key={c.id} className="flex items-center gap-2 px-2 py-1 rounded hover:bg-red-50 group">
+                  <div key={c.id}>
+                  <div className="flex items-center gap-2 px-2 py-1 rounded hover:bg-red-50 group">
                     <span className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ backgroundColor: c.code_color }} />
                     <span className="text-sm text-gray-700 truncate flex-1">{c.code_name}</span>
-                    {c.coder && <span className="text-[10px] text-gray-400 shrink-0" title="Coder">{c.coder}</span>}
+                    <CoderLabel coding={c} />
                     <button
                       onClick={() => { onDeleteCoding(c.id); setSelection(null); }}
                       className="text-gray-300 group-hover:text-red-500 p-0.5"
@@ -956,6 +1193,11 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
                     >
                       <Trash2 size={12} />
                     </button>
+                  </div>
+                  {/* Field answers (none in a project without coding fields) */}
+                  <div className="pl-6 pr-2" onMouseDown={(e) => { e.stopPropagation(); popupClickRef.current = true; }}>
+                    <CodingAnswers coding={c} fields={codingFields} projectId={doc.project_id} />
+                  </div>
                   </div>
                 ))}
               </div>
@@ -968,11 +1210,31 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
               </button>
             </div>
 
+            {/* Until the coding fields are known, codes cannot be applied (the answers step
+                must not be skipped); normally this is too brief to see. */}
+            {!fieldsReady && (
+              <p className="text-[11px] mb-1.5 px-0.5" data-fields-status>
+                {fieldsError ? (
+                  <span className="text-red-600">
+                    AQDA could not load the coding fields, so codes cannot be applied yet. {fieldsError}{' '}
+                    <button onClick={() => retryFields()} className="text-indigo-600 hover:text-indigo-700 font-medium">
+                      Try again
+                    </button>
+                  </span>
+                ) : (
+                  <span className="text-gray-400 flex items-center gap-1">
+                    <Loader2 size={11} className="animate-spin" /> Loading coding fields…
+                  </span>
+                )}
+              </p>
+            )}
+
             {/* Quick apply with selected code */}
             {selectedCodeId && (
               <button
                 onClick={() => applyCode(selectedCodeId)}
-                className="w-full text-left px-2 py-1.5 rounded text-sm hover:bg-gray-50 flex items-center gap-2 mb-1 font-medium"
+                disabled={!fieldsReady}
+                className="w-full text-left px-2 py-1.5 rounded text-sm hover:bg-gray-50 flex items-center gap-2 mb-1 font-medium disabled:opacity-50"
               >
                 <span
                   className="w-3 h-3 rounded-sm shrink-0"
@@ -1007,7 +1269,8 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
                   <button
                     key={code.id}
                     onClick={() => applyCode(code.id)}
-                    className="w-full text-left px-2 py-1 rounded text-sm hover:bg-gray-50 flex items-center gap-2"
+                    disabled={!fieldsReady}
+                    className="w-full text-left px-2 py-1 rounded text-sm hover:bg-gray-50 flex items-center gap-2 disabled:opacity-50"
                   >
                     <span
                       className="w-2.5 h-2.5 rounded-sm shrink-0"
@@ -1032,7 +1295,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
                   onMouseDown={(e) => { e.stopPropagation(); popupClickRef.current = true; }}
                   className="w-full px-2 py-1 border border-gray-200 rounded text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500"
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter' && newCodeName.trim()) createNewCode();
+                    if (e.key === 'Enter' && newCodeName.trim() && fieldsReady) createNewCode();
                     if (e.key === 'Escape') { setShowNewCodeInput(false); setNewCodeName(''); setNewCodeDesc(''); }
                   }}
                 />
@@ -1048,7 +1311,7 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
                 />
                 <button
                   onClick={createNewCode}
-                  disabled={!newCodeName.trim()}
+                  disabled={!newCodeName.trim() || !fieldsReady}
                   className="w-full py-1 text-sm font-medium rounded bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   Create &amp; apply
@@ -1085,24 +1348,58 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
         {/* Click-on-coded-passage popup */}
         {clickedCoding && (
           <div
-            className="absolute z-50 bg-white rounded-lg shadow-xl border border-gray-200 py-2 px-1 min-w-[180px]"
+            className="absolute z-50 bg-white rounded-lg shadow-xl border border-gray-200 py-2 px-1 min-w-[180px] max-w-[420px]"
             style={{
               top: clickedCoding.rect.top + 20,
-              left: Math.min(clickedCoding.rect.left, (contentRef.current?.clientWidth ?? 400) - 200),
+              left: Math.max(10, Math.min(clickedCoding.rect.left, (contentRef.current?.clientWidth ?? 480) - 430)),
             }}
             onMouseDown={(e) => { e.preventDefault(); popupClickRef.current = true; }}
           >
             <div className="px-2 pb-1.5 mb-1 border-b border-gray-100 flex items-center justify-between">
-              <span className="text-[10px] text-gray-400 uppercase tracking-wider">Applied codes</span>
+              <span className="text-[10px] text-gray-400 uppercase tracking-wider">
+                {clickedCoding.codings.length > 0 ? 'Applied codes' : 'Memo on this passage'}
+              </span>
               <button onClick={() => setClickedCoding(null)} className="text-gray-400 hover:text-gray-600">
                 <X size={12} />
               </button>
             </div>
-            {clickedCoding.codings.map((c) => (
-              <div key={c.id} className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-red-50 group">
+            {clickedCoding.codings.map((clicked) => {
+              // The current version of the coding, so edited answers show at once; a coding
+              // hidden meanwhile (by the Coders control) leaves the list.
+              const c = codings.find((x) => x.id === clicked.id) ?? (allCodings.some((x) => x.id === clicked.id) ? null : clicked);
+              if (!c) return null;
+              const alsoMine = c.run_id != null && codedItMyself(c);
+              // A model coding, or one accepted from a model run, says so in words on a
+              // line of its own; a plain hand coding keeps the coder's name beside the code.
+              const fromRun = c.run_id != null;
+              const acceptedFrom = !fromRun && c.accepted_from_run_id != null;
+              const runName = (fromRun ? c.run_label : c.accepted_from_run_label) ?? 'a model run';
+              const runModel = fromRun ? c.run_model : c.accepted_from_run_model;
+              return (
+              <div key={c.id}>
+              <div className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-gray-50 group">
                 <span className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ backgroundColor: c.code_color }} />
-                <span className="text-sm text-gray-700 truncate flex-1">{c.code_name}</span>
-                {c.coder && <span className="text-[10px] text-gray-400 shrink-0" title="Coder">{c.coder}</span>}
+                <span className="text-sm text-gray-700 truncate flex-1" title={c.code_name}>{c.code_name}</span>
+                {!fromRun && !acceptedFrom && <CoderLabel coding={c} />}
+                {c.run_id != null && (alsoMine ? (
+                  <span
+                    className="text-[11px] text-gray-400 shrink-0"
+                    title="You coded this passage yourself with the same code and answers; your coding is listed separately"
+                    data-also-mine
+                  >
+                    also yours
+                  </span>
+                ) : (
+                  <button
+                    onClick={() => acceptCoding(c)}
+                    disabled={acceptingId !== null}
+                    className="text-[11px] px-1.5 py-0.5 rounded border border-indigo-200 text-indigo-600 hover:bg-indigo-50 disabled:opacity-50 shrink-0"
+                    title="Make this coding your own. It stays if the model run is removed, and it remembers which run suggested it."
+                    data-accept
+                  >
+                    {acceptingId === c.id ? 'Accepting…' : 'Accept'}
+                  </button>
+                ))}
                 <button
                   onClick={() => { onDeleteCoding(c.id); setClickedCoding(null); }}
                   className="text-gray-300 group-hover:text-red-500 p-0.5"
@@ -1111,7 +1408,54 @@ export function DocumentViewer({ document: doc, codings, codes, memos, selectedC
                   <Trash2 size={12} />
                 </button>
               </div>
-            ))}
+              {(fromRun || acceptedFrom) && (
+                <p
+                  className="pl-6 pr-2 pb-1 text-[11px] leading-snug text-gray-500 flex items-center gap-1"
+                  title={runModel ? `Model: ${runModel}` : undefined}
+                  data-provenance={fromRun ? 'suggested' : 'accepted'}
+                >
+                  {acceptedFrom && <Check size={11} className="shrink-0 text-green-600" />}
+                  <span>
+                    {fromRun
+                      ? <>Suggested by model run “{runName}”, not accepted</>
+                      : <>Accepted{c.coder ? ` by ${c.coder}` : ''}; suggested by model run “{runName}”</>}
+                  </span>
+                </p>
+              )}
+              {acceptError?.id === c.id && (
+                <p className="px-2 text-[11px] text-red-600" role="alert">{acceptError.message}</p>
+              )}
+              {/* Field answers (none in a project without coding fields) */}
+              <div className="pl-6 pr-2 max-w-[300px]" onMouseDown={(e) => { e.stopPropagation(); popupClickRef.current = true; }}>
+                <CodingAnswers coding={c} fields={codingFields} projectId={doc.project_id} />
+              </div>
+              </div>
+              );
+            })}
+            {/* Memos written on the clicked passage; a click opens the memo. */}
+            {clickedCoding.memos.length > 0 && (
+              <div className={clickedCoding.codings.length > 0 ? 'mt-1 pt-1 border-t border-gray-100' : ''} data-passage-memos>
+                {clickedCoding.codings.length > 0 && (
+                  <p className="px-2 py-1 text-[10px] text-gray-400 uppercase tracking-wider">Memo on this passage</p>
+                )}
+                {clickedCoding.memos.map((clicked) => {
+                  // The memo as it is now (renamed meanwhile); a deleted memo leaves the list.
+                  const memo = passageMemos.find((m) => m.id === clicked.id);
+                  if (!memo) return null;
+                  return (
+                    <button
+                      key={memo.id}
+                      onClick={() => { onOpenMemo?.(memo.id); setClickedCoding(null); }}
+                      className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-left hover:bg-amber-50"
+                      title="Open this memo"
+                    >
+                      <StickyNote size={12} className="text-amber-500 shrink-0" />
+                      <span className="text-sm text-gray-700 truncate">{memo.title || 'Untitled memo'}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
         )}
 
