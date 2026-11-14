@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.8.0
+
+### New features
+- **Model runs (advanced)** — for developing codes inductively with the help of language
+  models: a program on your computer can let one or several models suggest codes and passages
+  through AQDA's local interface. This works without any codes to start from, and each model's
+  proposals are kept apart. The suggestions sit in the text for you to work through.
+  The program sends verbatim quotes with a code; AQDA finds each quote in the document itself
+  and refuses, with a reason, any quote it cannot place exactly once. All codings of one pass
+  form a run that records the model, the instructions, the codebook, the documents read, and
+  the refused quotes. Model codings are shown with a dashed underline and the name of their
+  run. **Accept** makes a model coding your own; it then stays when the run is removed and
+  remembers which run suggested it. A run can be removed and restored as a whole under
+  **AI → Model runs**, which appears once a project has a run. An example program ships with
+  AQDA (`python -m aqda.examples.model_coding`); see
+  [docs/model-runs.md](https://github.com/tseidl/aqda/blob/main/docs/model-runs.md).
+- **Show or hide coders** — **Coders** in the document toolbar shows or hides the codings of
+  each coder and each model run, for example to code a document yourself before looking at
+  what a model did. The button says so while anything is hidden.
+- **Color-blind-safe code colors** — an additional color scheme for new codes, **Color-blind
+  safe**, whose eight colors stay distinguishable with the common forms of color blindness.
+  Choose it under **Settings**; the default scheme is unchanged.
+- **Merge codes** — fold one code into another from the code tree. Coded segments, memos, and
+  child codes move over; exact duplicates are dropped; a differing definition is kept as a
+  memo. AQDA makes a backup first, because a merge cannot be undone inside AQDA.
+- **Coding fields** — optional questions answered each time a code is applied (yes / no, whole
+  number, or text with suggestions from earlier answers), defined per project under
+  **Codes → Fields**. One passage can carry the same code several times with different
+  answers, for example for two speakers.
+- **Statements export** — a CSV with one row per coded segment: document, code and its path,
+  coder, model run, the run an accepted coding came from, passage, and one column per
+  document variable and coding field.
+
+### Improvements
+- **The same code can be applied to a passage by different coders** — before, AQDA refused a
+  code that anyone had already applied to exactly that passage.
+- **Projects from a newer AQDA are refused instead of imported incompletely** — and a project
+  that uses model runs or coding fields is not replaced by a version from a collaborator whose
+  AQDA is too old to keep them; AQDA says that the collaborator needs to update. Collaborators
+  still on 0.7.0 or older cannot be warned by their own AQDA, so update together before using
+  model runs or coding fields in a shared project.
+- **Shared projects wait for a model run** — while a run is in progress, AQDA neither sends nor
+  applies collaborators' changes for that project, and says so.
+- **Code Suggest and the definition generator use hand codings only** — codings from model
+  runs do not serve as examples there.
+- **Summaries and definitions are plain text** — a theme summary no longer shows asterisks
+  and other formatting marks, and it no longer refers to "Passage 3": the model now sees each
+  passage with the name of its document and is asked to quote a few words or name the document
+  instead. Generated definitions and the descriptions in Hierarchy Suggest are cleaned in the
+  same way. A summary also gets more room in the Codes tab and can be closed.
+- **Passages with a memo are marked in the text** — a dotted underline shows that a passage
+  has a memo. Click the passage and then the memo's title to open it.
+- **The `@` list in memos works with the keyboard** — the arrow keys move through the list,
+  Enter or Tab inserts the highlighted entry, and Escape closes the list.
+- **Collaborator references are named as such** — a new reference project is called
+  "… (collaborator reference from Ben, 2026-11-13)" instead of "conflicting copy", like its
+  badge and the documentation. Existing projects keep their names.
+- **Settings say what the backups are** — the count under Collaboration is now labelled
+  **Backups** and lists daily backups and backups made before collaborator updates
+  separately. Before, a new installation showed "Safety backups: 1" for its first daily backup.
+- **The language model setting names its uses** — definitions, summaries, and grouping
+  suggestions (it mentioned a chat that does not exist).
+
+### Bug fixes
+- **Topic Search passages could start in the middle of a word** — passages now begin and end
+  with whole sentences where possible, otherwise with whole words. Documents are embedded
+  again on the next AI run, so the first search after updating takes longer.
+
 ## 0.7.0
 
 ### Improvements
@@ -212,6 +280,12 @@
   dropdown per document variable (with per-value counts); active filters combine, the
   funnel icon turns indigo while any filter is active, and a one-click reset clears them.
   Variables with more than 25 distinct values (IDs, dates) are not offered as filters.
+
+## 0.3.1
+
+- **First release on PyPI** — `pipx install aqda` works from here on. Adds the command-line
+  options `--help`, `--version`, `--host`, `--port`, and `--no-browser`, the MIT license file,
+  and a packaging fix.
 
 ## 0.3.0
 
